@@ -1,0 +1,5 @@
+{
+  "name": "@pi-extensions/rtk",
+  "private": true,
+  "type": "module"
+}
