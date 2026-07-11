@@ -36,6 +36,8 @@ importers:
 
   packages/early-env: {}
 
+  packages/thinking-filter: {}
+
 packages:
 
   '@anthropic-ai/sdk@0.91.1':
