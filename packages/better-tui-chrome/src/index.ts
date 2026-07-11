@@ -20,6 +20,8 @@ import { stripVTControlCharacters } from "node:util";
 
 const EDITOR_INSET = 1;
 const EDITOR_INSET_TEXT = " ".repeat(EDITOR_INSET);
+const FAST_MODE_STATE_EVENT = "codex-fast-mode:state";
+const FAST_MODE_STATE_REQUEST_EVENT = "codex-fast-mode:state-request";
 
 type ThinkingLevel = Parameters<Theme["getThinkingBorderColor"]>[0];
 const THINKING_LEVEL_VALUES = [
@@ -155,6 +157,7 @@ function renderFooterLine(
   theme: Theme,
   thinkingLevel: unknown,
   usage: ContextUsage | undefined,
+  fastModeEnabled: boolean,
 ): string {
   const innerWidth = width - EDITOR_INSET * 2;
   if (innerWidth <= 0) return blankLine(width);
@@ -167,8 +170,11 @@ function renderFooterLine(
   const cwdText = sanitizeStatusText(formatCwd(ctx.cwd));
   const rightText = branch ? `${cwdText} • ${sanitizeStatusText(branch)}` : cwdText;
 
+  const fastMode = fastModeEnabled ? theme.fg("dim", "fast • ") : "";
   const left =
-    theme.fg("dim", `${model} • ${reasoning} • `) +
+    theme.fg("dim", `${model} • `) +
+    fastMode +
+    theme.fg("dim", `${reasoning} • `) +
     theme.fg(contextStatusColor(context), context.text);
   const right = theme.fg("dim", rightText);
 
@@ -237,6 +243,7 @@ class ChromeFooter implements Component {
     private readonly footerData: ReadonlyFooterDataProvider,
     private readonly theme: Theme,
     private readonly getThinkingLevel: () => unknown,
+    private readonly getFastModeEnabled: () => boolean,
     private readonly onDispose: (footer: ChromeFooter) => void,
   ) {
     this.unsubscribeBranch = footerData.onBranchChange(() => {
@@ -270,6 +277,7 @@ class ChromeFooter implements Component {
   render(width: number): string[] {
     const usage = this.getContextUsage();
     const thinkingLevel = this.getThinkingLevel();
+    const fastModeEnabled = this.getFastModeEnabled();
     const model = this.ctx.getModel();
     const branch = this.footerData.getGitBranch();
     const signature = [
@@ -278,6 +286,7 @@ class ChromeFooter implements Component {
       model?.id ?? "",
       model?.contextWindow ?? "",
       String(thinkingLevel),
+      fastModeEnabled,
       usage?.tokens ?? "",
       usage?.percent ?? "",
       usage?.contextWindow ?? "",
@@ -293,6 +302,7 @@ class ChromeFooter implements Component {
       this.theme,
       thinkingLevel,
       usage,
+      fastModeEnabled,
     );
     this.cachedRender = { signature, line };
     return [line];
@@ -316,6 +326,7 @@ export default function betterTuiChrome(pi: ExtensionAPI) {
   let currentEditor: InsetEditor | undefined;
   let currentFooter: ChromeFooter | undefined;
   let currentModel: FooterModel;
+  let fastModeEnabled = false;
 
   function invalidateFooterContextUsage(): void {
     currentFooter?.invalidateContextUsage();
@@ -329,6 +340,15 @@ export default function betterTuiChrome(pi: ExtensionAPI) {
 
     currentFooter?.requestRender();
   }
+
+  pi.events.on(FAST_MODE_STATE_EVENT, (data) => {
+    const state = data as { enabled?: unknown };
+    if (typeof state.enabled !== "boolean" || state.enabled === fastModeEnabled) return;
+
+    fastModeEnabled = state.enabled;
+    currentFooter?.invalidate();
+    requestChromeRender();
+  });
 
   pi.on("thinking_level_select", () => {
     requestChromeRender();
@@ -371,6 +391,7 @@ export default function betterTuiChrome(pi: ExtensionAPI) {
       ctx.ui.setFooter(undefined);
     }
 
+    fastModeEnabled = false;
     currentEditor = undefined;
     currentFooter = undefined;
     currentModel = undefined;
@@ -401,6 +422,7 @@ export default function betterTuiChrome(pi: ExtensionAPI) {
         footerData,
         theme,
         () => pi.getThinkingLevel(),
+        () => fastModeEnabled,
         (disposed) => {
           if (currentFooter === disposed) currentFooter = undefined;
         },
@@ -408,5 +430,7 @@ export default function betterTuiChrome(pi: ExtensionAPI) {
       currentFooter = footer;
       return footer;
     });
+
+    pi.events.emit(FAST_MODE_STATE_REQUEST_EVENT, undefined);
   });
 }
