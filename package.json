@@ -5,7 +5,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "apply": "node scripts/apply.mjs",
-    "check": "pnpm format:check && pnpm lint && pnpm typecheck",
+    "check": "node scripts/check.mjs",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint . --deny-warnings",
