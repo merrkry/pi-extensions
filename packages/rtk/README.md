@@ -6,7 +6,7 @@ Rewrites commands from Pi's `bash` tool and [`pi-unified-exec`](../../docs/compa
 
 Requires `rtk >= 0.23.0` in `PATH`. The extension disables itself when RTK is missing or too old, and otherwise fails open: rewrite failures never prevent the original command from running.
 
-Set `RTK_DISABLED=1` in Pi's environment to disable rewriting globally. The extension tells the agent to use RTK's per-command bypass only when retrying a command that failed after rewriting, rather than carrying it into subsequent commands. Commands that already start with `rtk ` are also left unchanged.
+Set `RTK_DISABLED=1` in Pi's environment to disable rewriting globally. For truncated search output, the extension tells the agent to narrow the search, exclude generated files such as source maps, or limit line width before considering a bypass. It reserves RTK's per-command bypass for rewrites that change command semantics or cause execution failure, and tells the agent to put a bypassed command in its own tool call rather than combining it with other commands. Commands that already start with `rtk ` are also left unchanged.
 
 ## Origin and license
 

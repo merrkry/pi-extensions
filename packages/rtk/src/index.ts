@@ -8,7 +8,8 @@ const MIN_SUPPORTED_RTK_MINOR = 23;
 const AGENT_INSTRUCTIONS = `## RTK
 
 RTK automatically rewrites supported non-interactive shell tool calls to simplify CLI output and reduce token usage.
-If an RTK-rewritten command fails or behaves unexpectedly, retry only that command with \`RTK_DISABLED=1\` prefixed, for example \`RTK_DISABLED=1 git status\`.`;
+If search output is truncated, first narrow the path or glob, exclude generated files such as \`*.map\`, or limit line width with options such as \`rg --max-columns 240 --max-columns-preview\`.
+Use \`RTK_DISABLED=1\` only when rewriting changes command semantics or causes execution failure. Put the bypassed command in its own tool call rather than combining it with other commands.`;
 
 export function getRewriteTarget(event: {
   toolName: string;
