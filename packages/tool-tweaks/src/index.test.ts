@@ -18,7 +18,21 @@ describe("transformActiveTools", () => {
     ]);
   });
 
-  it("preserves restricted tools exactly when bash is unavailable", () => {
+  it("treats exec_command as having the same shell capabilities as bash", () => {
+    expect(
+      transformActiveTools(["read", "exec_command", "edit", "write", "grep", "find", "ls"]),
+    ).toEqual(["exec_command", "edit", "view_image"]);
+  });
+
+  it("preserves both shell tools when both are active", () => {
+    expect(transformActiveTools(["read", "bash", "exec_command", "ls"])).toEqual([
+      "bash",
+      "exec_command",
+      "view_image",
+    ]);
+  });
+
+  it("preserves restricted tools exactly when no shell tool is available", () => {
     expect(transformActiveTools(["read", "grep", "find", "ls"])).toEqual([
       "read",
       "grep",

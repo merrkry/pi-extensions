@@ -7,8 +7,37 @@ const REWRITE_TIMEOUT_MS = 2_000;
 const MIN_SUPPORTED_RTK_MINOR = 23;
 const AGENT_INSTRUCTIONS = `## RTK
 
-RTK automatically rewrites CLI commands executed by \`bash\` tool for simplified output to reduce token usage.
+RTK automatically rewrites supported non-interactive shell tool calls to simplify CLI output and reduce token usage.
 If an RTK-rewritten command fails or behaves unexpectedly, retry only that command with \`RTK_DISABLED=1\` prefixed, for example \`RTK_DISABLED=1 git status\`.`;
+
+export function getRewriteTarget(event: {
+  toolName: string;
+  input: Record<string, unknown>;
+}): { command: string; apply(rewritten: string): void } | undefined {
+  if (event.toolName === "bash") {
+    if (typeof event.input.command !== "string" || event.input.command.trim() === "") return;
+    return {
+      command: event.input.command,
+      apply: (rewritten) => {
+        event.input.command = rewritten;
+      },
+    };
+  }
+
+  if (event.toolName === "exec_command") {
+    // Interactive terminal commands should retain their exact command and terminal semantics.
+    if (event.input.tty === true) return;
+    if (typeof event.input.cmd !== "string" || event.input.cmd.trim() === "") return;
+    return {
+      command: event.input.cmd,
+      apply: (rewritten) => {
+        event.input.cmd = rewritten;
+      },
+    };
+  }
+
+  return undefined;
+}
 
 function parseSemver(raw: string): [number, number, number] | null {
   const match = raw.trim().match(/(\d+)\.(\d+)\.(\d+)/);
@@ -20,6 +49,19 @@ function parseSemver(raw: string): [number, number, number] | null {
   ];
 }
 
+export function extractRewrittenCommand(result: {
+  code: number;
+  stdout: string;
+  killed: boolean;
+}): string | null {
+  // RTK's protocol returns 0 for an allowed rewrite and 3 for an advisory
+  // rewrite that a permission-aware host would ask about. Both carry the valid
+  // rewritten command on stdout. Exit 1 is unsupported/pass-through, while 2
+  // defers a deny decision to the host; neither should rewrite the Pi tool call.
+  if (result.killed || (result.code !== 0 && result.code !== 3)) return null;
+  return result.stdout.trim() || null;
+}
+
 async function rewriteCommand(
   pi: ExtensionAPI,
   command: string,
@@ -29,8 +71,7 @@ async function rewriteCommand(
     timeout: REWRITE_TIMEOUT_MS,
     ...(signal ? { signal } : {}),
   });
-  if (result.killed || (result.code !== 0 && result.code !== 3)) return null;
-  return result.stdout.trim() || null;
+  return extractRewrittenCommand(result);
 }
 
 export default async function rtk(pi: ExtensionAPI) {
@@ -52,21 +93,23 @@ export default async function rtk(pi: ExtensionAPI) {
   }
 
   pi.on("before_agent_start", (event) => ({
-    systemPrompt: `${event.systemPrompt}
-
-${AGENT_INSTRUCTIONS}`,
+    systemPrompt: `${event.systemPrompt}\n\n${AGENT_INSTRUCTIONS}`,
   }));
 
   pi.on("tool_call", async (event, ctx) => {
     try {
-      if (!isToolCallEventType("bash", event)) return;
+      if (!isToolCallEventType("bash", event) && !isToolCallEventType("exec_command", event)) {
+        return;
+      }
 
-      const command = event.input.command;
-      if (typeof command !== "string" || command.trim() === "") return;
-      if (command.startsWith("rtk ") || process.env.RTK_DISABLED === "1") return;
+      const target = getRewriteTarget(event);
+      if (!target) return;
+      if (target.command.startsWith("rtk ") || process.env.RTK_DISABLED === "1") return;
 
-      const rewritten = await rewriteCommand(pi, command, ctx.signal);
-      if (rewritten && rewritten !== command) event.input.command = rewritten;
+      // Only RTK's successful (0) and advisory (3) outcomes with non-empty stdout
+      // produce a rewrite. Unsupported, denied, empty, or killed outcomes pass through.
+      const rewritten = await rewriteCommand(pi, target.command, ctx.signal);
+      if (rewritten && rewritten !== target.command) target.apply(rewritten);
     } catch (error) {
       console.warn("[rtk] unexpected error in tool_call handler; passing through command", error);
     }

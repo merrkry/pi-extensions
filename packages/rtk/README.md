@@ -1,6 +1,6 @@
 # RTK
 
-Rewrites Pi bash tool calls through [`rtk rewrite`](https://github.com/rtk-ai/rtk) to simplify CLI output and reduce token usage.
+Rewrites commands from Pi's `bash` tool and [`pi-unified-exec`](https://pi.dev/packages/pi-unified-exec)'s `exec_command` tool through [`rtk rewrite`](https://github.com/rtk-ai/rtk) to simplify CLI output and reduce token usage. `exec_command` calls with `tty: true` are left unchanged. A command is rewritten only when RTK exits with code 0 (allowed) or 3 (advisory/ask) and emits a non-empty command on stdout; unsupported, denied, empty, and killed outcomes pass through unchanged. Its agent prompt deliberately refers only to supported non-interactive shell tool calls, without naming either tool, so it does not depend on the active tool set or extension ordering.
 
 Requires `rtk >= 0.23.0` in `PATH`. The extension disables itself when RTK is missing or too old, and otherwise fails open: rewrite failures never prevent the original command from running.
 
