@@ -8,4 +8,5 @@ User's Pi setup is at `${PI_CONFIG_DIR:-$HOME/.pi}`.
 
 - Use `pnpm format` for formatting.
 - Use `pnpm check` for verification. Pass `[<package-dir>...]` to only execute on selected packages, e.g. `pnpm check better-tui-chrome early-env`.
-- Use `pnpm apply [<package-dir>...]` to install extension packages to user's Pi setup. Do not execute this unless explicitly permitted.
+- Use `pnpm apply [<package-dir>...]` to install extension packages to user's Pi setup.
+- Unless explicitly permitted, you should not execute any command that modifies user's Pi setup.
