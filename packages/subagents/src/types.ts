@@ -47,9 +47,13 @@ export interface AgentPromptConfig {
   systemPrompt: string;
 }
 
+export type AgentToolProfile = "read-only-unified-exec";
+
 /** Unified agent configuration — used for both default and user-defined agents. */
 export interface AgentConfig extends AgentIdentity, AgentPromptConfig {
   builtinToolNames?: string[];
+  /** Post-extension-binding tool capability profile. */
+  toolProfile?: AgentToolProfile;
   model?: string;
   thinking?: ThinkingLevel;
   maxTurns?: number;

@@ -15,6 +15,7 @@
 import type { Model } from "@earendil-works/pi-ai";
 import { type AgentSession, type SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { AgentConfigLookup } from "#src/config/agent-types";
+import { getProfileAllowedToolNames, UNIFIED_EXEC_TOOL_NAMES } from "#src/config/tool-profiles";
 import type { ChildLifecyclePublisher } from "#src/lifecycle/child-lifecycle";
 import type { ParentSnapshot } from "#src/lifecycle/parent-snapshot";
 import { SubagentSession } from "#src/lifecycle/subagent-session";
@@ -26,11 +27,30 @@ import type { ParentSessionInfo, ShellExec, SubagentType, ThinkingLevel } from "
 const EXCLUDED_TOOL_NAMES = ["subagent", "get_subagent_result", "steer_subagent"];
 
 /**
- * Apply the recursion guard: remove this extension's dispatch tools from the
- * child's active set. Runs after `bindExtensions` so extension-registered tools
- * are also covered. Unconditional: children always load the parent's extensions.
+ * Finalize the child's tools after extensions bind. Built-in read-only agents
+ * prefer unified-exec over bash, retain its complete session-control family,
+ * and gain image inspection. Other agents only receive the recursion guard.
  */
-function applyRecursionGuard(session: AgentSession): void {
+function finalizeChildTools(session: AgentSession, useReadOnlyToolProfile: boolean): void {
+  if (useReadOnlyToolProfile) {
+    // This profile intentionally treats registered capabilities as authorized,
+    // so it may reactivate a tool another extension made inactive.
+    const registered = new Set(session.getAllTools().map((tool) => tool.name));
+    let shellTools: string[];
+    if (registered.has("exec_command")) {
+      const missing = UNIFIED_EXEC_TOOL_NAMES.filter((name) => !registered.has(name));
+      if (missing.length > 0) {
+        throw new Error(`Incomplete unified-exec tool family; missing: ${missing.join(", ")}`);
+      }
+      shellTools = [...UNIFIED_EXEC_TOOL_NAMES];
+    } else {
+      shellTools = registered.has("bash") ? ["bash"] : [];
+    }
+    const imageTools = registered.has("view_image") ? ["view_image"] : [];
+    session.setActiveToolsByName([...shellTools, ...imageTools]);
+    return;
+  }
+
   const filtered = session.getActiveToolNames().filter((t) => !EXCLUDED_TOOL_NAMES.includes(t));
   session.setActiveToolsByName(filtered);
 }
@@ -69,7 +89,8 @@ export interface CreateSessionOptions {
   settingsManager: SettingsManager;
   modelRegistry: unknown;
   model?: unknown;
-  tools: string[];
+  /** Undefined leaves extension tools unrestricted; [] is a hard empty allowlist. */
+  tools?: string[];
   resourceLoader: ResourceLoaderLike;
   thinkingLevel?: ThinkingLevel;
 }
@@ -204,7 +225,10 @@ export async function createSubagentSession(
     settingsManager: deps.io.createSettingsManager(cfg.effectiveCwd, agentDir),
     modelRegistry: snapshot.modelRegistry,
     model: cfg.model,
-    tools: cfg.toolNames,
+    // AgentSession treats this as a hard allowlist, including for tools that
+    // extensions register later. Admit all profile candidates before binding;
+    // finalizeChildTools() selects the active subset afterward.
+    tools: getProfileAllowedToolNames(cfg.toolProfile, cfg.toolNames),
     resourceLoader: loader,
     thinkingLevel: cfg.thinkingLevel,
   });
@@ -229,9 +253,9 @@ export async function createSubagentSession(
   try {
     // Bind extensions so that session_start fires and extensions can initialize.
     await session.bindExtensions({});
-    // Apply recursion guard after bindExtensions so extension-registered tools
-    // are included in the post-bind active set.
-    applyRecursionGuard(session);
+    // Finalize tools after bindExtensions so extension-registered capabilities
+    // are available and recursive dispatch remains disabled.
+    finalizeChildTools(session, cfg.toolProfile === "read-only-unified-exec");
   } catch (err) {
     // Binding failed after session-created — dispose (emit disposed +
     // session.dispose()) before rethrowing so registration is never leaked.

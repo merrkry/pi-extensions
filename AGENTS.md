@@ -6,7 +6,7 @@ User's Pi setup is at `${PI_CONFIG_DIR:-$HOME/.pi}`.
 
 ## Documentation
 
-- See [compatibility notes](docs/compatibility.md) for the external extensions and CLIs relied on by packages in this repository. Each package README documents that package's own integration behavior.
+- See [compatibility notes](docs/compatibility.md) for the external extensions and CLIs relied on by packages in this repository, including the checklist for how newly registered or activated tools interact with child subagent sessions. Each package README documents that package's own integration behavior.
 
 ## Workflows
 

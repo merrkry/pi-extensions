@@ -16,10 +16,10 @@ Full-file `write` is intentionally removed for safety. File creation can be perf
 
 ## Subagent compatibility
 
-This handling targets the [`@gotgenes/pi-subagents`](../../docs/compatibility.md#gotgenespi-subagents) lifecycle described in the shared compatibility notes, rather than every possible subagent implementation.
+This handling integrates with the local [`@pi-extensions/subagents`](../../docs/compatibility.md#subagents) lifecycle described in the shared compatibility notes, rather than every possible subagent implementation.
 
-`tool-tweaks` applies its transformation from `session_start`, so a child observes its own initial allowlist rather than its parent's final active tools. The resulting active set remains in place when `pi-subagents` subsequently applies its recursion guard.
+`tool-tweaks` applies its transformation from `session_start`, so a child observes its own initial allowlist rather than its parent's final active tools. It registers `view_image` and transforms the child's active set before subagents applies any configured post-binding tool profile.
 
-Consequently, the built-in presets are reduced to the shell-oriented tool set and gain `view_image`. The same transformation applies when another extension replaces `bash` with `exec_command` during binding. A custom preset without either shell tool retains its original tools exactly, including `tools: none`. Concurrent children have separate session tool state and do not modify one another.
+For the `read-only-unified-exec` profile, subagents then selects the complete unified-exec family when registered, falls back to `bash` otherwise, and retains the `view_image` registered here. Configurations without a tool profile retain the transformed active set except for recursive subagent dispatch tools. A custom preset without either shell tool therefore retains its original tools exactly, including `tools: none`.
 
-A different subagent implementation may not receive the same handling if it does not bind parent extensions into children, fires `session_start` at another point, or overwrites active tools after binding.
+Concurrent children have separate session tool state and do not modify one another. A different subagent implementation may not receive the same handling if it does not bind parent extensions into children, fires `session_start` at another point, or applies a different post-binding tool policy.

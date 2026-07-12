@@ -9,10 +9,12 @@ const DEFAULT_AGENT_CONFIG: AgentConfig = {
   name: "Explore",
   description: "Explore",
   builtinToolNames: ["read"],
+  toolProfile: "read-only-unified-exec",
   systemPrompt: "You are Explore.",
   promptMode: "replace",
   inheritContext: false,
   runInBackground: false,
+  isDefault: true,
 };
 
 /**
@@ -62,7 +64,7 @@ export function createAgentLookup(configOverrides?: Partial<AgentConfig>) {
   const config: AgentConfig = { ...DEFAULT_AGENT_CONFIG, ...configOverrides };
   return {
     resolveAgentConfig: vi.fn((_type: string): AgentConfig => config),
-    getToolNamesForType: vi.fn((_type: string): string[] => config.builtinToolNames ?? ["read"]),
+    getToolNamesForType: vi.fn((_type: string): string[] | undefined => config.builtinToolNames),
   };
 }
 
@@ -143,6 +145,7 @@ export function createFactorySession(options: FactorySessionOptions = {}) {
     prompt: vi.fn().mockResolvedValue(undefined),
     abort: vi.fn(),
     getActiveToolNames: vi.fn(() => (bound ? after : before)),
+    getAllTools: vi.fn(() => (bound ? after : before).map((name) => ({ name }))),
     setActiveToolsByName: vi.fn(),
     bindExtensions: vi.fn(async () => {
       bound = true;

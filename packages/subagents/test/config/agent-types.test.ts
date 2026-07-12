@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AgentTypeRegistry, BUILTIN_TOOL_NAMES } from "#src/config/agent-types";
+import { AgentTypeRegistry } from "#src/config/agent-types";
 import type { AgentConfig } from "#src/types";
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -210,17 +210,32 @@ describe("AgentTypeRegistry", () => {
     });
   });
 
+  describe("tool profile metadata", () => {
+    it("maps read-only presets to the unified-exec profile", () => {
+      const registry = makeRegistry();
+
+      expect(registry.resolveAgentConfig("Explore").toolProfile).toBe("read-only-unified-exec");
+      expect(registry.resolveAgentConfig("Plan").toolProfile).toBe("read-only-unified-exec");
+    });
+
+    it("leaves the unrestricted preset without a post-bind profile", () => {
+      const registry = makeRegistry();
+
+      expect(registry.resolveAgentConfig("general-purpose").toolProfile).toBeUndefined();
+    });
+  });
+
   describe("getToolNamesForType", () => {
-    it("returns all built-in tools for general-purpose", () => {
+    it("leaves general-purpose unrestricted for SDK extension tools", () => {
       const registry = makeRegistry();
       const names = registry.getToolNamesForType("general-purpose");
-      expect(names).toEqual(BUILTIN_TOOL_NAMES);
+      expect(names).toBeUndefined();
     });
 
     it("returns restricted tools for Explore", () => {
       const registry = makeRegistry();
       const names = registry.getToolNamesForType("Explore");
-      expect(names).toEqual(["read", "bash", "grep", "find", "ls"]);
+      expect(names).toEqual(["bash"]);
     });
 
     it("returns custom tool names for user agent", () => {
@@ -232,10 +247,16 @@ describe("AgentTypeRegistry", () => {
       expect(registry.getToolNamesForType("auditor")).toEqual(["read", "grep"]);
     });
 
-    it("returns BUILTIN_TOOL_NAMES for unknown type", () => {
+    it("preserves an explicit empty custom tool allowlist", () => {
+      const registry = makeRegistry(
+        new Map([["no-tools", makeAgentConfig({ name: "no-tools", builtinToolNames: [] })]]),
+      );
+      expect(registry.getToolNamesForType("no-tools")).toEqual([]);
+    });
+
+    it("leaves the general-purpose fallback for an unknown type unrestricted", () => {
       const registry = makeRegistry();
-      const names = registry.getToolNamesForType("nonexistent");
-      expect(names).toEqual(BUILTIN_TOOL_NAMES);
+      expect(registry.getToolNamesForType("nonexistent")).toBeUndefined();
     });
   });
 

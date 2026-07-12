@@ -70,6 +70,60 @@ describe("createSubagentSession — assembly", () => {
     expect(session.bindExtensions).toHaveBeenCalledWith({});
   });
 
+  it("admits every profile candidate through AgentSession's pre-bind allowlist", async () => {
+    await createSubagentSession(
+      { snapshot: STUB_SNAPSHOT, type: "renamed-reader" },
+      createSubagentSessionDeps({ io, exec, registry: mockAgentLookup }),
+    );
+
+    expect(io.createSession.mock.calls[0][0].tools).toEqual([
+      "read",
+      "bash",
+      "exec_command",
+      "write_stdin",
+      "kill_session",
+      "list_sessions",
+      "view_image",
+    ]);
+  });
+
+  it("does not expand an explicit pre-bind allowlist when no profile is configured", async () => {
+    const registry = createAgentLookup({ toolProfile: undefined, builtinToolNames: ["read"] });
+
+    await createSubagentSession(
+      { snapshot: STUB_SNAPSHOT, type: "custom" },
+      createSubagentSessionDeps({ io, exec, registry }),
+    );
+
+    expect(io.createSession.mock.calls[0][0].tools).toEqual(["read"]);
+  });
+
+  it("passes undefined through so unrestricted agents can receive extension tools", async () => {
+    const registry = createAgentLookup({
+      name: "general-purpose",
+      toolProfile: undefined,
+      builtinToolNames: undefined,
+    });
+
+    await createSubagentSession(
+      { snapshot: STUB_SNAPSHOT, type: "general-purpose" },
+      createSubagentSessionDeps({ io, exec, registry }),
+    );
+
+    expect(io.createSession.mock.calls[0][0].tools).toBeUndefined();
+  });
+
+  it("passes an empty allowlist through without turning tools back on", async () => {
+    const registry = createAgentLookup({ toolProfile: undefined, builtinToolNames: [] });
+
+    await createSubagentSession(
+      { snapshot: STUB_SNAPSHOT, type: "no-tools" },
+      createSubagentSessionDeps({ io, exec, registry }),
+    );
+
+    expect(io.createSession.mock.calls[0][0].tools).toEqual([]);
+  });
+
   it("passes the effective cwd and agentDir to the loader, settings, and session", async () => {
     await createSubagentSession(
       { snapshot: STUB_SNAPSHOT, type: "Explore", cwd: "/tmp/worktree" },
@@ -213,11 +267,10 @@ describe("createSubagentSession — dispose on creation failure", () => {
   });
 });
 
-describe("createSubagentSession — post-bind recursion guard", () => {
-  // Extension-registered tools join the active set during bindExtensions; a
-  // single post-bind filter pass applies the EXCLUDED_TOOL_NAMES recursion
-  // guard to the full post-bind set. The factory session flips getActiveToolNames
-  // from its before-bind set to its after-bind set once bindExtensions resolves.
+describe("createSubagentSession — post-bind tool profiles", () => {
+  // Extension-registered tools join the available set during bindExtensions.
+  // Tool profiles are applied only after binding and are selected by explicit
+  // agent metadata rather than agent names.
 
   it("calls setActiveToolsByName once, after bindExtensions", async () => {
     const session = arrangeFactory({
@@ -237,17 +290,17 @@ describe("createSubagentSession — post-bind recursion guard", () => {
     {
       name: "includes extension-registered tools",
       toolsAfterBind: ["read", "extension_tool"],
-      expected: ["read", "extension_tool"],
+      expected: [],
     },
     {
       name: "excludes EXCLUDED_TOOL_NAMES while keeping other tools",
       toolsAfterBind: ["read", "subagent", "get_subagent_result", "steer_subagent", "external"],
-      expected: ["read", "external"],
+      expected: [],
     },
     {
       name: "runs the guard unconditionally when no extension tools register",
       toolsAfterBind: ["read"],
-      expected: ["read"],
+      expected: [],
     },
   ])("post-bind set: $name", async ({ toolsAfterBind, expected }) => {
     const session = arrangeFactory({ toolsBeforeBind: ["read"], toolsAfterBind });
@@ -256,5 +309,74 @@ describe("createSubagentSession — post-bind recursion guard", () => {
 
     expect(session.setActiveToolsByName).toHaveBeenCalledTimes(1);
     expect(session.setActiveToolsByName.mock.calls[0][0]).toEqual(expected);
+  });
+
+  it("activates the complete unified-exec family and image viewing for the read-only profile", async () => {
+    const toolsAfterBind = [
+      "bash",
+      "read",
+      "exec_command",
+      "write_stdin",
+      "kill_session",
+      "list_sessions",
+      "view_image",
+      "subagent",
+    ];
+    const session = arrangeFactory({ toolsBeforeBind: ["bash"], toolsAfterBind });
+
+    await createSubagentSession({ snapshot: STUB_SNAPSHOT, type: "Explore" }, defaultDeps());
+
+    expect(session.setActiveToolsByName.mock.calls[0][0]).toEqual([
+      "exec_command",
+      "write_stdin",
+      "kill_session",
+      "list_sessions",
+      "view_image",
+    ]);
+  });
+
+  it("falls back to bash and keeps image viewing when unified-exec is unavailable", async () => {
+    const session = arrangeFactory({
+      toolsBeforeBind: ["bash"],
+      toolsAfterBind: ["bash", "read", "view_image"],
+    });
+
+    const deps = createSubagentSessionDeps({
+      io,
+      exec,
+      registry: createAgentLookup({ name: "renamed-reader" }),
+    });
+
+    await createSubagentSession({ snapshot: STUB_SNAPSHOT, type: "renamed-reader" }, deps);
+
+    expect(session.setActiveToolsByName.mock.calls[0][0]).toEqual(["bash", "view_image"]);
+  });
+
+  it("rejects an incomplete unified-exec registration", async () => {
+    const session = arrangeFactory({
+      toolsBeforeBind: ["bash"],
+      toolsAfterBind: ["exec_command", "write_stdin", "view_image"],
+    });
+
+    await expect(
+      createSubagentSession({ snapshot: STUB_SNAPSHOT, type: "renamed" }, defaultDeps()),
+    ).rejects.toThrow("Incomplete unified-exec tool family; missing: kill_session, list_sessions");
+    expect(session.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("uses ordinary recursion filtering when the agent has no tool profile", async () => {
+    const session = arrangeFactory({
+      toolsBeforeBind: ["read"],
+      toolsAfterBind: ["read", "external", "subagent"],
+    });
+    const deps = createSubagentSessionDeps({
+      io,
+      exec,
+      registry: createAgentLookup({ toolProfile: undefined }),
+    });
+
+    await createSubagentSession({ snapshot: STUB_SNAPSHOT, type: "Explore" }, deps);
+
+    expect(session.setActiveToolsByName.mock.calls[0][0]).toEqual(["read", "external"]);
   });
 });

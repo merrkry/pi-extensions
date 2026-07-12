@@ -6,7 +6,9 @@
 
 import type { AgentConfig } from "#src/types";
 
-const READ_ONLY_TOOLS = ["read", "bash", "grep", "find", "ls"];
+// Bootstrap with the built-in shell. After child extensions bind, the session
+// factory replaces this with the registered unified-exec tool family.
+const READ_ONLY_TOOLS = ["bash"];
 
 export const DEFAULT_AGENTS: Map<string, AgentConfig> = new Map([
   [
@@ -30,6 +32,7 @@ export const DEFAULT_AGENTS: Map<string, AgentConfig> = new Map([
       displayName: "Explore",
       description: "Fast codebase exploration agent (read-only)",
       builtinToolNames: READ_ONLY_TOOLS,
+      toolProfile: "read-only-unified-exec",
       model: "anthropic/claude-haiku-4-5-20251001",
       systemPrompt: `# CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS
 You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
@@ -44,13 +47,10 @@ You are STRICTLY PROHIBITED from:
 - Using redirect operators (>, >>, |) or heredocs to write to files
 - Running ANY commands that change system state
 
-Use Bash ONLY for read-only operations: ls, git status, git log, git diff, find, cat, head, tail.
+Use available capabilities exclusively for read-only operations.
 
 # Tool Usage
-- Use the find tool for file pattern matching (NOT the bash find command)
-- Use the grep tool for content search (NOT bash grep/rg command)
-- Use the read tool for reading files (NOT bash cat/head/tail)
-- Use Bash ONLY for read-only operations
+- Perform only read-only inspection, search, and analysis operations
 - Make independent tool calls in parallel for efficiency
 - Adapt search approach based on thoroughness level specified
 
@@ -70,6 +70,7 @@ Use Bash ONLY for read-only operations: ls, git status, git log, git diff, find,
       displayName: "Plan",
       description: "Software architect for implementation planning (read-only)",
       builtinToolNames: READ_ONLY_TOOLS,
+      toolProfile: "read-only-unified-exec",
       systemPrompt: `# CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS
 You are a software architect and planning specialist.
 Your role is EXCLUSIVELY to explore the codebase and design implementation plans.
@@ -97,10 +98,7 @@ You are STRICTLY PROHIBITED from:
 - Follow existing patterns where appropriate
 
 # Tool Usage
-- Use the find tool for file pattern matching (NOT the bash find command)
-- Use the grep tool for content search (NOT bash grep/rg command)
-- Use the read tool for reading files (NOT bash cat/head/tail)
-- Use Bash ONLY for read-only operations
+- Perform only read-only inspection, search, and analysis operations
 
 # Output Format
 - Use absolute file paths

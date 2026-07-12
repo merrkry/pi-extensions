@@ -12,7 +12,7 @@
 
 import type { AgentConfigLookup } from "#src/config/agent-types";
 import type { EnvInfo } from "#src/session/env";
-import type { AgentPromptConfig, SubagentType, ThinkingLevel } from "#src/types";
+import type { AgentPromptConfig, AgentToolProfile, SubagentType, ThinkingLevel } from "#src/types";
 
 // ── Public interfaces ────────────────────────────────────────────────────────
 
@@ -79,8 +79,13 @@ export interface SessionConfig {
   effectiveCwd: string;
   /** Fully-assembled system prompt string (ready for `systemPromptOverride`). */
   systemPrompt: string;
-  /** Built-in tool name allowlist for this agent type. */
-  toolNames: string[];
+  /**
+   * SDK tool allowlist. Undefined permits extension tools; an empty array
+   * deliberately denies every tool.
+   */
+  toolNames?: string[];
+  /** Tool capability profile applied after child extensions bind. */
+  toolProfile?: AgentToolProfile;
   /**
    * Resolved model instance (undefined → use parent model as passed to SDK).
    * Opaque handle — the assembler passes it through without inspection.
@@ -174,6 +179,7 @@ export function assembleSessionConfig(
     effectiveCwd,
     systemPrompt,
     toolNames,
+    toolProfile: agentConfig.toolProfile,
     model,
     thinkingLevel,
     agentMaxTurns,

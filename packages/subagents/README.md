@@ -1,19 +1,10 @@
 # Subagents
 
-A private, vendored Pi extension providing focused, in-process subagents. It is maintained in this monorepo primarily to integrate cleanly with the other extensions here and to ensure that their prompts, tool activation, and session lifecycle behavior interact predictably.
+A Pi extension providing focused, in-process subagents.
 
-## Fork lineage and license
+## Maintenance
 
-This package is a second-generation fork:
-
-1. [`@gotgenes/pi-subagents`](https://github.com/gotgenes/pi-packages/tree/main/packages/pi-subagents) is an independently maintained hard fork of [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents).
-2. This repository vendors `@gotgenes/pi-subagents` as `@pi-extensions/subagents` and adapts it for integration with the other packages in this monorepo.
-
-The initial vendored snapshot is [`gotgenes/pi-packages@df49079`](https://github.com/gotgenes/pi-packages/tree/df49079e98736824994f82c98035b321a9b2ce78/packages/pi-subagents).
-
-The software remains available under the [MIT License](./LICENSE). The vendored copyright and license notice are preserved. This package is currently private and is not configured for publication.
-
-The implementation and historical documentation below originate from the upstream forks unless noted otherwise.
+See [PATCH.md](./PATCH.md) for the synchronized upstream version, fork lineage, and local changes. This package is available under the [MIT License](./LICENSE).
 
 ## Features
 
@@ -109,14 +100,16 @@ The LLM receives structured `<task-notification>` XML for parsing, while the use
 
 ## Default Agent Types
 
-| Type              | Tools                      | Model                         | Prompt Mode            | Description                                                                                      |
-| ----------------- | -------------------------- | ----------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------ |
-| `general-purpose` | all 7                      | inherit                       | `append` (parent twin) | Inherits the parent's full system prompt — same rules, CLAUDE.md, project conventions            |
-| `Explore`         | read, bash, grep, find, ls | haiku (falls back to inherit) | `replace`              | Fast codebase exploration (read-only); inherits the parent prompt as a base                      |
-| `Plan`            | read, bash, grep, find, ls | inherit                       | `replace`              | Software architect for implementation planning (read-only); inherits the parent prompt as a base |
+| Type              | Effective tool policy                                                                                 | Model                         | Prompt Mode            | Description                                                                                      |
+| ----------------- | ----------------------------------------------------------------------------------------------------- | ----------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------ |
+| `general-purpose` | All active built-in and extension tools except recursive subagent dispatch                            | inherit                       | `append` (parent twin) | Inherits the parent's full system prompt — same rules, CLAUDE.md, project conventions            |
+| `Explore`         | Complete unified-exec family plus `view_image`; falls back to `bash` when unified-exec is unavailable | haiku (falls back to inherit) | `replace`              | Fast codebase exploration (read-only); inherits the parent prompt as a base                      |
+| `Plan`            | Complete unified-exec family plus `view_image`; falls back to `bash` when unified-exec is unavailable | inherit                       | `replace`              | Software architect for implementation planning (read-only); inherits the parent prompt as a base |
 
 The `general-purpose` agent is a **parent twin** — it receives the parent's entire system prompt plus a sub-agent context bridge, so it follows the same rules the parent does.
-Explore and Plan use `replace` mode: the parent prompt is the cacheable base and their specialist read-only instructions are appended last, giving them the final say.
+Explore and Plan use `replace` mode: the parent prompt is the cacheable base and their specialist read-only instructions are appended last, giving them the final say. Their read-only behavior is a prompt policy; shell tools do not provide a hard no-side-effects boundary.
+
+Child sessions load and bind the parent's extensions before finalizing their active tools. Extension authors who register tools or change active-tool state should follow the repository's [subagent compatibility and integration checklist](../../docs/compatibility.md#adding-or-changing-tools).
 
 Default agents can be **overridden** by creating a `.md` file with the same name (e.g. `.pi/agents/general-purpose.md`), or **disabled** per-project with `enabled: false` frontmatter.
 
@@ -168,18 +161,18 @@ subagent({ subagent_type: "auditor", prompt: "Review the auth module", descripti
 
 All fields are optional — sensible defaults for everything.
 
-| Field               | Default        | Description                                                                                                                                                                                                                                                                                                             |
-| ------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `description`       | filename       | Agent description shown in tool listings                                                                                                                                                                                                                                                                                |
-| `display_name`      | —              | Display name for UI (e.g. widget, agent list)                                                                                                                                                                                                                                                                           |
-| `tools`             | all 7          | Comma-separated built-in tools: read, bash, edit, write, grep, find, ls. `none` for no tools                                                                                                                                                                                                                            |
-| `model`             | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`)                                                                                                                                                                                                                                                        |
-| `thinking`          | inherit        | off, minimal, low, medium, high, xhigh                                                                                                                                                                                                                                                                                  |
-| `max_turns`         | unlimited      | Max agentic turns before graceful shutdown. `0` or omit for unlimited                                                                                                                                                                                                                                                   |
-| `prompt_mode`       | `append`       | `replace`: parent prompt is the cacheable base; body is appended last with full control (no `<sub_agent_context>` bridge, no `<agent_instructions>` wrapper). `append`: parent prompt is the base; body is wrapped in `<agent_instructions>` and a sub-agent context bridge is injected (agent acts as a "parent twin") |
-| `inherit_context`   | `false`        | Fork parent conversation into agent                                                                                                                                                                                                                                                                                     |
-| `run_in_background` | `false`        | Run in background by default                                                                                                                                                                                                                                                                                            |
-| `enabled`           | `true`         | Set to `false` to disable an agent (useful for hiding a default agent per-project)                                                                                                                                                                                                                                      |
+| Field               | Default         | Description                                                                                                                                                                                                                                                                                                             |
+| ------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `description`       | filename        | Agent description shown in tool listings                                                                                                                                                                                                                                                                                |
+| `display_name`      | —               | Display name for UI (e.g. widget, agent list)                                                                                                                                                                                                                                                                           |
+| `tools`             | all 7 built-ins | Comma-separated built-in hard allowlist: read, bash, edit, write, grep, find, ls. `none` creates an empty allowlist. Unlike the unrestricted built-in general-purpose preset, a custom agent's explicit/default list does not automatically admit extension tools                                                       |
+| `model`             | inherit parent  | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`)                                                                                                                                                                                                                                                        |
+| `thinking`          | inherit         | off, minimal, low, medium, high, xhigh                                                                                                                                                                                                                                                                                  |
+| `max_turns`         | unlimited       | Max agentic turns before graceful shutdown. `0` or omit for unlimited                                                                                                                                                                                                                                                   |
+| `prompt_mode`       | `append`        | `replace`: parent prompt is the cacheable base; body is appended last with full control (no `<sub_agent_context>` bridge, no `<agent_instructions>` wrapper). `append`: parent prompt is the base; body is wrapped in `<agent_instructions>` and a sub-agent context bridge is injected (agent acts as a "parent twin") |
+| `inherit_context`   | `false`         | Fork parent conversation into agent                                                                                                                                                                                                                                                                                     |
+| `run_in_background` | `false`         | Run in background by default                                                                                                                                                                                                                                                                                            |
+| `enabled`           | `true`          | Set to `false` to disable an agent (useful for hiding a default agent per-project)                                                                                                                                                                                                                                      |
 
 Frontmatter is authoritative.
 If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, or `run_in_background`, those values are locked for that agent.

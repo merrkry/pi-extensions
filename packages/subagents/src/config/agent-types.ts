@@ -16,7 +16,7 @@ import type { AgentConfig } from "#src/types";
  */
 export interface AgentConfigLookup {
   resolveAgentConfig(type: string): AgentConfig;
-  getToolNamesForType(type: string): string[];
+  getToolNamesForType(type: string): string[] | undefined;
 }
 
 // ── AgentTypeRegistry class ──────────────────────────────────────────────────
@@ -90,15 +90,16 @@ export class AgentTypeRegistry implements AgentConfigLookup {
     return this.agents.get(key)?.enabled !== false;
   }
 
-  /** Get built-in tool names for a type (case-insensitive). */
-  getToolNamesForType(type: string): string[] {
+  /**
+   * Get the SDK tool allowlist for a type (case-insensitive).
+   * `undefined` deliberately means unrestricted extension tools, while `[]`
+   * means no tools; Pi's SDK distinguishes these from an explicit allowlist.
+   */
+  getToolNamesForType(type: string): string[] | undefined {
     const key = this.resolveKey(type);
     const raw = key ? this.agents.get(key) : undefined;
     const config = raw?.enabled !== false ? raw : undefined;
-    const names = config?.builtinToolNames?.length
-      ? config.builtinToolNames
-      : [...BUILTIN_TOOL_NAMES];
-    return names;
+    return config?.builtinToolNames === undefined ? undefined : [...config.builtinToolNames];
   }
 
   /** Resolve agent config with guaranteed non-null return. Falls back: unknown → general-purpose → absolute fallback. */
