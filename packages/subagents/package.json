@@ -1,0 +1,35 @@
+{
+  "name": "@pi-extensions/subagents",
+  "private": true,
+  "type": "module",
+  "imports": {
+    "#src/*": "./src/*",
+    "#test/*": "./test/*"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/service/service.ts",
+      "default": "./src/service/service.ts"
+    },
+    "./settings": {
+      "types": "./src/layered-settings.ts",
+      "default": "./src/layered-settings.ts"
+    }
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.49"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.75.0",
+    "@earendil-works/pi-coding-agent": ">=0.75.0",
+    "@earendil-works/pi-tui": ">=0.75.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}

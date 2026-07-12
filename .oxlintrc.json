@@ -5,5 +5,17 @@
     "suspicious": "error",
     "perf": "warn"
   },
+  "overrides": [
+    {
+      "files": ["packages/subagents/**/*.ts"],
+      "rules": {
+        "eslint/no-await-in-loop": "off",
+        "eslint/no-underscore-dangle": "off",
+        "unicorn/consistent-function-scoping": "off",
+        "unicorn/no-array-sort": "off",
+        "unicorn/prefer-set-has": "off"
+      }
+    }
+  ],
   "ignorePatterns": ["node_modules/**", "packages/*/dist/**"]
 }
