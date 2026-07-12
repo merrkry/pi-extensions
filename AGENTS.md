@@ -4,6 +4,10 @@ This is a monorepo of several Pi Coding Agent extensions.
 
 User's Pi setup is at `${PI_CONFIG_DIR:-$HOME/.pi}`.
 
+## Documentation
+
+- See [compatibility notes](docs/compatibility.md) for the external extensions and CLIs relied on by packages in this repository. Each package README documents that package's own integration behavior.
+
 ## Workflows
 
 - Use `pnpm format` for formatting.

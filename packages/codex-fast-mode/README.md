@@ -8,4 +8,4 @@ Adds a `/fast` command that toggles Codex fast mode. While enabled, requests fro
 }
 ```
 
-The toggle is process-global: in-process child sessions, including `pi-subagents`, use the same state. New sessions also reflect the current state in their status line. Run `/fast` again to disable it.
+The toggle is process-global, so in-process child sessions use the same state. This includes children created by [`@gotgenes/pi-subagents`](../../docs/compatibility.md#gotgenespi-subagents). New sessions also reflect the current state in their status line. Run `/fast` again to disable it.

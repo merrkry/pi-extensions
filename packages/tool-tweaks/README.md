@@ -16,10 +16,10 @@ Full-file `write` is intentionally removed for safety. File creation can be perf
 
 ## Subagent compatibility
 
-The subagent behavior documented here specifically assumes [`@gotgenes/pi-subagents`](https://github.com/gotgenes/pi-packages/tree/main/packages/pi-subagents), rather than every possible subagent implementation.
+This handling targets the [`@gotgenes/pi-subagents`](../../docs/compatibility.md#gotgenespi-subagents) lifecycle described in the shared compatibility notes, rather than every possible subagent implementation.
 
-That extension creates each child as an in-process Pi session with the agent preset's tool allowlist, loads the parent's extensions into the child, and calls `bindExtensions()`. Binding fires this extension's `session_start` handler against the child session, so `getActiveTools()` observes that child's own initial allowlist and the transformation is applied independently. After binding, `pi-subagents` reads the resulting active set and applies only its recursion guard, removing its own dispatch tools without restoring the built-in tools removed here.
+`tool-tweaks` applies its transformation from `session_start`, so a child observes its own initial allowlist rather than its parent's final active tools. The resulting active set remains in place when `pi-subagents` subsequently applies its recursion guard.
 
-Consequently, its built-in presets, which all include `bash`, are reduced to the shell-oriented tool set and gain `view_image`. The same transformation applies when another extension replaces `bash` with `exec_command` during binding. A custom preset without either shell tool retains its original tools exactly, including `tools: none`. Concurrent children have separate session tool state and do not modify one another.
+Consequently, the built-in presets are reduced to the shell-oriented tool set and gain `view_image`. The same transformation applies when another extension replaces `bash` with `exec_command` during binding. A custom preset without either shell tool retains its original tools exactly, including `tools: none`. Concurrent children have separate session tool state and do not modify one another.
 
-This compatibility relies on that loading order and post-bind behavior. A different subagent extension that does not bind parent extensions into child sessions, fires `session_start` at another point, or overwrites active tools after binding may not receive the same behavior.
+A different subagent implementation may not receive the same handling if it does not bind parent extensions into children, fires `session_start` at another point, or overwrites active tools after binding.

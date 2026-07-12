@@ -1,10 +1,12 @@
 # RTK
 
-Rewrites commands from Pi's `bash` tool and [`pi-unified-exec`](https://pi.dev/packages/pi-unified-exec)'s `exec_command` tool through [`rtk rewrite`](https://github.com/rtk-ai/rtk) to simplify CLI output and reduce token usage. `exec_command` calls with `tty: true` are left unchanged. A command is rewritten only when RTK exits with code 0 (allowed) or 3 (advisory/ask) and emits a non-empty command on stdout; unsupported, denied, empty, and killed outcomes pass through unchanged. Its agent prompt deliberately refers only to supported non-interactive shell tool calls, without naming either tool, so it does not depend on the active tool set or extension ordering.
+Rewrites commands from Pi's `bash` tool and [`pi-unified-exec`](../../docs/compatibility.md#pi-unified-exec)'s `exec_command` tool through [`rtk rewrite`](../../docs/compatibility.md#rtk-cli) to simplify CLI output and reduce token usage.
+
+`exec_command` calls with `tty: true` are left unchanged. A command is rewritten only when RTK exits with code 0 or 3 and emits a non-empty command on stdout; all other outcomes pass through unchanged. Its agent prompt deliberately refers only to supported non-interactive shell tool calls, without naming either tool, so it does not depend on the active tool set or extension ordering.
 
 Requires `rtk >= 0.23.0` in `PATH`. The extension disables itself when RTK is missing or too old, and otherwise fails open: rewrite failures never prevent the original command from running.
 
-Set `RTK_DISABLED=1` in Pi's environment to disable rewriting globally. An agent can bypass rewriting for one tool call by prefixing the command itself, for example `RTK_DISABLED=1 git status`; `rtk rewrite` recognizes this prefix and passes the command through unchanged. The extension tells the agent to use this only when retrying a command that failed after rewriting, rather than carrying the prefix into subsequent commands. Commands that already start with `rtk ` are also left unchanged.
+Set `RTK_DISABLED=1` in Pi's environment to disable rewriting globally. The extension tells the agent to use RTK's per-command bypass only when retrying a command that failed after rewriting, rather than carrying it into subsequent commands. Commands that already start with `rtk ` are also left unchanged.
 
 ## Origin and license
 
