@@ -6,8 +6,8 @@ Pi's configuration root is `${PI_CONFIG_DIR:-$HOME/.pi}`. Its agent directory is
 
 ## Documentation
 
-- See [compatibility notes](docs/compatibility.md) for the external extension and CLI contracts used by the bundle.
-- Keep `src/index.ts` composition order explicit and coordinate features through typed shared code rather than event-order assumptions.
+- See [architecture](docs/architecture.md) for layout, Effect, lifecycle, and cross-module communication conventions.
+- See [compatibility notes](docs/compatibility.md) for external extension and CLI contracts.
 
 ## Workflows
 

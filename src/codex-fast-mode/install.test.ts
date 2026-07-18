@@ -1,12 +1,31 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import { describe, expect, it, vi } from "vitest";
 
-import { createFastModeStore, type FastModeStore } from "../shared/fast-mode.js";
+import { FastMode, type FastModeApi } from "../shared/fast-mode.js";
 import installCodexFastMode from "./install.js";
 
 type Handler = (...args: any[]) => unknown;
 
-function createHarness(fastMode: FastModeStore) {
+function makeTestFastMode(initialEnabled = false): FastModeApi {
+  let enabled = initialEnabled;
+  return {
+    get enabled() {
+      return enabled;
+    },
+    setEnabled(nextEnabled) {
+      enabled = nextEnabled;
+    },
+    toggle() {
+      enabled = !enabled;
+      return enabled;
+    },
+    subscribe: vi.fn(() => () => undefined),
+  };
+}
+
+function createHarness(fastMode: FastModeApi) {
   const handlers = new Map<string, Handler[]>();
   let fastCommand: Handler | undefined;
   const pi = {
@@ -18,7 +37,7 @@ function createHarness(fastMode: FastModeStore) {
     },
   } as unknown as ExtensionAPI;
 
-  installCodexFastMode(pi, fastMode);
+  Effect.runSync(installCodexFastMode(pi).pipe(Effect.provide(Layer.succeed(FastMode, fastMode))));
 
   return {
     emit(name: string, ...args: unknown[]) {
@@ -41,7 +60,7 @@ function createContext() {
 
 describe("codex-fast-mode", () => {
   it("shares toggles across installers and can globally disable them again", async () => {
-    const fastMode = createFastModeStore();
+    const fastMode = makeTestFastMode();
     const first = createHarness(fastMode);
     const second = createHarness(fastMode);
     const ctx = createContext();
@@ -58,7 +77,7 @@ describe("codex-fast-mode", () => {
   });
 
   it("shows the current state when a new session starts", async () => {
-    const fastMode = createFastModeStore();
+    const fastMode = makeTestFastMode();
     const first = createHarness(fastMode);
     await first.runFast(createContext());
 

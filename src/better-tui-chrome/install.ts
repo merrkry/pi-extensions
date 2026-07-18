@@ -14,11 +14,12 @@ import {
   type EditorTheme,
   type TUI,
 } from "@earendil-works/pi-tui";
+import * as Effect from "effect/Effect";
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 
-import type { FastModeStore } from "../shared/fast-mode.js";
+import { FastMode } from "../shared/fast-mode.js";
 
 const EDITOR_INSET = 1;
 const EDITOR_INSET_TEXT = " ".repeat(EDITOR_INSET);
@@ -322,116 +323,120 @@ class ChromeFooter implements Component {
   }
 }
 
-export default function installBetterTuiChrome(pi: ExtensionAPI, fastMode: FastModeStore): void {
-  let currentEditor: InsetEditor | undefined;
-  let currentFooter: ChromeFooter | undefined;
-  let currentModel: FooterModel;
-  let fastModeEnabled = fastMode.enabled;
-  let unsubscribeFastMode: (() => void) | undefined;
+export default function installBetterTuiChrome(
+  pi: ExtensionAPI,
+): Effect.Effect<void, never, FastMode> {
+  return FastMode.useSync((fastMode) => {
+    let currentEditor: InsetEditor | undefined;
+    let currentFooter: ChromeFooter | undefined;
+    let currentModel: FooterModel;
+    let fastModeEnabled = fastMode.enabled;
+    let unsubscribeFastMode: (() => void) | undefined;
 
-  function invalidateFooterContextUsage(): void {
-    currentFooter?.invalidateContextUsage();
-  }
-
-  function requestChromeRender(): void {
-    if (currentEditor) {
-      currentEditor.requestChromeRender();
-      return;
+    function invalidateFooterContextUsage(): void {
+      currentFooter?.invalidateContextUsage();
     }
 
-    currentFooter?.requestRender();
-  }
+    function requestChromeRender(): void {
+      if (currentEditor) {
+        currentEditor.requestChromeRender();
+        return;
+      }
 
-  pi.on("thinking_level_select", () => {
-    requestChromeRender();
-  });
-
-  pi.on("model_select", (event) => {
-    currentModel = event.model;
-    invalidateFooterContextUsage();
-    requestChromeRender();
-  });
-
-  pi.on("agent_start", () => {
-    invalidateFooterContextUsage();
-    requestChromeRender();
-  });
-
-  pi.on("turn_start", () => {
-    invalidateFooterContextUsage();
-    requestChromeRender();
-  });
-
-  pi.on("turn_end", () => {
-    invalidateFooterContextUsage();
-    requestChromeRender();
-  });
-
-  pi.on("message_end", () => {
-    invalidateFooterContextUsage();
-    requestChromeRender();
-  });
-
-  pi.on("session_compact", () => {
-    invalidateFooterContextUsage();
-    requestChromeRender();
-  });
-
-  pi.on("session_shutdown", (_event, ctx) => {
-    unsubscribeFastMode?.();
-    unsubscribeFastMode = undefined;
-
-    if (ctx.mode === "tui") {
-      ctx.ui.setEditorComponent(undefined);
-      ctx.ui.setFooter(undefined);
+      currentFooter?.requestRender();
     }
 
-    currentEditor = undefined;
-    currentFooter = undefined;
-    currentModel = undefined;
-  });
-
-  pi.on("session_start", (_event, ctx) => {
-    currentModel = ctx.model;
-
-    if (ctx.mode !== "tui") return;
-
-    fastModeEnabled = fastMode.enabled;
-    unsubscribeFastMode?.();
-    unsubscribeFastMode = fastMode.subscribe((enabled) => {
-      if (enabled === fastModeEnabled) return;
-      fastModeEnabled = enabled;
-      currentFooter?.invalidate();
+    pi.on("thinking_level_select", () => {
       requestChromeRender();
     });
 
-    const footerContext: FooterContext = {
-      cwd: ctx.cwd,
-      getContextUsage: () => ctx.getContextUsage(),
-      getModel: () => currentModel,
-    };
-
-    ctx.ui.setEditorComponent((tui, theme, keybindings) => {
-      currentEditor = new InsetEditor(tui, theme, keybindings, (text) =>
-        editorBorderColor(ctx.ui.theme, pi.getThinkingLevel(), text),
-      );
-      return currentEditor;
+    pi.on("model_select", (event) => {
+      currentModel = event.model;
+      invalidateFooterContextUsage();
+      requestChromeRender();
     });
 
-    ctx.ui.setFooter((tui, theme, footerData) => {
-      const footer = new ChromeFooter(
-        tui,
-        footerContext,
-        footerData,
-        theme,
-        () => pi.getThinkingLevel(),
-        () => fastModeEnabled,
-        (disposed) => {
-          if (currentFooter === disposed) currentFooter = undefined;
-        },
-      );
-      currentFooter = footer;
-      return footer;
+    pi.on("agent_start", () => {
+      invalidateFooterContextUsage();
+      requestChromeRender();
+    });
+
+    pi.on("turn_start", () => {
+      invalidateFooterContextUsage();
+      requestChromeRender();
+    });
+
+    pi.on("turn_end", () => {
+      invalidateFooterContextUsage();
+      requestChromeRender();
+    });
+
+    pi.on("message_end", () => {
+      invalidateFooterContextUsage();
+      requestChromeRender();
+    });
+
+    pi.on("session_compact", () => {
+      invalidateFooterContextUsage();
+      requestChromeRender();
+    });
+
+    pi.on("session_shutdown", (_event, ctx) => {
+      unsubscribeFastMode?.();
+      unsubscribeFastMode = undefined;
+
+      if (ctx.mode === "tui") {
+        ctx.ui.setEditorComponent(undefined);
+        ctx.ui.setFooter(undefined);
+      }
+
+      currentEditor = undefined;
+      currentFooter = undefined;
+      currentModel = undefined;
+    });
+
+    pi.on("session_start", (_event, ctx) => {
+      currentModel = ctx.model;
+
+      if (ctx.mode !== "tui") return;
+
+      fastModeEnabled = fastMode.enabled;
+      unsubscribeFastMode?.();
+      unsubscribeFastMode = fastMode.subscribe((enabled) => {
+        if (enabled === fastModeEnabled) return;
+        fastModeEnabled = enabled;
+        currentFooter?.invalidate();
+        requestChromeRender();
+      });
+
+      const footerContext: FooterContext = {
+        cwd: ctx.cwd,
+        getContextUsage: () => ctx.getContextUsage(),
+        getModel: () => currentModel,
+      };
+
+      ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+        currentEditor = new InsetEditor(tui, theme, keybindings, (text) =>
+          editorBorderColor(ctx.ui.theme, pi.getThinkingLevel(), text),
+        );
+        return currentEditor;
+      });
+
+      ctx.ui.setFooter((tui, theme, footerData) => {
+        const footer = new ChromeFooter(
+          tui,
+          footerContext,
+          footerData,
+          theme,
+          () => pi.getThinkingLevel(),
+          () => fastModeEnabled,
+          (disposed) => {
+            if (currentFooter === disposed) currentFooter = undefined;
+          },
+        );
+        currentFooter = footer;
+        return footer;
+      });
     });
   });
 }

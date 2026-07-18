@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import { describe, expect, it, vi } from "vitest";
 
@@ -108,7 +109,7 @@ describe("installRtk", () => {
     } as unknown as ExtensionAPI;
 
     try {
-      await installRtk(pi);
+      await Effect.runPromise(installRtk(pi));
       expect(on).not.toHaveBeenCalled();
     } finally {
       warn.mockRestore();
@@ -127,7 +128,7 @@ describe("installRtk", () => {
       on,
     } as unknown as ExtensionAPI;
 
-    await installRtk(pi);
+    await Effect.runPromise(installRtk(pi));
 
     expect(on).toHaveBeenCalledWith("before_agent_start", expect.any(Function));
     expect(on).toHaveBeenCalledWith("tool_call", expect.any(Function));

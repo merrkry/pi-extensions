@@ -1,7 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import { describe, expect, it, vi } from "vitest";
 
-import type { FastModeStore } from "../shared/fast-mode.js";
+import { FastMode, type FastModeApi } from "../shared/fast-mode.js";
 import installBetterTuiChrome from "./install.js";
 
 type Handler = (...args: any[]) => unknown;
@@ -16,7 +18,7 @@ describe("better-tui-chrome fast-mode coordination", () => {
       setEnabled: vi.fn(),
       toggle: vi.fn(),
       subscribe,
-    } as FastModeStore;
+    } as FastModeApi;
     const pi = {
       on(name: string, handler: Handler) {
         handlers.set(name, [...(handlers.get(name) ?? []), handler]);
@@ -33,7 +35,9 @@ describe("better-tui-chrome fast-mode coordination", () => {
       },
     };
 
-    installBetterTuiChrome(pi, fastMode);
+    Effect.runSync(
+      installBetterTuiChrome(pi).pipe(Effect.provide(Layer.succeed(FastMode, fastMode))),
+    );
     handlers.get("session_start")?.[0]?.({}, ctx);
     expect(subscribe).toHaveBeenCalledOnce();
 

@@ -1,22 +1,32 @@
+import * as ManagedRuntime from "effect/ManagedRuntime";
 import { describe, expect, it, vi } from "vitest";
 
-import { createFastModeStore } from "./fast-mode.js";
+import { FastMode, FastModeLive } from "./fast-mode.js";
 
-describe("fast-mode store", () => {
-  it("coordinates process users and stops notifying disposed subscriptions", () => {
-    const store = createFastModeStore();
-    const first = vi.fn();
-    const second = vi.fn();
-    const unsubscribeFirst = store.subscribe(first);
-    store.subscribe(second);
+describe("FastMode service", () => {
+  it("shares process-global state across layers and stops disposed subscriptions", async () => {
+    const firstRuntime = ManagedRuntime.make(FastModeLive);
+    const secondRuntime = ManagedRuntime.make(FastModeLive);
+    const listener = vi.fn();
 
-    expect(store.toggle()).toBe(true);
-    expect(first).toHaveBeenCalledWith(true);
-    expect(second).toHaveBeenCalledWith(true);
+    try {
+      const unsubscribe = await firstRuntime.runPromise(
+        FastMode.useSync((fastMode) => {
+          fastMode.setEnabled(false);
+          return fastMode.subscribe(listener);
+        }),
+      );
 
-    unsubscribeFirst();
-    store.setEnabled(false);
-    expect(first).toHaveBeenCalledTimes(1);
-    expect(second).toHaveBeenLastCalledWith(false);
+      expect(
+        await secondRuntime.runPromise(FastMode.useSync((fastMode) => fastMode.toggle())),
+      ).toBe(true);
+      expect(listener).toHaveBeenCalledWith(true);
+
+      unsubscribe();
+      await secondRuntime.runPromise(FastMode.useSync((fastMode) => fastMode.setEnabled(false)));
+      expect(listener).toHaveBeenCalledTimes(1);
+    } finally {
+      await Promise.all([firstRuntime.dispose(), secondRuntime.dispose()]);
+    }
   });
 });

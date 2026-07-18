@@ -5,13 +5,16 @@ import {
   SettingsManager,
   type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
+import * as ManagedRuntime from "effect/ManagedRuntime";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { getFastModeStore } from "../shared/fast-mode.js";
+import { AppLayer } from "../app/layer.js";
+import { FastMode } from "../shared/fast-mode.js";
 
 const TEST_AGENT_DIR = "/tmp/pi-codex-fast-mode-sdk-test";
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 let piExtensions: ExtensionFactory;
+const serviceRuntime = ManagedRuntime.make(AppLayer);
 
 describe.sequential("codex-fast-mode SDK integration", () => {
   beforeAll(async () => {
@@ -19,13 +22,14 @@ describe.sequential("codex-fast-mode SDK integration", () => {
     piExtensions = (await import("../index.js")).default;
   });
 
-  afterAll(() => {
+  afterAll(async () => {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await serviceRuntime.dispose();
   });
 
-  beforeEach(() => {
-    getFastModeStore().setEnabled(false);
+  beforeEach(async () => {
+    await serviceRuntime.runPromise(FastMode.useSync((fastMode) => fastMode.setEnabled(false)));
   });
 
   it("does not reset process-global toggles while later sessions bind", async () => {
@@ -36,11 +40,11 @@ describe.sequential("codex-fast-mode SDK integration", () => {
     try {
       await parent.prompt("/fast");
       await childAfterEnable.bindExtensions({});
-      expect(getFastModeStore().enabled).toBe(true);
+      expect(await fastModeEnabled()).toBe(true);
 
       await parent.prompt("/fast");
       await childAfterDisable.bindExtensions({});
-      expect(getFastModeStore().enabled).toBe(false);
+      expect(await fastModeEnabled()).toBe(false);
     } finally {
       parent.dispose();
       childAfterEnable.dispose();
@@ -48,6 +52,10 @@ describe.sequential("codex-fast-mode SDK integration", () => {
     }
   });
 });
+
+function fastModeEnabled(): Promise<boolean> {
+  return serviceRuntime.runPromise(FastMode.useSync((fastMode) => fastMode.enabled));
+}
 
 async function createSession() {
   const settingsManager = SettingsManager.inMemory();

@@ -2,6 +2,7 @@
 // RTK is licensed under Apache-2.0: https://github.com/rtk-ai/rtk
 
 import { type ExtensionAPI, isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import * as Cause from "effect/Cause";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -32,75 +33,79 @@ function rewriteCommand(pi: ExtensionAPI, command: string) {
   return execRtk(pi, ["rewrite", command], "rewrite").pipe(Effect.map(extractRewrittenCommand));
 }
 
-export default async function installRtk(pi: ExtensionAPI): Promise<void> {
-  let enabled = false;
-  try {
-    enabled = await Effect.runPromise(
-      execRtk(pi, ["--version"], "version").pipe(
-        Effect.map((version) => {
-          if (version.killed || version.code !== 0) {
-            console.warn("[rtk] rtk binary not found or version check failed — extension disabled");
-            return false;
-          }
+export default function installRtk(pi: ExtensionAPI): Effect.Effect<void> {
+  return Effect.gen(function* () {
+    const enabled = yield* execRtk(pi, ["--version"], "version").pipe(
+      Effect.map((version) => {
+        if (version.killed || version.code !== 0) {
+          console.warn("[rtk] rtk binary not found or version check failed — extension disabled");
+          return false;
+        }
 
-          const parsed = parseSemver(version.stdout.replace(/^rtk\s+/, ""));
-          if (Option.isNone(parsed)) {
-            console.warn("[rtk] could not parse rtk version — extension disabled");
-            return false;
-          }
-          const [major, minor] = parsed.value;
-          if (major === 0 && minor < MIN_SUPPORTED_RTK_MINOR) {
-            console.warn(
-              `[rtk] rtk ${version.stdout.trim()} is too old (need >= 0.23.0) — extension disabled`,
-            );
-            return false;
-          }
-          return true;
+        const parsed = parseSemver(version.stdout.replace(/^rtk\s+/, ""));
+        if (Option.isNone(parsed)) {
+          console.warn("[rtk] could not parse rtk version — extension disabled");
+          return false;
+        }
+        const [major, minor] = parsed.value;
+        if (major === 0 && minor < MIN_SUPPORTED_RTK_MINOR) {
+          console.warn(
+            `[rtk] rtk ${version.stdout.trim()} is too old (need >= 0.23.0) — extension disabled`,
+          );
+          return false;
+        }
+        return true;
+      }),
+      Effect.catchTag("RtkExecError", (error) =>
+        Effect.sync(() => {
+          console.warn("[rtk] version check failed — extension disabled", error);
+          return false;
         }),
-        Effect.catchTag("RtkExecError", (error) =>
-          Effect.sync(() => {
-            console.warn("[rtk] version check failed — extension disabled", error);
-            return false;
-          }),
-        ),
+      ),
+      Effect.catchCause((cause) =>
+        Effect.sync(() => {
+          console.warn("[rtk] unexpected setup failure — extension disabled", Cause.squash(cause));
+          return false;
+        }),
       ),
     );
-  } catch (error) {
-    console.warn("[rtk] unexpected setup failure — extension disabled", error);
-  }
-  if (!enabled) return;
+    if (!enabled) return;
 
-  pi.on("before_agent_start", (event) => ({
-    systemPrompt: `${event.systemPrompt}\n\n${AGENT_INSTRUCTIONS}`,
-  }));
+    pi.on("before_agent_start", (event) => ({
+      systemPrompt: `${event.systemPrompt}\n\n${AGENT_INSTRUCTIONS}`,
+    }));
 
-  pi.on("tool_call", async (event, ctx) => {
-    try {
-      if (!isToolCallEventType("bash", event) && !isToolCallEventType("exec_command", event)) {
-        return;
+    pi.on("tool_call", async (event, ctx) => {
+      try {
+        if (!isToolCallEventType("bash", event) && !isToolCallEventType("exec_command", event)) {
+          return;
+        }
+
+        const targetOption = getRewriteTarget(event);
+        if (Option.isNone(targetOption)) return;
+        const target = targetOption.value;
+        if (target.command.startsWith("rtk ") || process.env.RTK_DISABLED === "1") return;
+
+        const rewrite = rewriteCommand(pi, target.command).pipe(
+          Effect.catchTag("RtkExecError", (error) =>
+            Effect.sync(() => {
+              console.warn("[rtk] rewrite failed; passing through command", error);
+              return Option.none<string>();
+            }),
+          ),
+        );
+        const rewritten = await Effect.runPromise(
+          rewrite,
+          ctx.signal ? { signal: ctx.signal } : {},
+        );
+        if (Option.isSome(rewritten) && rewritten.value !== target.command) {
+          target.apply(rewritten.value);
+        }
+      } catch (error) {
+        if (!ctx.signal?.aborted) {
+          console.warn("[rtk] unexpected rewrite failure; passing through command", error);
+        }
       }
-
-      const targetOption = getRewriteTarget(event);
-      if (Option.isNone(targetOption)) return;
-      const target = targetOption.value;
-      if (target.command.startsWith("rtk ") || process.env.RTK_DISABLED === "1") return;
-
-      const rewrite = rewriteCommand(pi, target.command).pipe(
-        Effect.catchTag("RtkExecError", (error) =>
-          Effect.sync(() => {
-            console.warn("[rtk] rewrite failed; passing through command", error);
-            return Option.none<string>();
-          }),
-        ),
-      );
-      const rewritten = await Effect.runPromise(rewrite, ctx.signal ? { signal: ctx.signal } : {});
-      if (Option.isSome(rewritten) && rewritten.value !== target.command) {
-        target.apply(rewritten.value);
-      }
-    } catch (error) {
-      if (!ctx.signal?.aborted) {
-        console.warn("[rtk] unexpected rewrite failure; passing through command", error);
-      }
-    }
+    });
   });
 }

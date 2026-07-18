@@ -1,8 +1,8 @@
 # Pi Extensions
 
-A private bundle of personal extensions for Pi Coding Agent. Features remain modular under `src/` and are composed through a single deterministic entry point.
+A private bundle of personal extensions for Pi Coding Agent.
 
-See [compatibility notes](docs/compatibility.md) for external integration contracts.
+See [architecture](docs/architecture.md) and [compatibility notes](docs/compatibility.md).
 
 ```bash
 pnpm format
