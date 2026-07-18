@@ -14,6 +14,7 @@ import { SpawnError, StdinWriteError, type UnifiedExecUnavailableError } from ".
 
 export const DEFAULT_HEAD_TAIL_MAX_BYTES = 1024 * 1024;
 const DEFAULT_STREAM_TAIL_BYTES = 32 * 1024;
+const STREAM_UPDATE_INTERVAL_MS = 250;
 const POST_EXIT_CLOSE_WAIT_MS = 50;
 const INTERRUPT_STATE_DEBOUNCE_MS = 500;
 
@@ -72,6 +73,7 @@ export class ExecSession {
   private requestedSignalVisibleAt = 0;
   private endedAtValue: number | undefined;
   private readonly stateListeners = new Set<() => void>();
+  private readonly outputListeners = new Set<() => void>();
 
   private constructor(
     readonly id: number,
@@ -145,6 +147,7 @@ export class ExecSession {
       this.appendStreamTail(chunk);
       this.logStream?.write(Buffer.from(chunk));
       Queue.offerUnsafe(this.outputSignal, undefined);
+      this.notifyOutputChange();
     });
     this.child.onExit((exitCode, signal, failureMessage) => {
       this.endedAtValue = Date.now();
@@ -202,9 +205,24 @@ export class ExecSession {
     }
   }
 
+  private notifyOutputChange(): void {
+    for (const listener of this.outputListeners) {
+      try {
+        listener();
+      } catch {
+        // Output collection must not be disrupted by streaming observers.
+      }
+    }
+  }
+
   onStateChange(listener: () => void): () => void {
     this.stateListeners.add(listener);
     return () => this.stateListeners.delete(listener);
+  }
+
+  onOutputChange(listener: () => void): () => void {
+    this.outputListeners.add(listener);
+    return () => this.outputListeners.delete(listener);
   }
 
   collectUntil(deadlineMs: number): Effect.Effect<Uint8Array> {
@@ -372,26 +390,53 @@ function streamSessionUpdates(
   deadlineMs: number,
   emit: (details: StreamUpdate) => void,
 ): Effect.Effect<void> {
-  return Effect.gen(function* () {
-    while (Date.now() < deadlineMs) {
-      yield* Effect.sleep(250);
-      const output = decoder.decode(session.snapshotStreamTail());
-      yield* Effect.sync(() =>
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const changes = yield* Queue.sliding<void>(1);
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          session.onOutputChange(() => {
+            Queue.offerUnsafe(changes, undefined);
+          }),
+        ),
+        (unsubscribe) => Effect.sync(unsubscribe),
+      );
+
+      let emittedBytes = 0;
+      const emitCurrent = () => {
+        const totalBytes = session.totalBytesSeen;
+        if (totalBytes === emittedBytes) return;
+        emittedBytes = totalBytes;
         emit({
           session_id: session.id,
           pid: session.pid,
           running: !session.hasExited,
-          total_bytes: session.totalBytesSeen,
+          total_bytes: totalBytes,
           tty: session.tty,
           command: session.displayCommand,
           cwd: session.cwd,
           log_path: session.logPath,
-          output,
-        }),
-      );
-      if (session.hasExited) return;
-    }
-  });
+          output: decoder.decode(session.snapshotStreamTail()),
+        });
+      };
+
+      yield* Queue.clear(changes);
+      yield* Effect.sync(emitCurrent);
+      while (Date.now() < deadlineMs && !session.hasExited) {
+        const remaining = deadlineMs - Date.now();
+        if (remaining <= 0) break;
+        const changed = yield* Queue.take(changes).pipe(Effect.timeoutOption(remaining));
+        if (Option.isNone(changed)) break;
+        const coalesceMs = Math.max(
+          0,
+          Math.min(STREAM_UPDATE_INTERVAL_MS, deadlineMs - Date.now()),
+        );
+        yield* Effect.sleep(coalesceMs);
+        yield* Queue.clear(changes);
+        yield* Effect.sync(emitCurrent);
+      }
+    }),
+  );
 }
 
 function concat(chunks: readonly Uint8Array[]): Uint8Array {

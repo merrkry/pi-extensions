@@ -11,6 +11,7 @@ import {
   MAX_YIELD_TIME_MS,
   resolveMaxEmptyPollMs,
   resolveWriteInput,
+  finalizeResponse,
 } from "./protocol.js";
 import { unescapeChars } from "./unescape.js";
 
@@ -125,5 +126,17 @@ describe("terminal output sanitization", () => {
           "\u0000\u0008\u009b2J\rnext\tvalue\u001b[",
       ),
     ).toBe("safe redlink\nnext\tvalue[");
+  });
+
+  it("does not retain raw output in truncation metadata", () => {
+    const response = finalizeResponse({
+      startedAt: Date.now(),
+      collected: encode(`\u001b[31m${"x\n".repeat(2_000)}\u001b[0m`),
+      tty: false,
+    });
+
+    expect(response.truncation).toBeDefined();
+    expect(response.truncation).not.toHaveProperty("content");
+    expect(response.output).not.toContain("\u001b");
   });
 });

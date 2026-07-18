@@ -37,3 +37,7 @@ Live capacity and exited history are bounded independently: up to 64 live or pen
 Pipe mode uses Node child processes. PTY mode uses the optional `@homebridge/node-pty-prebuilt-multiarch` package and fails explicitly when its native module is unavailable. Pi warns at session start when the PTY provider cannot load or the runtime is Bun; pipe mode remains available. Interrupt maps to `SIGINT` on POSIX and terminal Ctrl-C input for Windows PTY sessions; Windows pipe sessions do not expose a reliable graceful interrupt.
 
 Tool and management rendering is always bounded. Full output remains available through the runtime log while in-memory buffers and Agent-facing tails stay capped.
+
+TTY output is never streamed into Pi's update renderer. Pipe updates are output-driven,
+coalesced to at most four updates per second, and deduplicated after terminal sanitization;
+silent processes therefore cause no periodic TUI work.

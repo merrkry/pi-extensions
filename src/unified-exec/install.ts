@@ -1,4 +1,8 @@
-import type { AgentToolUpdateCallback, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentToolResult,
+  AgentToolUpdateCallback,
+  ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import { Type } from "typebox";
@@ -26,6 +30,7 @@ import {
   resolveMaxEmptyPollMs,
   resolveWriteInput,
   type ResponseShape,
+  type StreamingResponseShape,
   type WriteStdinArgs,
 } from "./protocol.js";
 import { renderExecCommandCall, renderResult, renderWriteStdinCall } from "./render.js";
@@ -153,10 +158,7 @@ export default function installUnifiedExec(
           ),
           signal,
         );
-        return {
-          content: [{ type: "text", text: renderResponseText(response) }],
-          details: response,
-        };
+        return finalToolResult(response);
       },
       renderCall: renderExecCommandCall,
       renderResult,
@@ -197,10 +199,7 @@ export default function installUnifiedExec(
           runWriteStdin(manager, parameters, onUpdate).pipe(Effect.mapError(toBoundaryError)),
           signal,
         );
-        return {
-          content: [{ type: "text", text: renderResponseText(response) }],
-          details: response,
-        };
+        return finalToolResult(response);
       },
       renderCall: renderWriteStdinCall,
       renderResult,
@@ -384,13 +383,13 @@ function withStreaming<E>(
   if (!onUpdate || session.tty) return operation;
   return Effect.scoped(
     Effect.gen(function* () {
+      let lastOutput = "";
       yield* Effect.forkScoped(
         session.streamUpdates(deadline, (update) => {
-          const response = streamResponse(update, session.startedAt);
-          onUpdate({
-            content: [{ type: "text", text: response.output }],
-            details: response,
-          });
+          const result = streamToolUpdate(update, session.startedAt);
+          if (!result.details.output || result.details.output === lastOutput) return;
+          lastOutput = result.details.output;
+          onUpdate(result);
         }),
       );
       const remaining = Math.max(1, deadline - Date.now());
@@ -400,17 +399,33 @@ function withStreaming<E>(
   );
 }
 
-function streamResponse(update: StreamUpdate, startedAt: number): ResponseShape {
+function streamToolUpdate(update: StreamUpdate, startedAt: number): AgentToolResult<ResponseShape> {
+  const response = streamResponse(update, startedAt);
   return {
+    content: [{ type: "text", text: response.output }],
+    details: response,
+  };
+}
+
+function streamResponse(update: StreamUpdate, startedAt: number): StreamingResponseShape {
+  return {
+    phase: "stream",
     chunk_id: "stream",
     wall_time_seconds: (Date.now() - startedAt) / 1000,
     output: sanitizeTerminalOutput(update.output),
     original_token_count: Math.ceil(update.total_bytes / 4),
     tty: update.tty,
     session_id: update.session_id,
-    log_path: update.log_path,
-    cwd: update.cwd,
-    command: update.command,
+    log_path: sanitizeTerminalOutput(update.log_path),
+    cwd: sanitizeTerminalOutput(update.cwd),
+    command: sanitizeTerminalOutput(update.command),
+  };
+}
+
+function finalToolResult(response: ResponseShape): AgentToolResult<ResponseShape> {
+  return {
+    content: [{ type: "text", text: renderResponseText(response) }],
+    details: response,
   };
 }
 

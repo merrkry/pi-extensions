@@ -36,6 +36,23 @@ describe("UnifiedExec service", () => {
     expect(result.state).toMatchObject({ hasExited: true, exitCode: 0 });
   });
 
+  it("streams only when pipe output changes", async () => {
+    const updates = await run(
+      Effect.gen(function* () {
+        const manager = yield* UnifiedExec;
+        const { session } = yield* manager.launch(spawnOptions("printf once; sleep 2"));
+        const received: string[] = [];
+        yield* session.streamUpdates(Date.now() + 700, (update) => {
+          received.push(update.output);
+        });
+        yield* manager.terminate(session.id, "SIGTERM");
+        return received;
+      }),
+    );
+
+    expect(updates).toEqual(["once"]);
+  });
+
   it("runs interactive commands through the optional PTY provider", async () => {
     const result = await run(
       Effect.gen(function* () {

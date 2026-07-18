@@ -9,7 +9,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import * as Effect from "effect/Effect";
 
-import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
+import { sanitizeTerminalOutput, type TerminalSafeText } from "../shared/sanitize-terminal.js";
 import { InvalidInputError } from "./errors.js";
 import { unescapeChars } from "./unescape.js";
 
@@ -37,22 +37,44 @@ export interface WriteStdinArgs {
   readonly yield_time_ms?: number;
 }
 
-export interface ResponseShape {
+export type TruncationMetadata = Omit<TruncationResult, "content">;
+
+interface ResponseBase {
   readonly chunk_id: string;
   readonly wall_time_seconds: number;
-  readonly output: string;
+  readonly output: TerminalSafeText;
   readonly original_token_count: number;
   readonly tty: boolean;
-  readonly session_id?: number;
-  readonly exit_code?: number;
-  readonly signal?: string;
-  readonly failure_message?: string;
-  readonly log_path?: string;
-  readonly cwd?: string;
-  readonly command?: string;
+  readonly failure_message?: TerminalSafeText;
+  readonly log_path?: TerminalSafeText;
+  readonly cwd?: TerminalSafeText;
+  readonly command?: TerminalSafeText;
   readonly yield_time_ms?: number;
-  readonly truncation?: TruncationResult;
+  readonly truncation?: TruncationMetadata;
 }
+
+export interface StreamingResponseShape extends ResponseBase {
+  readonly phase: "stream";
+  readonly session_id: number;
+  readonly exit_code?: never;
+  readonly signal?: never;
+}
+
+export interface YieldedResponseShape extends ResponseBase {
+  readonly phase: "yielded";
+  readonly session_id: number;
+  readonly exit_code?: never;
+  readonly signal?: never;
+}
+
+export interface ExitedResponseShape extends ResponseBase {
+  readonly phase: "exited";
+  readonly session_id?: never;
+  readonly exit_code?: number;
+  readonly signal?: NodeJS.Signals;
+}
+
+export type ResponseShape = StreamingResponseShape | YieldedResponseShape | ExitedResponseShape;
 
 export interface FinalizeInput {
   readonly startedAt: number;
@@ -137,23 +159,30 @@ export function finalizeResponse(input: FinalizeInput): ResponseShape {
     maxBytes: DEFAULT_MAX_BYTES,
     maxLines: DEFAULT_MAX_LINES,
   });
-  return {
+  const { content: _rawContent, ...truncationMetadata } = truncation;
+  const base: ResponseBase = {
     chunk_id: randomBytes(3).toString("hex"),
     wall_time_seconds: (Date.now() - input.startedAt) / 1000,
     output: sanitizeTerminalOutput(truncation.content),
     original_token_count: Math.ceil(input.collected.length / 4),
     tty: input.tty,
-    ...(input.sessionId === undefined ? {} : { session_id: input.sessionId }),
-    ...(input.exitCode === undefined || input.exitCode === null
-      ? {}
-      : { exit_code: input.exitCode }),
-    ...(input.signal ? { signal: input.signal } : {}),
     ...(input.failure ? { failure_message: sanitizeTerminalOutput(input.failure) } : {}),
     ...(input.logPath ? { log_path: sanitizeTerminalOutput(input.logPath) } : {}),
     ...(input.cwd ? { cwd: sanitizeTerminalOutput(input.cwd) } : {}),
     ...(input.command ? { command: sanitizeTerminalOutput(input.command) } : {}),
     ...(input.yieldTimeMs ? { yield_time_ms: input.yieldTimeMs } : {}),
-    ...(truncation.truncated ? { truncation } : {}),
+    ...(truncation.truncated ? { truncation: truncationMetadata } : {}),
+  };
+  if (input.sessionId !== undefined) {
+    return { ...base, phase: "yielded", session_id: input.sessionId };
+  }
+  return {
+    ...base,
+    phase: "exited",
+    ...(input.exitCode === undefined || input.exitCode === null
+      ? {}
+      : { exit_code: input.exitCode }),
+    ...(input.signal ? { signal: input.signal } : {}),
   };
 }
 
@@ -173,7 +202,7 @@ export function renderResponseText(shape: ResponseShape): string {
   return `${lines.join("\n")}\n---\n${shape.output || "(no output)"}${marker ? `\n\n${marker}` : ""}`;
 }
 
-function truncationMarker(truncation: TruncationResult, logPath: string | undefined): string {
+function truncationMarker(truncation: TruncationMetadata, logPath: string | undefined): string {
   const full = logPath ? `. Full output: ${logPath}` : "";
   if (truncation.lastLinePartial) {
     return `[Showing last ${formatSize(truncation.outputBytes)} of final line (line ${truncation.totalLines} is larger than the ${formatSize(DEFAULT_MAX_BYTES)} limit)${full}]`;

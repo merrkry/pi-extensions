@@ -2,6 +2,7 @@ import { initTheme, type AgentToolResult, type Theme } from "@earendil-works/pi-
 import { visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it } from "vitest";
 
+import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
 import type { ExecCommandArgs, ResponseShape } from "./protocol.js";
 import {
   COMMAND_EXPANDED_LINES,
@@ -27,15 +28,16 @@ const callContext = (args: ExecCommandArgs, expanded: boolean, lastComponent?: C
 });
 
 const response = (output: string): ResponseShape => ({
+  phase: "yielded",
   chunk_id: "test",
   wall_time_seconds: 1.25,
-  output,
+  output: sanitizeTerminalOutput(output),
   original_token_count: output.length,
   tty: false,
   session_id: 7,
-  log_path: "/tmp/unified.log",
-  cwd: "/workspace/project",
-  command: "test",
+  log_path: sanitizeTerminalOutput("/tmp/unified.log"),
+  cwd: sanitizeTerminalOutput("/workspace/project"),
+  command: sanitizeTerminalOutput("test"),
 });
 
 describe("unified-exec rendering", () => {

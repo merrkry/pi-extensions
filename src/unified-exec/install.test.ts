@@ -151,6 +151,7 @@ describe("unified-exec Pi adapter", () => {
     const details = result.details as ResponseShape;
 
     expect(details.exit_code).toBe(0);
+    expect(details.phase).toBe("exited");
     expect(details.session_id).toBeUndefined();
     expect(details.output).toBe("adapter-ok");
     expect(result.content[0]).toMatchObject({ type: "text" });
@@ -215,12 +216,36 @@ describe("unified-exec Pi adapter", () => {
     const details = result.details as ResponseShape;
 
     try {
-      expect(updates.length).toBeGreaterThan(0);
+      expect(updates).toHaveLength(1);
       for (const update of updates) {
         const text = (update.content[0] as { text: string }).text;
+        const updateDetails = update.details as ResponseShape;
+        expect(updateDetails.phase).toBe("stream");
+        expect(text).toBe(updateDetails.output);
         expect(text).toContain("first");
         expect(["\u001b", "\u0007"].some((control) => text.includes(control))).toBe(false);
       }
+    } finally {
+      if (details.session_id !== undefined) {
+        await harness.call("kill_session", { session_id: details.session_id });
+      }
+    }
+  });
+
+  it("does not emit periodic updates for a silent pipe process", async () => {
+    const harness = await makeHarness();
+    await harness.emit("session_start");
+    const updates: AgentToolResult<unknown>[] = [];
+    const result = await harness.call(
+      "exec_command",
+      { cmd: "sleep 2", yield_time_ms: 1_000 },
+      undefined,
+      (update) => updates.push(update),
+    );
+    const details = result.details as ResponseShape;
+
+    try {
+      expect(updates).toEqual([]);
     } finally {
       if (details.session_id !== undefined) {
         await harness.call("kill_session", { session_id: details.session_id });

@@ -9,7 +9,7 @@ import {
 import { Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 
 import { formatHomePath } from "../shared/display-path.js";
-import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
+import { sanitizeTerminalOutput, type TerminalSafeText } from "../shared/sanitize-terminal.js";
 import type { ExecCommandArgs, ResponseShape, WriteStdinArgs } from "./protocol.js";
 
 export const COMMAND_PREVIEW_LINES = 4;
@@ -22,6 +22,22 @@ interface RenderContext<TArgs> {
   readonly cwd: string;
   readonly expanded: boolean;
   readonly lastComponent: Component | undefined;
+}
+
+interface ResultRenderModel {
+  readonly output: TerminalSafeText;
+  readonly wallTime: number | undefined;
+  readonly sessionId: number | undefined;
+  readonly exitCode: number | undefined;
+  readonly signal: TerminalSafeText | undefined;
+  readonly failure: TerminalSafeText | undefined;
+  readonly logPath: TerminalSafeText | undefined;
+  readonly truncation?: {
+    readonly truncatedBy?: unknown;
+    readonly outputLines: number | undefined;
+    readonly totalLines: number | undefined;
+    readonly maxBytes: number | undefined;
+  };
 }
 
 class ExecCallComponent implements Component {
@@ -63,26 +79,27 @@ class ExecCallComponent implements Component {
 }
 
 class ResultComponent implements Component {
-  private result: AgentToolResult<ResponseShape> | undefined;
+  private model: ResultRenderModel = {
+    output: sanitizeTerminalOutput(""),
+    wallTime: undefined,
+    sessionId: undefined,
+    exitCode: undefined,
+    signal: undefined,
+    failure: undefined,
+    logPath: undefined,
+  };
   private options: ToolRenderResultOptions = { expanded: false, isPartial: false };
   private theme!: Theme;
 
-  update(
-    result: AgentToolResult<ResponseShape>,
-    options: ToolRenderResultOptions,
-    theme: Theme,
-  ): void {
-    this.result = result;
+  update(result: unknown, options: ToolRenderResultOptions, theme: Theme): void {
+    this.model = parseResultRenderModel(result);
     this.options = options;
     this.theme = theme;
   }
 
   render(width: number): string[] {
     if (width <= 0) return [];
-    const details = asRecord(this.result?.details);
-    const output = sanitizeTerminalOutput(
-      stringField(details, "output") ?? (this.result ? textContent(this.result) : ""),
-    );
+    const { output } = this.model;
     const lines: string[] = [];
 
     if (output) {
@@ -99,10 +116,10 @@ class ResultComponent implements Component {
       );
     }
 
-    const warning = details ? truncationWarning(details) : undefined;
+    const warning = truncationWarning(this.model);
     if (warning) lines.push("", truncateToWidth(this.theme.fg("warning", warning), width, "..."));
 
-    const status = details ? statusLine(details, this.options, this.theme) : undefined;
+    const status = statusLine(this.model, this.options, this.theme);
     if (status) {
       lines.push("", truncateToWidth(status, width, "..."));
     }
@@ -223,14 +240,12 @@ function hardLimitHint(
 }
 
 function statusLine(
-  details: Record<string, unknown>,
+  model: ResultRenderModel,
   options: ToolRenderResultOptions,
   theme: Theme,
 ): string | undefined {
   const fields: string[] = [];
-  const wallTime = finiteNumberField(details, "wall_time_seconds");
-  const sessionId = finiteNumberField(details, "session_id");
-  const exitCode = finiteNumberField(details, "exit_code");
+  const { wallTime, sessionId, exitCode } = model;
   if (wallTime !== undefined) {
     const timeLabel = options.isPartial ? "elapsed" : sessionId === undefined ? "took" : "yielded";
     fields.push(`${timeLabel} ${wallTime.toFixed(1)}s`);
@@ -240,35 +255,26 @@ function statusLine(
   } else if (exitCode !== undefined) {
     fields.push(exitCode === 0 ? `exit ${exitCode}` : theme.fg("error", `exit ${exitCode}`));
   } else {
-    const signal = stringField(details, "signal");
-    if (signal) fields.push(theme.fg("error", sanitizeTerminalOutput(signal)));
+    if (model.signal) fields.push(theme.fg("error", model.signal));
   }
-  const failure = stringField(details, "failure_message");
-  if (failure) {
-    fields.push(theme.fg("error", sanitizeTerminalOutput(failure)));
+  if (model.failure) {
+    fields.push(theme.fg("error", model.failure));
   }
-  const logPath = stringField(details, "log_path");
-  if (logPath) {
-    fields.push(`log ${formatHomePath(sanitizeTerminalOutput(logPath))}`);
+  if (model.logPath) {
+    fields.push(`log ${formatHomePath(model.logPath)}`);
   }
   return fields.length > 0 ? theme.fg("muted", fields.join(" · ")) : undefined;
 }
 
-function truncationWarning(details: Record<string, unknown>): string | undefined {
-  const truncation = asRecord(details["truncation"]);
-  if (truncation?.["truncated"] !== true) return undefined;
-  const logPath = stringField(details, "log_path");
-  const log = logPath ? `. Full output: ${sanitizeTerminalOutput(logPath)}` : "";
-  const outputLines = finiteNumberField(truncation, "outputLines");
-  const totalLines = finiteNumberField(truncation, "totalLines");
-  if (
-    truncation["truncatedBy"] === "lines" &&
-    outputLines !== undefined &&
-    totalLines !== undefined
-  ) {
+function truncationWarning(model: ResultRenderModel): string | undefined {
+  const { truncation } = model;
+  if (!truncation) return undefined;
+  const log = model.logPath ? `. Full output: ${model.logPath}` : "";
+  const { outputLines, totalLines } = truncation;
+  if (truncation.truncatedBy === "lines" && outputLines !== undefined && totalLines !== undefined) {
     return `[Truncated: showing ${outputLines} of ${totalLines} lines${log}]`;
   }
-  const maximum = finiteNumberField(truncation, "maxBytes") ?? DEFAULT_MAX_BYTES;
+  const maximum = truncation.maxBytes ?? DEFAULT_MAX_BYTES;
   const shown =
     outputLines === undefined ? "Output truncated" : `Truncated: ${outputLines} lines shown`;
   return `[${shown} (${formatSize(maximum)} limit)${log}]`;
@@ -304,9 +310,36 @@ function base64ByteLength(base64: string): number {
   return Math.max(0, Math.floor((compact.length * 3) / 4) - padding);
 }
 
-function textContent(result: AgentToolResult<unknown>): string {
-  if (!Array.isArray(result.content)) return "";
-  const first = asRecord(result.content[0]);
+function parseResultRenderModel(value: unknown): ResultRenderModel {
+  const result = asRecord(value);
+  const details = asRecord(result?.["details"]);
+  const truncation = asRecord(details?.["truncation"]);
+  const rawOutput = stringField(details, "output") ?? textContent(result);
+  return {
+    output: sanitizeTerminalOutput(rawOutput),
+    wallTime: finiteNumberField(details, "wall_time_seconds"),
+    sessionId: finiteNumberField(details, "session_id"),
+    exitCode: finiteNumberField(details, "exit_code"),
+    signal: safeStringField(details, "signal"),
+    failure: safeStringField(details, "failure_message"),
+    logPath: safeStringField(details, "log_path"),
+    ...(truncation?.["truncated"] === true
+      ? {
+          truncation: {
+            truncatedBy: truncation["truncatedBy"],
+            outputLines: finiteNumberField(truncation, "outputLines"),
+            totalLines: finiteNumberField(truncation, "totalLines"),
+            maxBytes: finiteNumberField(truncation, "maxBytes"),
+          },
+        }
+      : {}),
+  };
+}
+
+function textContent(result: Record<string, unknown> | undefined): string {
+  const content = result?.["content"];
+  if (!Array.isArray(content)) return "";
+  const first = asRecord(content[0]);
   return first?.["type"] === "text" && typeof first["text"] === "string" ? first["text"] : "";
 }
 
@@ -319,6 +352,14 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 function stringField(record: Record<string, unknown> | undefined, key: string): string | undefined {
   const value = record?.[key];
   return typeof value === "string" ? value : undefined;
+}
+
+function safeStringField(
+  record: Record<string, unknown> | undefined,
+  key: string,
+): TerminalSafeText | undefined {
+  const value = stringField(record, key);
+  return value === undefined ? undefined : sanitizeTerminalOutput(value);
 }
 
 function finiteNumberField(
