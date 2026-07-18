@@ -4,6 +4,7 @@ allowBuilds:
   "@google/genai": false
   esbuild: true
   msgpackr-extract: false
+  node-pty: true
   protobufjs: false
 
 minimumReleaseAgeExclude:

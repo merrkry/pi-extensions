@@ -1,0 +1,135 @@
+import { initTheme, type AgentToolResult, type Theme } from "@earendil-works/pi-coding-agent";
+import { visibleWidth, type Component } from "@earendil-works/pi-tui";
+import { beforeAll, describe, expect, it } from "vitest";
+
+import type { ExecCommandArgs, ResponseShape } from "./protocol.js";
+import {
+  COMMAND_EXPANDED_LINES,
+  COMMAND_PREVIEW_LINES,
+  OUTPUT_EXPANDED_LINES,
+  OUTPUT_PREVIEW_LINES,
+  renderExecCommandCall,
+  renderResult,
+} from "./render.js";
+
+beforeAll(() => initTheme(undefined, false));
+
+const theme = {
+  fg: (_color: string, text: string) => text,
+  bold: (text: string) => text,
+} as unknown as Theme;
+
+const callContext = (args: ExecCommandArgs, expanded: boolean, lastComponent?: Component) => ({
+  args,
+  cwd: "/workspace/project",
+  expanded,
+  lastComponent,
+});
+
+const response = (output: string): ResponseShape => ({
+  chunk_id: "test",
+  wall_time_seconds: 1.25,
+  output,
+  original_token_count: output.length,
+  tty: false,
+  session_id: 7,
+  log_path: "/tmp/unified.log",
+  cwd: "/workspace/project",
+  command: "test",
+});
+
+describe("unified-exec rendering", () => {
+  it("caps a streaming command while keeping cwd on a stable separate line", () => {
+    const args = {
+      cmd: ["first", "second", "third", "fourth", "fifth", "sixth"].join("\n"),
+    };
+    const component = renderExecCommandCall(args, theme, callContext(args, false));
+    const lines = component.render(80);
+
+    expect(lines.at(-1)).toBe("cwd  /workspace/project");
+    expect(lines.some((line) => line.includes("$ first"))).toBe(true);
+    expect(lines.some((line) => line.includes("sixth"))).toBe(false);
+    expect(lines.length).toBe(COMMAND_PREVIEW_LINES + 2);
+    expect(lines.every((line) => visibleWidth(line) <= 80)).toBe(true);
+
+    const updated = { ...args, cmd: `${args.cmd}\nseventh` };
+    const updatedLines = renderExecCommandCall(
+      updated,
+      theme,
+      callContext(updated, false, component),
+    ).render(80);
+    expect(updatedLines.at(-1)).toBe("cwd  /workspace/project");
+  });
+
+  it("uses the global tool expansion state for full command and output", () => {
+    const args = {
+      cmd: ["first", "second", "third", "fourth", "fifth", "sixth"].join("\n"),
+    };
+    const call = renderExecCommandCall(args, theme, callContext(args, true));
+    expect(call.render(80).some((line) => line.includes("$ first"))).toBe(true);
+
+    const output = Array.from(
+      { length: 12 },
+      (_, index) => `row-${String(index + 1).padStart(2, "0")}`,
+    ).join("\n");
+    const result: AgentToolResult<ResponseShape> = {
+      content: [{ type: "text", text: output }],
+      details: response(output),
+    };
+    const collapsed = renderResult(result, { expanded: false, isPartial: true }, theme, {
+      args: {},
+      cwd: "/workspace/project",
+      expanded: false,
+      lastComponent: undefined,
+    });
+    const collapsedLines = collapsed.render(80);
+    expect(collapsedLines.some((line) => line.includes("row-01"))).toBe(false);
+    expect(collapsedLines.some((line) => line.includes("row-12"))).toBe(true);
+    expect(collapsedLines.filter((line) => line.includes("row-")).length).toBe(
+      OUTPUT_PREVIEW_LINES,
+    );
+
+    const expanded = renderResult(result, { expanded: true, isPartial: false }, theme, {
+      args: {},
+      cwd: "/workspace/project",
+      expanded: true,
+      lastComponent: collapsed,
+    });
+    expect(expanded.render(80).some((line) => line.includes("row-01"))).toBe(true);
+  });
+
+  it("applies hard visual-line limits even when expanded", () => {
+    const commandRows = Array.from(
+      { length: COMMAND_EXPANDED_LINES + 20 },
+      (_, index) => `command-${String(index + 1).padStart(3, "0")}`,
+    );
+    const args = { cmd: commandRows.join("\n") };
+    const commandLines = renderExecCommandCall(args, theme, callContext(args, true)).render(80);
+    expect(commandLines.some((line) => line.includes("$ command-001"))).toBe(true);
+    expect(commandLines.some((line) => line.includes("command-100"))).toBe(false);
+    expect(commandLines.some((line) => line.includes("Display limit"))).toBe(true);
+    expect(commandLines.length).toBe(COMMAND_EXPANDED_LINES + 2);
+
+    const outputRows = Array.from(
+      { length: OUTPUT_EXPANDED_LINES + 20 },
+      (_, index) => `output-${String(index + 1).padStart(3, "0")}`,
+    );
+    const output = outputRows.join("\n");
+    const result: AgentToolResult<ResponseShape> = {
+      content: [{ type: "text", text: output }],
+      details: response(output),
+    };
+    const outputLines = renderResult(result, { expanded: true, isPartial: false }, theme, {
+      args: {},
+      cwd: "/workspace/project",
+      expanded: true,
+      lastComponent: undefined,
+    }).render(80);
+    expect(outputLines.some((line) => line.includes("output-001"))).toBe(false);
+    expect(outputLines.some((line) => line.includes("output-220"))).toBe(true);
+    expect(outputLines.some((line) => line.includes("Display limit"))).toBe(true);
+    expect(outputLines.filter((line) => line.includes("output-")).length).toBe(
+      OUTPUT_EXPANDED_LINES,
+    );
+  });
+});

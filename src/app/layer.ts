@@ -1,9 +1,10 @@
 import * as Layer from "effect/Layer";
 
 import { FastModeLive } from "../shared/fast-mode.js";
+import { UnifiedExecLive } from "../unified-exec/service.js";
 
 /**
  * Process/extension-lifetime capabilities only. Background resources tied to a
  * Pi session belong in session lifecycle scopes, not this application layer.
  */
-export const AppLayer = Layer.mergeAll(FastModeLive);
+export const AppLayer = Layer.mergeAll(FastModeLive, UnifiedExecLive);

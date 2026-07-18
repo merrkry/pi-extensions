@@ -33,6 +33,9 @@
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
+  "optionalDependencies": {
+    "node-pty": "1.1.0"
+  },
   "packageManager": "pnpm@11.8.0",
   "pi": {
     "extensions": [

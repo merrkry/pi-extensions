@@ -12,6 +12,7 @@ See [architecture](docs/architecture.md) and [compatibility notes](docs/compatib
 - [RTK](src/rtk/README.md)
 - [Thinking Filter](src/thinking-filter/README.md)
 - [Tool Tweaks](src/tool-tweaks/README.md)
+- [Unified Exec](src/unified-exec/README.md)
 - [Shared capabilities](src/shared/README.md)
 
 ```bash

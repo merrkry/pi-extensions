@@ -14,6 +14,14 @@ src/
 
 A feature should keep its core behavior and Pi integration together under one folder. Use role-oriented filenames such as `install.ts`, `service.ts`, or `policy.ts`; an `index.ts` is not required. Small features may remain in one file, while larger ones should separate pure core logic from Pi-facing glue.
 
+## Unified exec
+
+`src/unified-exec/` is the internal Effect-based successor to the external `pi-unified-exec` extension. Pure protocol, shell, buffering, and rendering code stays separate from process ownership. `UnifiedExec` is the capability boundary: its scoped Layer owns the session registry, bounds concurrent spawns, serializes operations per session, exposes typed failures, and terminates remaining process trees when its scope closes.
+
+Pi tool callbacks are the error-display boundary. Calls run as interruptible Effects using Pi's abort signal; interrupting a wait does not terminate the owned process. A one-element sliding Effect Queue bridges process callbacks into interruptible output waits without losing a notification between draining and waiting. The service registry is protected by a semaphore, while each session has its own semaphore to prevent concurrent polls from racing to drain the same output.
+
+The module is a product-focused redesign derived from `pi-unified-exec`, not a line-for-line port. It preserves the four core tool names and session-oriented behavior. Tool rendering is a pure boundary concern; session-management widgets and the interactive management command remain deferred while their UX is redesigned. The PTY implementation uses the maintained official `node-pty` package; pipe mode remains available if the optional native module cannot load.
+
 ## Composition
 
 `src/app/` is the composition root:
