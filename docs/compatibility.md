@@ -2,6 +2,14 @@
 
 This document records the external contracts used by the root Pi extension bundle. They are not general guarantees about similarly named tools or alternative extensions.
 
+## Pi host
+
+Pi supplies `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-ai`, and `typebox` to loaded extensions. Following Pi's package guidance, imported host modules remain external to the bundle and are declared as `"*"` peer dependencies rather than installed by Pi's extension package manager.
+
+The `"*"` peer range is a loading convention, not a compatibility guarantee. Pi is pre-1.0 and its changelog includes extension-facing breaking changes in patch releases. This bundle is developed and tested against the versions resolved in `pnpm-lock.yaml`; support for another Pi host version must be established by testing the APIs used here.
+
+Development uses Pi-compatible TypeBox because runtime schemas are created and validated with the host-provided TypeBox implementation.
+
 ## `pi-unified-exec`
 
 [`pi-unified-exec`](https://github.com/merrkry/pi-unified-exec/commits/prod/) provides `exec_command`, whose command text is `input.cmd`; Pi's built-in `bash` uses `input.command`.

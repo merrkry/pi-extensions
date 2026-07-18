@@ -15,18 +15,18 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "effect": "4.0.0-beta.97"
+    "effect": "~4.0.0-beta.97"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.80.6",
-    "@earendil-works/pi-tui": "0.80.6",
-    "@types/node": "^24.13.2",
-    "esbuild": "^0.25.12",
-    "oxfmt": "0.57.0",
-    "oxlint": "1.72.0",
-    "typebox": "1.1.38",
-    "typescript": "^5.9.3",
-    "vitest": "^4.1.9"
+    "@earendil-works/pi-coding-agent": "~0.80.10",
+    "@earendil-works/pi-tui": "~0.80.10",
+    "@types/node": "^26.1.1",
+    "esbuild": "~0.28.1",
+    "oxfmt": "~0.58.0",
+    "oxlint": "^1.73.0",
+    "typebox": "~1.1.38",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
