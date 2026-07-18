@@ -1,19 +1,10 @@
-import type {
-  AgentToolUpdateCallback,
-  ExtensionAPI,
-  ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import type { AgentToolUpdateCallback, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import { Type } from "typebox";
 
 import { loadPty } from "./child.js";
-import {
-  clearProcessStatus,
-  manageProcesses,
-  renderAgentInventory,
-  updateProcessStatus,
-} from "./management.js";
+import { manageProcesses, renderAgentInventory } from "./management.js";
 import {
   errorMessage,
   InvalidInputError,
@@ -68,16 +59,10 @@ export default function installUnifiedExec(
       default: false,
     });
 
-    let statusContext: ExtensionContext | undefined;
     let pendingAgentInventory: string | undefined;
-    yield* manager.subscribe((sessions) => {
-      if (statusContext) updateProcessStatus(statusContext, sessions);
-    });
 
-    pi.on("session_start", async (_event, context) => {
-      statusContext = context;
+    pi.on("session_start", async () => {
       await runEffect(manager.resume);
-      updateProcessStatus(context, await runEffect(manager.inventory));
       if (pi.getFlag("keep-builtin-bash") !== true) {
         pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "bash"));
       }
@@ -105,9 +90,7 @@ export default function installUnifiedExec(
       };
     });
 
-    pi.on("session_shutdown", async (_event, context) => {
-      clearProcessStatus(context);
-      statusContext = undefined;
+    pi.on("session_shutdown", async () => {
       pendingAgentInventory = undefined;
       await runEffect(manager.shutdown);
     });
@@ -139,7 +122,9 @@ export default function installUnifiedExec(
               "Shell binary. Defaults to bash (on Windows: bash if available, else powershell).",
           }),
         ),
-        tty: Type.Optional(Type.Boolean({ description: "Allocate a PTY. Default false." })),
+        tty: Type.Optional(
+          Type.Boolean({ description: "Allocate a PTY. Default false.", default: false }),
+        ),
         yield_time_ms: Type.Optional(
           Type.Number({
             description: `Wait before yielding, clamped to [${MIN_YIELD_TIME_MS}, ${MAX_YIELD_TIME_MS}] ms.`,
@@ -249,20 +234,14 @@ export default function installUnifiedExec(
     pi.registerTool({
       name: "list_sessions",
       label: "list_sessions",
-      description:
-        "List owned sessions. Sessions that exited since the previous call are reported once and then reaped.",
-      promptSnippet: "List live sessions",
+      description: "List live sessions and retained exited-session tombstones.",
+      promptSnippet: "List live sessions and exited tombstones",
       executionMode: "parallel",
       parameters: Type.Object({}),
       async execute(_toolCallId, _parameters, signal) {
         const all = await runEffect(manager.list(), signal);
         const now = Date.now();
         const sessions = all.map((session) => sessionSummary(session, now));
-        await Promise.all(
-          all
-            .filter((session) => session.hasExited)
-            .map((session) => runEffect(manager.remove(session.id))),
-        );
         const lines = sessions.length
           ? sessions.map(
               (session) =>
@@ -367,7 +346,6 @@ function runWriteStdin(
       }),
     );
     if (session.hasExited) {
-      yield* manager.remove(session.id);
       return finalizeForSession(
         session,
         startedAt,
@@ -450,7 +428,8 @@ function sessionSummary(session: ExecSession, now: number) {
     tty: session.tty,
     pid: session.pid,
     started_at_ms: session.startedAt,
-    elapsed_ms: now - session.startedAt,
+    ended_at_ms: session.endedAt,
+    elapsed_ms: (session.endedAt ?? now) - session.startedAt,
     running: !session.hasExited,
     exit_code: session.exitCode,
     signal: session.signal,

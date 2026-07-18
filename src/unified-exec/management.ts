@@ -5,44 +5,29 @@ import {
   truncateHead,
   truncateTail,
   type ExtensionCommandContext,
+  type KeybindingsManager,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
-  Key,
   matchesKey,
-  SelectList,
+  Text,
   truncateToWidth,
+  visibleWidth,
   type Component,
-  type SelectItem,
 } from "@earendil-works/pi-tui";
 import * as Effect from "effect/Effect";
 
+import { formatHomePath } from "../shared/display-path.js";
 import { errorMessage, type UnifiedExecError } from "./errors.js";
 import type { AgentSessionSnapshot, SessionSnapshot, UnifiedExecApi } from "./service.js";
 
 const AGENT_COMMAND_MAX_BYTES = 128;
 const AGENT_OUTPUT_MAX_BYTES_PER_SESSION = 256;
 const AGENT_OUTPUT_MAX_LINES_PER_SESSION = 4;
-const STATUS_KEY = "unified-exec";
-
 type ManagementAction =
   | { readonly type: "details"; readonly sessionId: number }
-  | { readonly type: "term"; readonly sessionId: number }
-  | { readonly type: "kill"; readonly sessionId: number }
-  | { readonly type: "refresh" };
-
-export function updateProcessStatus(
-  context: Pick<ExtensionCommandContext, "ui">,
-  sessions: readonly SessionSnapshot[],
-): void {
-  const active = sessions.filter((session) => session.phase !== "exited").length;
-  const color = active > 0 ? "accent" : "dim";
-  context.ui.setStatus(STATUS_KEY, context.ui.theme.fg(color, `exec ${active}`));
-}
-
-export function clearProcessStatus(context: Pick<ExtensionCommandContext, "ui">): void {
-  context.ui.setStatus(STATUS_KEY, undefined);
-}
+  | { readonly type: "interrupt"; readonly sessionId: number }
+  | { readonly type: "kill"; readonly sessionId: number };
 
 export function renderAgentInventory(
   sessions: readonly AgentSessionSnapshot[],
@@ -54,7 +39,7 @@ export function renderAgentInventory(
   for (const session of sessions) {
     lines.push(
       `#${session.sessionId} ${describeAgentState(session)} ${session.tty ? "tty" : "pipe"} running_for=${formatElapsed(
-        now - session.startedAt,
+        sessionDuration(session, now),
       )} cwd=${JSON.stringify(session.cwd)} cmd=${JSON.stringify(commandSummary(session.command))}`,
     );
   }
@@ -82,57 +67,59 @@ export async function manageProcesses(
 async function manageProcessesInTui(
   manager: UnifiedExecApi,
   context: ExtensionCommandContext,
+  selectedSessionId?: number,
 ): Promise<void> {
   const initial = await Effect.runPromise(manager.inventory);
-  const action = await showProcessManager(manager, context, initial);
+  const action = await showProcessManager(manager, context, initial, selectedSessionId);
   if (!action) return;
-  if (action.type === "refresh") return manageProcessesInTui(manager, context);
   const session = (await Effect.runPromise(manager.inventory)).find(
     (candidate) => candidate.sessionId === action.sessionId,
   );
-  if (!session) {
-    context.ui.notify(`Session ${action.sessionId} no longer exists.`, "warning");
-    return manageProcessesInTui(manager, context);
-  }
+  if (!session) return manageProcessesInTui(manager, context, action.sessionId);
   if (action.type === "details") {
     context.ui.notify(renderDetails(session), "info");
-    return manageProcessesInTui(manager, context);
+    return manageProcessesInTui(manager, context, action.sessionId);
   }
   if (session.phase === "exited") {
-    context.ui.notify(`Session ${session.sessionId} has already exited.`, "warning");
-    return manageProcessesInTui(manager, context);
+    return manageProcessesInTui(manager, context, action.sessionId);
   }
-  if (action.type === "kill") {
-    const confirmed = await context.ui.confirm(
-      `Kill session ${session.sessionId}?`,
-      `Send SIGKILL immediately to this process tree?\n\n${singleLine(session.command, 256)}`,
-    );
-    if (!confirmed) return manageProcessesInTui(manager, context);
-  }
-  const signal: NodeJS.Signals = action.type === "term" ? "SIGTERM" : "SIGKILL";
   try {
-    await Effect.runPromise(manager.signal(session.sessionId, signal));
-    context.ui.notify(`${signal} sent to session ${session.sessionId}.`, "info");
+    if (action.type === "interrupt") {
+      if (!isDuplicateSignal(session, "SIGINT")) {
+        const result = await Effect.runPromise(manager.interrupt(session.sessionId));
+        if (!result.sent && result.session.phase !== "exited") {
+          context.ui.notify(
+            `Interrupt is unavailable for pipe session ${session.sessionId} on Windows.`,
+            "warning",
+          );
+        }
+      }
+    } else if (!isDuplicateSignal(session, "SIGKILL")) {
+      await Effect.runPromise(manager.signal(session.sessionId, "SIGKILL"));
+    }
   } catch (cause) {
-    context.ui.notify(managementError(cause), "error");
+    if (!isSessionNotFound(cause)) context.ui.notify(managementError(cause), "error");
   }
-  return manageProcessesInTui(manager, context);
+  return manageProcessesInTui(manager, context, action.sessionId);
 }
 
 class ProcessManagerComponent implements Component {
   private sessions: readonly SessionSnapshot[];
   private selectedSessionId: number | undefined;
-  private list: SelectList | undefined;
 
   constructor(
     sessions: readonly SessionSnapshot[],
-    private readonly maximumVisible: number,
+    selectedSessionId: number | undefined,
+    private readonly getMaximumVisible: () => number,
     private readonly theme: Theme,
+    private readonly keybindings: KeybindingsManager,
+    private readonly refresh: () => void,
     private readonly finish: (action: ManagementAction | undefined) => void,
   ) {
     this.sessions = sessions;
-    this.selectedSessionId = sessions[0]?.sessionId;
-    this.rebuildList();
+    this.selectedSessionId = sessions.some((session) => session.sessionId === selectedSessionId)
+      ? selectedSessionId
+      : sessions[0]?.sessionId;
   }
 
   update(sessions: readonly SessionSnapshot[]): void {
@@ -140,103 +127,144 @@ class ProcessManagerComponent implements Component {
     if (!sessions.some((session) => session.sessionId === this.selectedSessionId)) {
       this.selectedSessionId = sessions[0]?.sessionId;
     }
-    this.rebuildList();
-  }
-
-  refreshElapsed(): void {
-    this.rebuildList();
   }
 
   render(width: number): string[] {
     if (width <= 0) return [];
-    const top = new DynamicBorder((text: string) => this.theme.fg("borderAccent", text));
-    const bottom = new DynamicBorder((text: string) => this.theme.fg("borderMuted", text));
+    const border = new DynamicBorder();
+    const maximumVisible = this.getMaximumVisible();
     const lines = [
-      ...top.render(width),
+      ...border.render(width),
       truncateToWidth(this.theme.fg("accent", this.theme.bold("Background processes")), width),
+      "",
     ];
-    if (this.list) {
-      lines.push(...this.list.render(width));
-    } else {
+    if (this.sessions.length === 0) {
       lines.push(this.theme.fg("muted", "  No owned processes."));
+    } else {
+      const selectedIndex = Math.max(
+        0,
+        this.sessions.findIndex((session) => session.sessionId === this.selectedSessionId),
+      );
+      const start = Math.min(
+        Math.max(0, selectedIndex - maximumVisible + 1),
+        Math.max(0, this.sessions.length - maximumVisible),
+      );
+      const visible = this.sessions.slice(start, start + maximumVisible);
+      if (start > 0) lines.push(this.theme.fg("dim", `  ${start} processes above`));
+      for (const [index, session] of visible.entries()) {
+        if (index > 0) lines.push("");
+        lines.push(
+          ...renderProcessCard(
+            session,
+            session.sessionId === this.selectedSessionId,
+            width,
+            this.theme,
+          ),
+        );
+      }
+      const below = this.sessions.length - start - visible.length;
+      if (below > 0) lines.push(this.theme.fg("dim", `  ${below} processes below`));
     }
     lines.push(
+      "",
       truncateToWidth(
         this.theme.fg(
           "dim",
-          "↑↓ navigate · enter details · t TERM · k KILL · r refresh · esc close",
+          "up/down navigate · enter details · i interrupt · k kill · r refresh · esc close",
         ),
         width,
         "...",
       ),
-      ...bottom.render(width),
+      ...border.render(width),
     );
     return lines;
   }
 
   handleInput(data: string): void {
     if (matchesKey(data, "r")) {
-      this.finish({ type: "refresh" });
+      this.refresh();
       return;
     }
-    const selected = this.selectedSessionId;
-    if (selected !== undefined && matchesKey(data, "t")) {
-      this.finish({ type: "term", sessionId: selected });
-      return;
-    }
-    if (selected !== undefined && matchesKey(data, "k")) {
-      this.finish({ type: "kill", sessionId: selected });
-      return;
-    }
-    if (!this.list && (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")))) {
+    if (this.keybindings.matches(data, "tui.select.cancel")) {
       this.finish(undefined);
       return;
     }
-    this.list?.handleInput(data);
+    if (this.keybindings.matches(data, "tui.select.up")) {
+      this.moveSelection(-1);
+      return;
+    }
+    if (this.keybindings.matches(data, "tui.select.down")) {
+      this.moveSelection(1);
+      return;
+    }
+    if (this.keybindings.matches(data, "tui.select.pageUp")) {
+      this.moveSelection(-this.getMaximumVisible());
+      return;
+    }
+    if (this.keybindings.matches(data, "tui.select.pageDown")) {
+      this.moveSelection(this.getMaximumVisible());
+      return;
+    }
+    const selected = this.selectedSessionId;
+    if (selected === undefined) return;
+    const session = this.sessions.find((candidate) => candidate.sessionId === selected);
+    if (!session) return;
+    if (this.keybindings.matches(data, "tui.select.confirm")) {
+      this.finish({ type: "details", sessionId: selected });
+    } else if (matchesKey(data, "i")) {
+      if (session.phase === "exited" || isDuplicateSignal(session, "SIGINT")) return;
+      this.finish({ type: "interrupt", sessionId: selected });
+    } else if (matchesKey(data, "k")) {
+      if (session.phase === "exited" || isDuplicateSignal(session, "SIGKILL")) return;
+      this.finish({ type: "kill", sessionId: selected });
+    }
   }
 
   invalidate(): void {
-    this.list?.invalidate();
+    // All themed content is rebuilt on every render.
   }
 
-  private rebuildList(): void {
-    if (this.sessions.length === 0) {
-      this.list = undefined;
-      return;
-    }
-    const items: SelectItem[] = this.sessions.map((session) => ({
-      value: String(session.sessionId),
-      label: renderListLabel(session, this.theme),
-      description: session.cwd,
-    }));
-    const list = new SelectList(items, Math.min(items.length, this.maximumVisible), {
-      selectedPrefix: (text) => this.theme.fg("accent", text),
-      selectedText: (text) => this.theme.fg("accent", text),
-      description: (text) => this.theme.fg("muted", text),
-      scrollInfo: (text) => this.theme.fg("dim", text),
-      noMatch: (text) => this.theme.fg("warning", text),
-    });
-    const selectedIndex = items.findIndex((item) => Number(item.value) === this.selectedSessionId);
-    list.setSelectedIndex(Math.max(0, selectedIndex));
-    list.onSelectionChange = (item) => {
-      this.selectedSessionId = Number(item.value);
-    };
-    list.onSelect = (item) => {
-      this.finish({ type: "details", sessionId: Number(item.value) });
-    };
-    list.onCancel = () => this.finish(undefined);
-    this.list = list;
+  private moveSelection(delta: number): void {
+    if (this.sessions.length === 0) return;
+    const current = Math.max(
+      0,
+      this.sessions.findIndex((session) => session.sessionId === this.selectedSessionId),
+    );
+    const next = Math.max(0, Math.min(this.sessions.length - 1, current + delta));
+    this.selectedSessionId = this.sessions[next]?.sessionId;
   }
+}
+
+function maximumVisibleProcesses(terminalRows: number): number {
+  return Math.max(1, Math.min(8, Math.floor((terminalRows - 7) / 4)));
 }
 
 async function showProcessManager(
   manager: UnifiedExecApi,
   context: ExtensionCommandContext,
   initial: readonly SessionSnapshot[],
+  selectedSessionId: number | undefined,
 ): Promise<ManagementAction | undefined> {
-  return context.ui.custom<ManagementAction | undefined>((tui, theme, _keybindings, done) => {
-    const maximumVisible = Math.max(3, Math.min(14, tui.terminal.rows - 8));
-    const component = new ProcessManagerComponent(initial, maximumVisible, theme, done);
+  return context.ui.custom<ManagementAction | undefined>((tui, theme, keybindings, done) => {
+    let component: ProcessManagerComponent;
+    const refresh = () => {
+      void Effect.runPromise(manager.inventory).then(
+        (sessions) => {
+          component.update(sessions);
+          tui.requestRender();
+        },
+        (cause) => context.ui.notify(managementError(cause), "error"),
+      );
+    };
+    component = new ProcessManagerComponent(
+      initial,
+      selectedSessionId,
+      () => maximumVisibleProcesses(tui.terminal.rows),
+      theme,
+      keybindings,
+      refresh,
+      done,
+    );
     const unsubscribe = Effect.runSync(
       manager.subscribe((sessions) => {
         component.update(sessions);
@@ -244,7 +272,6 @@ async function showProcessManager(
       }),
     );
     const timer = setInterval(() => {
-      component.refreshElapsed();
       tui.requestRender();
     }, 1_000);
     timer.unref();
@@ -279,49 +306,92 @@ async function manageProcessesWithDialogs(
   if (!session) return;
   const action = await context.ui.select(`Session ${session.sessionId}`, [
     "View details",
-    "Send SIGTERM",
-    "Send SIGKILL",
+    "Interrupt",
+    "Kill",
   ]);
   if (action === "View details") {
     context.ui.notify(renderDetails(session), "info");
     return;
   }
-  if (action !== "Send SIGTERM" && action !== "Send SIGKILL") return;
-  if (session.phase === "exited") {
-    context.ui.notify(`Session ${session.sessionId} has already exited.`, "warning");
-    return;
-  }
-  if (action === "Send SIGKILL") {
-    const confirmed = await context.ui.confirm(
-      `Kill session ${session.sessionId}?`,
-      "Send SIGKILL immediately to this process tree?",
-    );
-    if (!confirmed) return;
-  }
-  const signal = action === "Send SIGTERM" ? "SIGTERM" : "SIGKILL";
+  if (action !== "Interrupt" && action !== "Kill") return;
+  if (session.phase === "exited") return;
   try {
-    await Effect.runPromise(manager.signal(session.sessionId, signal));
-    context.ui.notify(`${signal} sent to session ${session.sessionId}.`, "info");
+    if (action === "Interrupt") {
+      if (isDuplicateSignal(session, "SIGINT")) return;
+      const result = await Effect.runPromise(manager.interrupt(session.sessionId));
+      if (!result.sent && result.session.phase !== "exited") {
+        context.ui.notify(
+          `Interrupt is unavailable for pipe session ${session.sessionId} on Windows.`,
+          "warning",
+        );
+      }
+    } else {
+      if (isDuplicateSignal(session, "SIGKILL")) return;
+      await Effect.runPromise(manager.signal(session.sessionId, "SIGKILL"));
+    }
   } catch (cause) {
-    context.ui.notify(managementError(cause), "error");
+    if (!isSessionNotFound(cause)) context.ui.notify(managementError(cause), "error");
   }
 }
 
-function renderListLabel(session: SessionSnapshot, theme: Theme): string {
-  const icon =
+function renderProcessCard(
+  session: SessionSnapshot,
+  selected: boolean,
+  width: number,
+  theme: Theme,
+): string[] {
+  const selector = selected ? theme.fg("accent", ">") : " ";
+  const id = selected
+    ? theme.fg("accent", theme.bold(`#${session.sessionId}`))
+    : theme.bold(`#${session.sessionId}`);
+  const state =
     session.phase === "running"
-      ? theme.fg("success", "●")
+      ? theme.fg("success", "running")
       : session.phase === "stopping"
-        ? theme.fg("warning", "◐")
-        : theme.fg("dim", "○");
-  return `${icon} #${session.sessionId} ${formatElapsed(Date.now() - session.startedAt)} ${
-    session.tty ? "tty" : "pipe"
-  } ${singleLine(session.command, 128)}`;
+        ? theme.fg("warning", "exiting")
+        : theme.fg("dim", "exited");
+  const header = `${selector} ${id}  ${state}  ${formatElapsed(
+    sessionDuration(session, Date.now()),
+  )}  ${session.tty ? "tty" : "pipe"}`;
+  return [
+    truncateToWidth(header, width, "..."),
+    ...renderProcessValue(session.command, width, theme, "toolOutput"),
+    ...renderProcessValue(formatHomePath(session.cwd), width, theme, "muted"),
+  ];
+}
+
+function renderProcessValue(
+  value: string,
+  width: number,
+  theme: Theme,
+  color: "toolOutput" | "muted",
+): string[] {
+  const prefix = "  ";
+  const prefixWidth = visibleWidth(prefix);
+  if (width <= prefixWidth) return [prefix.slice(0, width)];
+  const contentWidth = width - prefixWidth;
+  const wrapped = new Text(theme.fg(color, sanitizeDisplayValue(value)), 0, 0).render(contentWidth);
+  let first = wrapped[0] ?? "";
+  if (wrapped.length > 1) {
+    first = truncateToWidth(first, Math.max(1, contentWidth - 4), "") + theme.fg("dim", " ...");
+  }
+  return [truncateToWidth(`${prefix}${first}`, width, "...")];
+}
+
+function sanitizeDisplayValue(value: string): string {
+  const withoutAnsi = stripVTControlCharacters(value);
+  return [...withoutAnsi]
+    .map((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      if (code === 9) return "  ";
+      return code < 32 && code !== 10 ? " " : character;
+    })
+    .join("");
 }
 
 function plainListLabel(session: SessionSnapshot): string {
   return `#${session.sessionId} ${session.phase} ${formatElapsed(
-    Date.now() - session.startedAt,
+    sessionDuration(session, Date.now()),
   )} ${session.tty ? "tty" : "pipe"} ${singleLine(session.command, 128)}`;
 }
 
@@ -330,8 +400,8 @@ function renderDetails(session: SessionSnapshot): string {
     `Session ${session.sessionId} — ${describeAgentState(session)}`,
     `pid: ${session.pid ?? "?"}`,
     `mode: ${session.tty ? "tty" : "pipe"}`,
-    `running time: ${formatElapsed(Date.now() - session.startedAt)}`,
-    `cwd: ${session.cwd}`,
+    `running time: ${formatElapsed(sessionDuration(session, Date.now()))}`,
+    `cwd: ${formatHomePath(session.cwd)}`,
     `command: ${singleLine(session.command, 1_024)}`,
     `output bytes: ${session.outputBytesTotal}`,
     `log: ${session.logPath}`,
@@ -364,6 +434,10 @@ function describeAgentState(session: SessionSnapshot): string {
     return `exited(code=${session.exitCode ?? "?"})`;
   }
   return "running";
+}
+
+function sessionDuration(session: SessionSnapshot, now: number): number {
+  return Math.max(0, (session.endedAt ?? now) - session.startedAt);
 }
 
 function formatElapsed(milliseconds: number): string {
@@ -405,6 +479,19 @@ function singleLine(value: string, maximum: number): string {
     .join("");
   const normalized = printable.replace(/\s+/g, " ").trim();
   return normalized.length <= maximum ? normalized : `${normalized.slice(0, maximum - 3)}...`;
+}
+
+function isDuplicateSignal(session: SessionSnapshot, signal: NodeJS.Signals): boolean {
+  return session.requestedSignal === signal || session.requestedSignal === "SIGKILL";
+}
+
+function isSessionNotFound(cause: unknown): boolean {
+  return Boolean(
+    cause &&
+    typeof cause === "object" &&
+    "_tag" in cause &&
+    cause["_tag"] === "SessionNotFoundError",
+  );
 }
 
 function managementError(cause: unknown): string {

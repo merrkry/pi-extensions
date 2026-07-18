@@ -2,6 +2,7 @@ import {
   CustomEditor,
   type ContextUsage,
   type ExtensionAPI,
+  type ExtensionContext,
   type KeybindingsManager,
   type ReadonlyFooterDataProvider,
   type Theme,
@@ -15,14 +16,15 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import * as Effect from "effect/Effect";
-import { homedir } from "node:os";
-import { isAbsolute, relative, resolve, sep } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 
+import { formatHomePath } from "../shared/display-path.js";
 import { FastMode } from "../shared/fast-mode.js";
+import { UnifiedExec } from "../unified-exec/service.js";
 
 const EDITOR_INSET = 1;
 const EDITOR_INSET_TEXT = " ".repeat(EDITOR_INSET);
+const PROCESS_WIDGET_KEY = "better-tui-chrome-processes";
 
 type ThinkingLevel = Parameters<Theme["getThinkingBorderColor"]>[0];
 const THINKING_LEVEL_VALUES = [
@@ -66,23 +68,6 @@ function formatTokens(count: number): string {
   if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
   if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
   return `${Math.round(count / 1_000_000)}M`;
-}
-
-function formatCwd(cwd: string): string {
-  const home = process.env.HOME || process.env.USERPROFILE || homedir();
-  if (!home) return cwd;
-
-  const resolvedCwd = resolve(cwd);
-  const resolvedHome = resolve(home);
-  const relativeToHome = relative(resolvedHome, resolvedCwd);
-  const isInsideHome =
-    relativeToHome === "" ||
-    (relativeToHome !== ".." &&
-      !relativeToHome.startsWith(`..${sep}`) &&
-      !isAbsolute(relativeToHome));
-
-  if (!isInsideHome) return cwd;
-  return relativeToHome === "" ? "~" : `~${sep}${relativeToHome}`;
 }
 
 function formatContextWindow(contextWindow: number): string {
@@ -168,7 +153,7 @@ function renderFooterLine(
   const reasoning = sanitizeStatusText(String(thinkingLevel));
   const context = contextInfo(usage, currentModel);
   const branch = footerData.getGitBranch();
-  const cwdText = sanitizeStatusText(formatCwd(ctx.cwd));
+  const cwdText = sanitizeStatusText(formatHomePath(ctx.cwd));
   const rightText = branch ? `${cwdText} • ${sanitizeStatusText(branch)}` : cwdText;
 
   const fastMode = fastModeEnabled ? theme.fg("dim", "fast • ") : "";
@@ -325,13 +310,47 @@ class ChromeFooter implements Component {
 
 export default function installBetterTuiChrome(
   pi: ExtensionAPI,
-): Effect.Effect<void, never, FastMode> {
-  return FastMode.useSync((fastMode) => {
+): Effect.Effect<void, never, FastMode | UnifiedExec> {
+  return Effect.gen(function* () {
+    const fastMode = yield* FastMode;
+    const processes = yield* UnifiedExec;
     let currentEditor: InsetEditor | undefined;
     let currentFooter: ChromeFooter | undefined;
     let currentModel: FooterModel;
     let fastModeEnabled = fastMode.enabled;
     let unsubscribeFastMode: (() => void) | undefined;
+    let unsubscribeProcesses: (() => void) | undefined;
+    let currentContext: ExtensionContext | undefined;
+    let activeProcessCount = 0;
+    let agentRunning = false;
+
+    function processLabel(): string {
+      const noun = activeProcessCount === 1 ? "process" : "processes";
+      return `${activeProcessCount} ${noun} running`;
+    }
+
+    function updateProcessChrome(): void {
+      const ctx = currentContext;
+      if (!ctx || ctx.mode !== "tui") return;
+      ctx.ui.setWorkingMessage(
+        activeProcessCount > 0 ? `Working... · ${processLabel()}` : undefined,
+      );
+      if (agentRunning || activeProcessCount === 0) {
+        ctx.ui.setWidget(PROCESS_WIDGET_KEY, undefined);
+        return;
+      }
+      const label = processLabel();
+      ctx.ui.setWidget(PROCESS_WIDGET_KEY, (_tui, theme) => ({
+        render: (width) => [
+          truncateToWidth(
+            ` ${theme.fg("accent", "·")} ${theme.fg("muted", label)}`,
+            width,
+            theme.fg("dim", "..."),
+          ),
+        ],
+        invalidate() {},
+      }));
+    }
 
     function invalidateFooterContextUsage(): void {
       currentFooter?.invalidateContextUsage();
@@ -357,8 +376,15 @@ export default function installBetterTuiChrome(
     });
 
     pi.on("agent_start", () => {
+      agentRunning = true;
+      updateProcessChrome();
       invalidateFooterContextUsage();
       requestChromeRender();
+    });
+
+    pi.on("agent_end", () => {
+      agentRunning = false;
+      updateProcessChrome();
     });
 
     pi.on("turn_start", () => {
@@ -384,15 +410,22 @@ export default function installBetterTuiChrome(
     pi.on("session_shutdown", (_event, ctx) => {
       unsubscribeFastMode?.();
       unsubscribeFastMode = undefined;
+      unsubscribeProcesses?.();
+      unsubscribeProcesses = undefined;
 
       if (ctx.mode === "tui") {
+        ctx.ui.setWorkingMessage();
+        ctx.ui.setWidget(PROCESS_WIDGET_KEY, undefined);
         ctx.ui.setEditorComponent(undefined);
         ctx.ui.setFooter(undefined);
       }
 
+      currentContext = undefined;
       currentEditor = undefined;
       currentFooter = undefined;
       currentModel = undefined;
+      activeProcessCount = 0;
+      agentRunning = false;
     });
 
     pi.on("session_start", (_event, ctx) => {
@@ -400,6 +433,15 @@ export default function installBetterTuiChrome(
 
       if (ctx.mode !== "tui") return;
 
+      currentContext = ctx;
+      agentRunning = false;
+      unsubscribeProcesses?.();
+      unsubscribeProcesses = Effect.runSync(
+        processes.subscribe((sessions) => {
+          activeProcessCount = sessions.filter((session) => session.phase !== "exited").length;
+          updateProcessChrome();
+        }),
+      );
       fastModeEnabled = fastMode.enabled;
       unsubscribeFastMode?.();
       unsubscribeFastMode = fastMode.subscribe((enabled) => {
@@ -437,6 +479,7 @@ export default function installBetterTuiChrome(
         currentFooter = footer;
         return footer;
       });
+      updateProcessChrome();
     });
   });
 }

@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 
+import { formatHomePath } from "../shared/display-path.js";
 import type { ExecCommandArgs, ResponseShape, WriteStdinArgs } from "./protocol.js";
 
 export const COMMAND_PREVIEW_LINES = 4;
@@ -45,7 +46,7 @@ class ExecCallComponent implements Component {
       : headWithExpansionHint(commandLines, COMMAND_PREVIEW_LINES, width, this.theme);
     const effectiveCwd = this.args.workdir?.trim() || this.cwd;
     const cwdLine = truncateToWidth(
-      this.theme.fg("muted", `cwd  ${tildify(effectiveCwd)}`),
+      this.theme.fg("muted", `cwd  ${formatHomePath(effectiveCwd)}`),
       width,
       "...",
     );
@@ -238,7 +239,7 @@ function statusLine(
     fields.push(theme.fg("error", details.signal));
   }
   if (details.failure_message) fields.push(theme.fg("error", details.failure_message));
-  if (details.log_path) fields.push(`log ${tildify(details.log_path)}`);
+  if (details.log_path) fields.push(`log ${formatHomePath(details.log_path)}`);
   return theme.fg("muted", fields.join(" · "));
 }
 
@@ -285,9 +286,4 @@ function base64ByteLength(base64: string): number {
 function textContent(result: AgentToolResult<unknown>): string {
   const first = result.content[0];
   return first?.type === "text" ? first.text : "";
-}
-
-function tildify(path: string): string {
-  const home = process.env.HOME;
-  return home && path.startsWith(home) ? `~${path.slice(home.length)}` : path;
 }

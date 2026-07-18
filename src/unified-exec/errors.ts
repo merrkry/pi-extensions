@@ -52,7 +52,7 @@ export function errorMessage(error: UnifiedExecError): string {
     return "unified-exec: session is shutting down; not starting new commands.";
   }
   if (error instanceof SessionCapacityError) {
-    return `unified-exec: session limit reached (${error.maximum}); stop or reap a session before starting another command.`;
+    return `unified-exec: live session limit reached (${error.maximum}); stop a running session before starting another command.`;
   }
   if (error instanceof TerminationError) {
     return `failed to terminate session ${error.sessionId} with ${error.signal}; the process is still running`;

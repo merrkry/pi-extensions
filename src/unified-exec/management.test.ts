@@ -1,7 +1,6 @@
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 
-import { renderAgentInventory, updateProcessStatus } from "./management.js";
+import { renderAgentInventory } from "./management.js";
 import type { AgentSessionSnapshot } from "./service.js";
 
 function snapshot(overrides: Partial<AgentSessionSnapshot> = {}): AgentSessionSnapshot {
@@ -13,6 +12,7 @@ function snapshot(overrides: Partial<AgentSessionSnapshot> = {}): AgentSessionSn
     cwd: "/workspace/project",
     tty: true,
     startedAt: 1_000,
+    endedAt: undefined,
     requestedSignal: undefined,
     exitCode: null,
     exitSignal: null,
@@ -59,20 +59,11 @@ describe("unified-exec process management", () => {
     expect(inventory).toContain("tty output tails omitted");
   });
 
-  it("counts running and stopping sessions in the persistent footer status", () => {
-    const statuses: Array<string | undefined> = [];
-    const context = {
-      ui: {
-        theme: { fg: (_color: string, text: string) => text },
-        setStatus: (_key: string, text: string | undefined) => statuses.push(text),
-      },
-    } as unknown as Pick<ExtensionCommandContext, "ui">;
-
-    updateProcessStatus(context, [
-      snapshot(),
-      snapshot({ sessionId: 4, phase: "stopping", requestedSignal: "SIGTERM" }),
-      snapshot({ sessionId: 5, phase: "exited", exitCode: 0 }),
-    ]);
-    expect(statuses.at(-1)).toBe("exec 2");
+  it("freezes displayed running time when a process exits", () => {
+    const inventory = renderAgentInventory(
+      [snapshot({ phase: "exited", endedAt: 31_000, exitCode: 0 })],
+      62_000,
+    );
+    expect(inventory).toContain("running_for=30s");
   });
 });

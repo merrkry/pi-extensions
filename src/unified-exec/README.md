@@ -2,35 +2,33 @@
 
 Provides persistent, owned shell sessions through four model-facing tools:
 
-- `exec_command` starts a pipe or PTY process and returns either its final exit state or a `session_id` when it outlives the bounded wait.
-- `write_stdin` serializes input and polling for one session. Text accepts C-style escapes; `chars_b64` is binary-safe.
-- `kill_session` terminates a process tree, escalating to `SIGKILL` on POSIX when needed.
-- `list_sessions` reports owned sessions and reaps exited entries after reporting them once.
+- `exec_command` runs a pipe or PTY command and yields a session id when it remains active.
+- `write_stdin` writes input or polls an existing session.
+- `kill_session` terminates a process tree.
+- `list_sessions` reports live sessions and recent exited-session tombstones.
 
-This is a product-focused Effect redesign derived from `pi-unified-exec`, not a line-for-line port. It also exposes the owned-process inventory to the user and Agent without making process state part of the conversation tree.
+This is an Effect-based product redesign derived from `pi-unified-exec`, not a line-for-line port.
 
-## Concurrency and lifetime
+## Product shape
 
-`UnifiedExec` is a scoped Effect service. A semaphore protects registry and capacity transitions, another bounds concurrent spawns, and each session serializes drains and stdin operations. Process callbacks publish wakeups through a one-element sliding Effect Queue, while Deferred values represent process and output closure. Tool-call cancellation interrupts waits and streaming fibers without discarding the owned process.
+Background processes remain available across Agent turns and `/tree` navigation. Better TUI Chrome shows the active count near the editor, while `/processes` provides a live, height-aware management view with process details, interrupt, and kill actions.
 
-The service supports at most 64 registered or pending sessions. At capacity it first reaps exited sessions, then returns a typed capacity failure rather than silently killing a live process.
+A compact process inventory is injected once at the start of each Agent run without being persisted in the conversation tree. Pipe sessions may include a bounded output tail; raw PTY tails are omitted because the module does not maintain a terminal-emulator screen model.
 
-Processes belong to the current Pi session runtime rather than a single Agent turn or conversation branch. Cancelling a tool wait and navigating with `/tree` leave spawned processes running. Session replacement (`/new`, `/resume`, `/fork`, and `/clone`), extension reload, normal Pi shutdown, and Layer disposal terminate every owned process tree. Abrupt host termination cannot guarantee cleanup or recovery.
+Processes that finish before becoming background sessions are removed immediately. Once a session id has been returned, exit produces a retained tombstone regardless of whether the process exits naturally or is ended by the user or Agent. Tombstones use a bounded FIFO.
 
-## Process inventory and management
+## Lifetime
 
-The footer keeps an `exec N` status showing the number of running or stopping processes. `/processes` opens a live inventory with process state, total running time, pipe/TTY mode, command, and full working directory. `t` sends `SIGTERM` once without escalation; `k` confirms and sends `SIGKILL` immediately. The management interface observes metadata only and never drains process output or removes exited sessions behind the Agent's back.
+Processes belong to the current Pi session runtime, not to a turn or conversation branch. Turn cancellation does not terminate them. Session replacement, reload, normal shutdown, and Effect Layer disposal terminate all owned process trees.
 
-At the beginning of each Agent run, a compact inventory is prepared and injected only into the next model context. The injection is not persisted and is consumed after that first request, so later tool-continuation contexts are not polluted. Every owned process is listed; commands are normalized and limited to 128 bytes while working directories remain complete.
+Each runtime owns a temporary log directory containing complete process output. Normal shutdown closes process streams and removes the directory; abrupt host termination leaves cleanup to the operating system.
 
-Every pipe session may include recent output under per-session limits of 256 bytes and 4 lines, whichever limit is reached first. There is no second cross-process budget: the 64-session capacity and per-session limits already bound the inventory. PTY output is omitted because a raw terminal stream has no stable logical tail without maintaining a terminal-emulator screen model. The inventory is reconstructed from runtime state, so it stays current across `/tree` navigation without becoming tied to a conversation branch.
+## Internal decisions
 
-## Tool rendering
+`UnifiedExec` is a scoped Effect service. Semaphores protect registry transitions, bound concurrent spawning, and serialize per-session input/output operations. Queues and Deferred values bridge process callbacks into interruptible Effects, so cancelling a tool wait does not discard the process.
 
-`exec_command` keeps the working directory on a dedicated line so streaming command arguments cannot push it horizontally. Collapsed tool rows retain the first four visual command lines (preserving the CLI name) and the last eight visual output lines. Pi's global `app.tools.expand` action (`Ctrl+O` by default) expands these views, with hard rendering limits of the first 80 command lines and the last 200 output lines. The complete process stream remains available through `log_path`; rendering never attempts to place an unbounded process output in the terminal.
+Live capacity and exited history are bounded independently: up to 64 live or pending sessions and 64 FIFO tombstones. Capacity pressure never evicts a live process.
 
-## Output and PTY support
+Pipe mode uses Node child processes. PTY mode uses the optional official `node-pty` package and fails explicitly when its native module is unavailable. Interrupt maps to `SIGINT` on POSIX and terminal Ctrl-C input for Windows PTY sessions; Windows pipe sessions do not expose a reliable graceful interrupt.
 
-Each process has a bounded in-memory head/tail buffer and a complete log under the platform temporary directory. Tool responses use Pi's standard byte and line tail limits and include the log path for recovery.
-
-Pipe mode uses Node child processes. PTY mode uses the optional official `node-pty` dependency; failure to load its native module affects only `tty: true`. The build keeps `node-pty` external, and `pnpm apply` copies the current platform runtime beside the extension bundle.
+Tool and management rendering is always bounded. Full output remains available through the runtime log while in-memory buffers and Agent-facing tails stay capped.

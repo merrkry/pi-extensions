@@ -15,6 +15,7 @@ import { SpawnError, StdinWriteError, type UnifiedExecUnavailableError } from ".
 export const DEFAULT_HEAD_TAIL_MAX_BYTES = 1024 * 1024;
 const DEFAULT_STREAM_TAIL_BYTES = 32 * 1024;
 const POST_EXIT_CLOSE_WAIT_MS = 50;
+const INTERRUPT_STATE_DEBOUNCE_MS = 500;
 
 export interface SessionSpawnOptions {
   readonly command: string[];
@@ -68,6 +69,8 @@ export class ExecSession {
   };
   private logStream: WriteStream | undefined;
   private requestedSignalValue: NodeJS.Signals | undefined;
+  private requestedSignalVisibleAt = 0;
+  private endedAtValue: number | undefined;
   private readonly stateListeners = new Set<() => void>();
 
   private constructor(
@@ -92,11 +95,12 @@ export class ExecSession {
   static spawn(
     id: number,
     options: SessionSpawnOptions,
+    logDirectory = tmpdir(),
   ): Effect.Effect<ExecSession, SpawnError | UnifiedExecUnavailableError> {
     return Effect.gen(function* () {
       const pty = options.tty ? yield* loadPty : undefined;
       const outputSignal = yield* Queue.sliding<void>(1);
-      const logPath = join(tmpdir(), `pi-unified-exec-${id}-${randomBytes(4).toString("hex")}.log`);
+      const logPath = join(logDirectory, `${id}-${randomBytes(4).toString("hex")}.log`);
       return yield* Effect.try({
         try: () => {
           closeSync(openSync(logPath, "w"));
@@ -143,6 +147,7 @@ export class ExecSession {
       Queue.offerUnsafe(this.outputSignal, undefined);
     });
     this.child.onExit((exitCode, signal, failureMessage) => {
+      this.endedAtValue = Date.now();
       this.state = {
         hasExited: true,
         exitCode,
@@ -222,6 +227,13 @@ export class ExecSession {
     );
   }
 
+  awaitOutputClosed(timeoutMs: number): Effect.Effect<boolean> {
+    return Deferred.await(this.outputClosed).pipe(
+      Effect.timeoutOption(timeoutMs),
+      Effect.map(Option.isSome),
+    );
+  }
+
   clearOutputSignal(): Effect.Effect<void> {
     return Queue.clear(this.outputSignal).pipe(Effect.asVoid);
   }
@@ -234,10 +246,25 @@ export class ExecSession {
     return this.child.write(data);
   }
 
+  interrupt(): Effect.Effect<boolean> {
+    return Effect.sync(() => {
+      if (this.hasExited || !this.child.interrupt()) return false;
+      this.requestedSignalValue = "SIGINT";
+      this.requestedSignalVisibleAt = Date.now() + INTERRUPT_STATE_DEBOUNCE_MS;
+      this.notifyStateChange();
+      const timer = setTimeout(() => {
+        if (!this.hasExited && this.requestedSignalValue === "SIGINT") this.notifyStateChange();
+      }, INTERRUPT_STATE_DEBOUNCE_MS);
+      timer.unref();
+      return true;
+    });
+  }
+
   kill(signal: NodeJS.Signals = "SIGTERM"): Effect.Effect<void> {
     return Effect.sync(() => {
       if (this.hasExited) return;
       this.requestedSignalValue = signal;
+      this.requestedSignalVisibleAt = Date.now();
       this.child.kill(signal);
       this.notifyStateChange();
     });
@@ -273,6 +300,14 @@ export class ExecSession {
 
   get requestedSignal(): NodeJS.Signals | undefined {
     return this.requestedSignalValue;
+  }
+
+  get isStopping(): boolean {
+    return this.requestedSignalValue !== undefined && Date.now() >= this.requestedSignalVisibleAt;
+  }
+
+  get endedAt(): number | undefined {
+    return this.endedAtValue;
   }
 
   get totalBytesSeen(): number {

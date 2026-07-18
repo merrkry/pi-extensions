@@ -1,3 +1,7 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -15,11 +19,17 @@ import { ExecSession, type SessionSpawnOptions } from "./session.js";
 import { IS_WINDOWS } from "./shell.js";
 
 export const MAX_SESSIONS = 64;
+export const MAX_TOMBSTONES = 64;
 const MAX_CONCURRENT_SPAWNS = 8;
 const decoder = new TextDecoder("utf-8", { fatal: false });
 
 export interface LaunchOutcome {
   readonly session: ExecSession;
+}
+
+export interface InterruptOutcome {
+  readonly session: SessionSnapshot;
+  readonly sent: boolean;
 }
 
 export interface TerminateOutcome {
@@ -38,6 +48,7 @@ export interface SessionSnapshot {
   readonly cwd: string;
   readonly tty: boolean;
   readonly startedAt: number;
+  readonly endedAt: number | undefined;
   readonly requestedSignal: NodeJS.Signals | undefined;
   readonly exitCode: number | null;
   readonly exitSignal: NodeJS.Signals | null;
@@ -47,6 +58,12 @@ export interface SessionSnapshot {
 }
 
 export interface AgentSessionSnapshot extends SessionSnapshot {
+  readonly outputTail: string | undefined;
+}
+
+interface SessionTombstone {
+  readonly session: ExecSession;
+  readonly snapshot: SessionSnapshot;
   readonly outputTail: string | undefined;
 }
 
@@ -65,6 +82,7 @@ export interface UnifiedExecApi {
   agentInventory: Effect.Effect<readonly AgentSessionSnapshot[]>;
   subscribe(listener: InventoryListener): Effect.Effect<() => void>;
   remove(sessionId: number): Effect.Effect<ExecSession | undefined>;
+  interrupt(sessionId: number): Effect.Effect<InterruptOutcome, SessionNotFoundError>;
   signal(
     sessionId: number,
     signal: NodeJS.Signals,
@@ -92,32 +110,70 @@ function notifyInventoryListener(
   }
 }
 
+function makeLogDirectory(): Effect.Effect<string> {
+  return Effect.promise(() => mkdtemp(join(tmpdir(), "pi-unified-exec-")));
+}
+
+function removeLogDirectory(directory: string | undefined): Effect.Effect<void> {
+  if (!directory) return Effect.void;
+  return Effect.promise(() =>
+    rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }).catch(
+      () => undefined,
+    ),
+  );
+}
+
 function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
   return Effect.gen(function* () {
     const stateSemaphore = yield* Semaphore.make(1);
     const spawnSemaphore = yield* Semaphore.make(MAX_CONCURRENT_SPAWNS);
     const sessions = new Map<number, ExecSession>();
+    const tombstones: SessionTombstone[] = [];
     const pendingIds = new Set<number>();
     const inventoryListeners = new Set<InventoryListener>();
     let nextId = 1;
     let shuttingDown = false;
+    let logDirectory: string | undefined = yield* makeLogDirectory();
 
-    const inventoryUnsafe = (): readonly SessionSnapshot[] =>
-      Object.freeze(
-        [...sessions.values()].map(sessionSnapshot).toSorted((a, b) => a.sessionId - b.sessionId),
+    const reconcileExitedUnsafe = (): void => {
+      for (const [id, session] of sessions) {
+        if (!session.hasExited) continue;
+        sessions.delete(id);
+        tombstones.push({
+          session,
+          snapshot: sessionSnapshot(session),
+          outputTail: session.tty ? undefined : decoder.decode(session.snapshotStreamTail()),
+        });
+      }
+      while (tombstones.length > MAX_TOMBSTONES) tombstones.shift();
+    };
+
+    const inventoryUnsafe = (): readonly SessionSnapshot[] => {
+      reconcileExitedUnsafe();
+      return Object.freeze(
+        [
+          ...[...sessions.values()].map(sessionSnapshot),
+          ...tombstones.map((tombstone) => tombstone.snapshot),
+        ].toSorted((a, b) => a.sessionId - b.sessionId),
       );
+    };
 
-    const agentInventoryUnsafe = (): readonly AgentSessionSnapshot[] =>
-      Object.freeze(
-        [...sessions.values()]
-          .map((session) =>
+    const agentInventoryUnsafe = (): readonly AgentSessionSnapshot[] => {
+      reconcileExitedUnsafe();
+      return Object.freeze(
+        [
+          ...[...sessions.values()].map((session) =>
             Object.freeze({
               ...sessionSnapshot(session),
               outputTail: session.tty ? undefined : decoder.decode(session.snapshotStreamTail()),
             }),
-          )
-          .toSorted((a, b) => a.sessionId - b.sessionId),
+          ),
+          ...tombstones.map((tombstone) =>
+            Object.freeze({ ...tombstone.snapshot, outputTail: tombstone.outputTail }),
+          ),
+        ].toSorted((a, b) => a.sessionId - b.sessionId),
       );
+    };
 
     const publishInventory = (): void => {
       const inventory = inventoryUnsafe();
@@ -130,7 +186,12 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
           Effect.sync(() => {
             const session = sessions.get(sessionId);
             sessions.delete(sessionId);
-            return session;
+            const tombstoneIndex = tombstones.findIndex(
+              (tombstone) => tombstone.session.id === sessionId,
+            );
+            const tombstone =
+              tombstoneIndex < 0 ? undefined : tombstones.splice(tombstoneIndex, 1)[0];
+            return session ?? tombstone?.session;
           }),
         )
         .pipe(Effect.tap(() => Effect.sync(publishInventory)));
@@ -148,9 +209,7 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
           const id = yield* stateSemaphore.withPermit(
             Effect.gen(function* () {
               if (shuttingDown) return yield* Effect.fail(new SessionShuttingDownError());
-              if (sessions.size + pendingIds.size >= MAX_SESSIONS) {
-                reapExited(sessions);
-              }
+              reconcileExitedUnsafe();
               if (sessions.size + pendingIds.size >= MAX_SESSIONS) {
                 return yield* Effect.fail(new SessionCapacityError({ maximum: MAX_SESSIONS }));
               }
@@ -169,7 +228,9 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
                       shuttingDown ? Effect.fail(new SessionShuttingDownError()) : Effect.void,
                     ),
                   );
-                  const session = yield* ExecSession.spawn(id, options);
+                  const directory = logDirectory;
+                  if (!directory) return yield* Effect.fail(new SessionShuttingDownError());
+                  const session = yield* ExecSession.spawn(id, options, directory);
                   session.onStateChange(publishInventory);
                   yield* stateSemaphore.withPermit(
                     Effect.suspend(() => {
@@ -193,7 +254,9 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
       get: (sessionId) =>
         stateSemaphore.withPermit(
           Effect.suspend(() => {
-            const session = sessions.get(sessionId);
+            const session =
+              sessions.get(sessionId) ??
+              tombstones.find((tombstone) => tombstone.session.id === sessionId)?.session;
             return session
               ? Effect.succeed(session)
               : Effect.fail(new SessionNotFoundError({ sessionId }));
@@ -201,7 +264,13 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
         ),
       list: () =>
         stateSemaphore.withPermit(
-          Effect.sync(() => [...sessions.values()].toSorted((a, b) => a.id - b.id)),
+          Effect.sync(() => {
+            reconcileExitedUnsafe();
+            return [
+              ...sessions.values(),
+              ...tombstones.map((tombstone) => tombstone.session),
+            ].toSorted((a, b) => a.id - b.id);
+          }),
         ),
       inventory: stateSemaphore.withPermit(Effect.sync(inventoryUnsafe)),
       agentInventory: stateSemaphore.withPermit(Effect.sync(agentInventoryUnsafe)),
@@ -214,6 +283,12 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
           };
         }),
       remove,
+      interrupt: (sessionId) =>
+        Effect.gen(function* () {
+          const session = yield* api.get(sessionId);
+          const sent = yield* session.interrupt();
+          return { session: sessionSnapshot(session), sent };
+        }),
       signal: (sessionId, signal) =>
         Effect.gen(function* () {
           const session = yield* api.get(sessionId);
@@ -235,29 +310,42 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
             session.collectUntil(Date.now() + 100),
           );
           if (!exited) return yield* Effect.fail(new TerminationError({ sessionId, signal }));
-          yield* remove(sessionId);
           return { session, escalated, finalOutput };
         }),
       shutdown: stateSemaphore
         .withPermit(
           Effect.sync(() => {
             shuttingDown = true;
-            const owned = [...sessions.values()];
+            const owned = [
+              ...sessions.values(),
+              ...tombstones.map((tombstone) => tombstone.session),
+            ];
+            const directory = logDirectory;
             sessions.clear();
-            return owned;
+            tombstones.length = 0;
+            logDirectory = undefined;
+            return { directory, owned };
           }),
         )
         .pipe(
           Effect.tap(() => Effect.sync(publishInventory)),
-          Effect.flatMap(terminateOwnedSessions),
+          Effect.flatMap(({ directory, owned }) =>
+            terminateOwnedSessions(owned).pipe(
+              Effect.ensuring(removeLogDirectory(directory)),
+              Effect.as(owned),
+            ),
+          ),
         ),
-      resume: stateSemaphore
-        .withPermit(
+      resume: Effect.gen(function* () {
+        const directory = logDirectory ?? (yield* makeLogDirectory());
+        yield* stateSemaphore.withPermit(
           Effect.sync(() => {
+            logDirectory = directory;
             shuttingDown = false;
           }),
-        )
-        .pipe(Effect.tap(() => Effect.sync(publishInventory))),
+        );
+        yield* Effect.sync(publishInventory);
+      }),
     };
     return api;
   });
@@ -266,12 +354,13 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
 function sessionSnapshot(session: ExecSession): SessionSnapshot {
   return Object.freeze({
     sessionId: session.id,
-    phase: session.hasExited ? "exited" : session.requestedSignal ? "stopping" : "running",
+    phase: session.hasExited ? "exited" : session.isStopping ? "stopping" : "running",
     pid: session.pid,
     command: session.displayCommand,
     cwd: session.cwd,
     tty: session.tty,
     startedAt: session.startedAt,
+    endedAt: session.endedAt,
     requestedSignal: session.requestedSignal,
     exitCode: session.exitCode,
     exitSignal: session.signal,
@@ -279,12 +368,6 @@ function sessionSnapshot(session: ExecSession): SessionSnapshot {
     outputBytesTotal: session.totalBytesSeen,
     logPath: session.logPath,
   });
-}
-
-function reapExited(sessions: Map<number, ExecSession>): void {
-  for (const [id, session] of sessions) {
-    if (session.hasExited) sessions.delete(id);
-  }
 }
 
 function terminateOwnedSessions(
@@ -322,6 +405,13 @@ function terminateOwnedSessions(
         },
       );
     }
+    yield* Effect.all(
+      sessions.map((session) => session.awaitOutputClosed(500)),
+      {
+        concurrency: "unbounded",
+        discard: true,
+      },
+    );
     return sessions;
   });
 }

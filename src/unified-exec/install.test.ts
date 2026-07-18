@@ -30,16 +30,12 @@ async function makeHarness() {
   const tools = new Map<string, CallableTool>();
   const commands = new Set<string>();
   const handlers = new Map<string, Array<(event: unknown, context: ExtensionContext) => unknown>>();
-  const statuses: Array<string | undefined> = [];
   let activeTools = ["bash", "read"];
   const ui = {
     theme: {
       fg: (_color: string, text: string) => text,
     },
     notify() {},
-    setStatus(_key: string, text: string | undefined) {
-      statuses.push(text);
-    },
     setWidget() {},
   };
   const context = {
@@ -77,7 +73,6 @@ async function makeHarness() {
   return {
     tools,
     commands,
-    statuses,
     get activeTools() {
       return activeTools;
     },
@@ -108,7 +103,6 @@ describe("unified-exec Pi adapter", () => {
     ]);
     expect(harness.commands).toContain("processes");
     expect(harness.activeTools).toEqual(["read"]);
-    expect(harness.statuses.at(-1)).toContain("exec 0");
   });
 
   it("executes short commands through the public exec_command contract", async () => {
@@ -123,7 +117,7 @@ describe("unified-exec Pi adapter", () => {
     expect(result.content[0]).toMatchObject({ type: "text" });
   });
 
-  it("keeps the footer and transient Agent inventory synchronized", async () => {
+  it("keeps the transient Agent inventory synchronized", async () => {
     const harness = await makeHarness();
     await harness.emit("session_start");
     const started = await harness.call("exec_command", {
@@ -133,7 +127,6 @@ describe("unified-exec Pi adapter", () => {
     const sessionId = (started.details as ResponseShape).session_id!;
 
     try {
-      expect(harness.statuses.at(-1)).toContain("exec 1");
       await harness.emit("before_agent_start", { type: "before_agent_start" });
       const [contextResult] = await harness.emit("context", { type: "context", messages: [] });
       const messages = (contextResult as { messages: Array<{ content: string }> }).messages;
@@ -149,7 +142,6 @@ describe("unified-exec Pi adapter", () => {
     } finally {
       await harness.call("kill_session", { session_id: sessionId });
     }
-    expect(harness.statuses.at(-1)).toContain("exec 0");
   });
 
   it("interrupts the tool wait without terminating the owned process", async () => {

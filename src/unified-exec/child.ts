@@ -27,6 +27,7 @@ export interface SpawnedChild {
   write(data: Uint8Array): boolean;
   onData(handler: (chunk: Uint8Array) => void): () => void;
   onExit(handler: ExitCallback): void;
+  interrupt(): boolean;
   kill(signal?: NodeJS.Signals): void;
   resize(cols: number, rows: number): void;
 }
@@ -194,6 +195,23 @@ function spawnPty(module: PtyModule, options: SpawnOptions): SpawnedChild {
     onExit(handler) {
       if (!exited) exitHandlers.add(handler);
     },
+    interrupt() {
+      if (exited) return false;
+      if (IS_WINDOWS) {
+        try {
+          child.write(Buffer.from([0x03]));
+          return true;
+        } catch {
+          return false;
+        }
+      }
+      try {
+        child.kill("SIGINT");
+        return true;
+      } catch {
+        return false;
+      }
+    },
     kill(signal = "SIGTERM") {
       if (exited) return;
       if (IS_WINDOWS) return killWindowsTree(child.pid);
@@ -273,6 +291,20 @@ function spawnPipes(options: SpawnOptions): SpawnedChild {
     },
     onExit(handler) {
       if (!exited) exitHandlers.add(handler);
+    },
+    interrupt() {
+      if (exited || !child.pid || IS_WINDOWS) return false;
+      try {
+        process.kill(-child.pid, "SIGINT");
+        return true;
+      } catch {
+        try {
+          process.kill(child.pid, "SIGINT");
+          return true;
+        } catch {
+          return false;
+        }
+      }
     },
     kill(signal = "SIGTERM") {
       if (exited || !child.pid) return;

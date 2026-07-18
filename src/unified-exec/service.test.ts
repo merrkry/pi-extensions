@@ -1,8 +1,11 @@
+import { existsSync } from "node:fs";
+import { dirname } from "node:path";
+
 import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vitest";
 
 import { decode } from "./protocol.js";
-import { UnifiedExec, UnifiedExecLive } from "./service.js";
+import { MAX_TOMBSTONES, UnifiedExec, UnifiedExecLive } from "./service.js";
 
 const spawnOptions = (command: string) => ({
   command: ["bash", "-c", command],
@@ -109,11 +112,82 @@ describe("UnifiedExec service", () => {
     expect(Object.isFrozen(result.running)).toBe(true);
     expect(Object.isFrozen(result.running[0])).toBe(true);
     expect(result.stopping).toMatchObject({ phase: "stopping", requestedSignal: "SIGTERM" });
-    expect(result.exited).toMatchObject([{ phase: "exited" }]);
+    expect(result.exited).toMatchObject([{ phase: "exited", endedAt: expect.any(Number) }]);
     expect(result.phases).toContain("empty");
     expect(result.phases).toContain("running");
     expect(result.phases).toContain("stopping");
     expect(result.phases).toContain("exited");
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "debounces the exiting phase after an interrupt",
+    async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const manager = yield* UnifiedExec;
+          const { session } = yield* manager.launch(spawnOptions("trap '' INT; sleep 30"));
+          yield* Effect.sleep(100);
+          const interrupted = yield* manager.interrupt(session.id);
+          yield* Effect.sleep(550);
+          const delayed = (yield* manager.inventory)[0];
+          yield* manager.signal(session.id, "SIGKILL");
+          expect(yield* session.awaitExit(2_000)).toBe(true);
+          return { interrupted, delayed };
+        }),
+      );
+
+      expect(result.interrupted).toMatchObject({
+        sent: true,
+        session: { phase: "running", requestedSignal: "SIGINT" },
+      });
+      expect(result.delayed).toMatchObject({ phase: "stopping", requestedSignal: "SIGINT" });
+    },
+  );
+
+  it("keeps a tombstone after an Agent termination", async () => {
+    const inventory = await run(
+      Effect.gen(function* () {
+        const manager = yield* UnifiedExec;
+        const { session } = yield* manager.launch(spawnOptions("sleep 30"));
+        yield* manager.terminate(session.id, "SIGTERM");
+        return yield* manager.inventory;
+      }),
+    );
+
+    expect(inventory).toMatchObject([{ phase: "exited", requestedSignal: "SIGTERM" }]);
+  });
+
+  it("retains exited background sessions in a bounded FIFO", async () => {
+    const inventory = await run(
+      Effect.gen(function* () {
+        const manager = yield* UnifiedExec;
+        for (let index = 0; index <= MAX_TOMBSTONES; index += 1) {
+          const { session } = yield* manager.launch(spawnOptions("true"));
+          expect(yield* session.awaitExit(2_000)).toBe(true);
+        }
+        return yield* manager.inventory;
+      }),
+    );
+
+    expect(inventory).toHaveLength(MAX_TOMBSTONES);
+    expect(inventory[0]).toMatchObject({ sessionId: 2, phase: "exited" });
+    expect(inventory.at(-1)).toMatchObject({
+      sessionId: MAX_TOMBSTONES + 1,
+      phase: "exited",
+    });
+  });
+
+  it("removes its runtime log directory during scoped shutdown", async () => {
+    const logDirectory = await run(
+      Effect.gen(function* () {
+        const manager = yield* UnifiedExec;
+        const { session } = yield* manager.launch(spawnOptions("printf cleanup"));
+        expect(yield* session.awaitExit(2_000)).toBe(true);
+        return dirname(session.logPath);
+      }),
+    );
+
+    expect(existsSync(logDirectory)).toBe(false);
   });
 
   it("terminates all owned processes during shutdown", async () => {
