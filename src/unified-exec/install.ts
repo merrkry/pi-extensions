@@ -1,9 +1,19 @@
-import type { AgentToolUpdateCallback, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentToolUpdateCallback,
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import { Type } from "typebox";
 
 import { loadPty } from "./child.js";
+import {
+  clearProcessStatus,
+  manageProcesses,
+  renderAgentInventory,
+  updateProcessStatus,
+} from "./management.js";
 import {
   errorMessage,
   InvalidInputError,
@@ -58,15 +68,53 @@ export default function installUnifiedExec(
       default: false,
     });
 
-    pi.on("session_start", async () => {
+    let statusContext: ExtensionContext | undefined;
+    let pendingAgentInventory: string | undefined;
+    yield* manager.subscribe((sessions) => {
+      if (statusContext) updateProcessStatus(statusContext, sessions);
+    });
+
+    pi.on("session_start", async (_event, context) => {
+      statusContext = context;
       await runEffect(manager.resume);
+      updateProcessStatus(context, await runEffect(manager.inventory));
       if (pi.getFlag("keep-builtin-bash") !== true) {
         pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "bash"));
       }
     });
 
-    pi.on("session_shutdown", async () => {
+    pi.on("before_agent_start", async () => {
+      pendingAgentInventory = renderAgentInventory(await runEffect(manager.agentInventory));
+    });
+
+    pi.on("context", (event) => {
+      const inventory = pendingAgentInventory;
+      pendingAgentInventory = undefined;
+      if (!inventory) return;
+      return {
+        messages: [
+          ...event.messages,
+          {
+            role: "custom" as const,
+            customType: "unified-exec-inventory",
+            content: inventory,
+            display: false,
+            timestamp: Date.now(),
+          },
+        ],
+      };
+    });
+
+    pi.on("session_shutdown", async (_event, context) => {
+      clearProcessStatus(context);
+      statusContext = undefined;
+      pendingAgentInventory = undefined;
       await runEffect(manager.shutdown);
+    });
+
+    pi.registerCommand("processes", {
+      description: "Inspect and manage Unified Exec background processes",
+      handler: async (_arguments, context) => manageProcesses(manager, context),
     });
 
     pi.registerTool({

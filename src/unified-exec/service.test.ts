@@ -86,6 +86,36 @@ describe("UnifiedExec service", () => {
     ).rejects.toMatchObject({ _tag: "SessionNotFoundError", sessionId: 999_999 });
   });
 
+  it("publishes immutable inventory transitions and supports non-escalating signals", async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const manager = yield* UnifiedExec;
+        const phases: string[] = [];
+        const unsubscribe = yield* manager.subscribe((sessions) => {
+          phases.push(sessions.map((session) => session.phase).join(",") || "empty");
+        });
+        const { session } = yield* manager.launch(spawnOptions("sleep 30"));
+        const running = yield* manager.inventory;
+        const stopping = yield* manager.signal(session.id, "SIGTERM");
+        expect(yield* session.awaitExit(2_000)).toBe(true);
+        const exited = yield* manager.inventory;
+        yield* manager.remove(session.id);
+        unsubscribe();
+        return { running, stopping, exited, phases };
+      }),
+    );
+
+    expect(result.running).toMatchObject([{ phase: "running", command: "sleep 30" }]);
+    expect(Object.isFrozen(result.running)).toBe(true);
+    expect(Object.isFrozen(result.running[0])).toBe(true);
+    expect(result.stopping).toMatchObject({ phase: "stopping", requestedSignal: "SIGTERM" });
+    expect(result.exited).toMatchObject([{ phase: "exited" }]);
+    expect(result.phases).toContain("empty");
+    expect(result.phases).toContain("running");
+    expect(result.phases).toContain("stopping");
+    expect(result.phases).toContain("exited");
+  });
+
   it("terminates all owned processes during shutdown", async () => {
     const exited = await run(
       Effect.gen(function* () {

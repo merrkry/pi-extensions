@@ -20,7 +20,7 @@ A feature should keep its core behavior and Pi integration together under one fo
 
 Pi tool callbacks are the error-display boundary. Calls run as interruptible Effects using Pi's abort signal; interrupting a wait does not terminate the owned process. A one-element sliding Effect Queue bridges process callbacks into interruptible output waits without losing a notification between draining and waiting. The service registry is protected by a semaphore, while each session has its own semaphore to prevent concurrent polls from racing to drain the same output.
 
-The module is a product-focused redesign derived from `pi-unified-exec`, not a line-for-line port. It preserves the four core tool names and session-oriented behavior. Tool rendering is a pure boundary concern; session-management widgets and the interactive management command remain deferred while their UX is redesigned. The PTY implementation uses the maintained official `node-pty` package; pipe mode remains available if the optional native module cannot load.
+The module is a product-focused redesign derived from `pi-unified-exec`, not a line-for-line port. It preserves the four core tool names and session-oriented behavior. Tool rendering, the footer process count, `/processes`, and the one-shot Agent-run inventory are Pi boundary concerns built from immutable service snapshots. Processes are owned by the current Pi session runtime: turn cancellation and `/tree` preserve them, while session replacement, reload, and shutdown terminate them. The PTY implementation uses the maintained official `node-pty` package; pipe mode remains available if the optional native module cannot load.
 
 ## Composition
 

@@ -66,8 +66,9 @@ export class ExecSession {
     signal: null,
     failureMessage: null,
   };
-  private lastUsedAt = this.startedAt;
   private logStream: WriteStream | undefined;
+  private requestedSignalValue: NodeJS.Signals | undefined;
+  private readonly stateListeners = new Set<() => void>();
 
   private constructor(
     readonly id: number,
@@ -148,6 +149,7 @@ export class ExecSession {
         signal,
         failureMessage: this.state.failureMessage ?? failureMessage ?? null,
       };
+      this.notifyStateChange();
       Deferred.doneUnsafe(this.exited, Effect.void);
       Queue.offerUnsafe(this.outputSignal, undefined);
       setImmediate(() => {
@@ -182,6 +184,22 @@ export class ExecSession {
 
   private recordFailure(message: string): void {
     this.state = { ...this.state, failureMessage: this.state.failureMessage ?? message };
+    this.notifyStateChange();
+  }
+
+  private notifyStateChange(): void {
+    for (const listener of this.stateListeners) {
+      try {
+        listener();
+      } catch {
+        // Process lifecycle callbacks must not be disrupted by observers.
+      }
+    }
+  }
+
+  onStateChange(listener: () => void): () => void {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
   }
 
   collectUntil(deadlineMs: number): Effect.Effect<Uint8Array> {
@@ -218,7 +236,10 @@ export class ExecSession {
 
   kill(signal: NodeJS.Signals = "SIGTERM"): Effect.Effect<void> {
     return Effect.sync(() => {
-      if (!this.hasExited) this.child.kill(signal);
+      if (this.hasExited) return;
+      this.requestedSignalValue = signal;
+      this.child.kill(signal);
+      this.notifyStateChange();
     });
   }
 
@@ -250,16 +271,12 @@ export class ExecSession {
     return this.state.failureMessage;
   }
 
+  get requestedSignal(): NodeJS.Signals | undefined {
+    return this.requestedSignalValue;
+  }
+
   get totalBytesSeen(): number {
     return this.totalOutputBytes;
-  }
-
-  get lastUsed(): number {
-    return this.lastUsedAt;
-  }
-
-  touch(): void {
-    this.lastUsedAt = Date.now();
   }
 }
 
@@ -299,7 +316,6 @@ function pollSession(
 ): Effect.Effect<Uint8Array, StdinWriteError> {
   return session.operationSemaphore.withPermit(
     Effect.gen(function* () {
-      session.touch();
       if (input && input.length > 0) {
         if (!session.writeNow(input)) {
           return yield* new StdinWriteError({

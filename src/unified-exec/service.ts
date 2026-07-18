@@ -16,6 +16,7 @@ import { IS_WINDOWS } from "./shell.js";
 
 export const MAX_SESSIONS = 64;
 const MAX_CONCURRENT_SPAWNS = 8;
+const decoder = new TextDecoder("utf-8", { fatal: false });
 
 export interface LaunchOutcome {
   readonly session: ExecSession;
@@ -27,6 +28,30 @@ export interface TerminateOutcome {
   readonly finalOutput: Uint8Array;
 }
 
+export type SessionPhase = "running" | "stopping" | "exited";
+
+export interface SessionSnapshot {
+  readonly sessionId: number;
+  readonly phase: SessionPhase;
+  readonly pid: number | undefined;
+  readonly command: string;
+  readonly cwd: string;
+  readonly tty: boolean;
+  readonly startedAt: number;
+  readonly requestedSignal: NodeJS.Signals | undefined;
+  readonly exitCode: number | null;
+  readonly exitSignal: NodeJS.Signals | null;
+  readonly failureMessage: string | null;
+  readonly outputBytesTotal: number;
+  readonly logPath: string;
+}
+
+export interface AgentSessionSnapshot extends SessionSnapshot {
+  readonly outputTail: string | undefined;
+}
+
+export type InventoryListener = (sessions: readonly SessionSnapshot[]) => void;
+
 export interface UnifiedExecApi {
   launch(
     options: SessionSpawnOptions,
@@ -36,7 +61,14 @@ export interface UnifiedExecApi {
   >;
   get(sessionId: number): Effect.Effect<ExecSession, SessionNotFoundError>;
   list(): Effect.Effect<readonly ExecSession[]>;
+  inventory: Effect.Effect<readonly SessionSnapshot[]>;
+  agentInventory: Effect.Effect<readonly AgentSessionSnapshot[]>;
+  subscribe(listener: InventoryListener): Effect.Effect<() => void>;
   remove(sessionId: number): Effect.Effect<ExecSession | undefined>;
+  signal(
+    sessionId: number,
+    signal: NodeJS.Signals,
+  ): Effect.Effect<SessionSnapshot, SessionNotFoundError>;
   terminate(
     sessionId: number,
     signal: NodeJS.Signals,
@@ -49,23 +81,59 @@ export class UnifiedExec extends Context.Service<UnifiedExec, UnifiedExecApi>()(
   "@pi-extensions/UnifiedExec",
 ) {}
 
+function notifyInventoryListener(
+  listener: InventoryListener,
+  inventory: readonly SessionSnapshot[],
+): void {
+  try {
+    listener(inventory);
+  } catch {
+    // An observer must not interfere with process ownership.
+  }
+}
+
 function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
   return Effect.gen(function* () {
     const stateSemaphore = yield* Semaphore.make(1);
     const spawnSemaphore = yield* Semaphore.make(MAX_CONCURRENT_SPAWNS);
     const sessions = new Map<number, ExecSession>();
     const pendingIds = new Set<number>();
+    const inventoryListeners = new Set<InventoryListener>();
     let nextId = 1;
     let shuttingDown = false;
 
-    const remove = (sessionId: number) =>
-      stateSemaphore.withPermit(
-        Effect.sync(() => {
-          const session = sessions.get(sessionId);
-          sessions.delete(sessionId);
-          return session;
-        }),
+    const inventoryUnsafe = (): readonly SessionSnapshot[] =>
+      Object.freeze(
+        [...sessions.values()].map(sessionSnapshot).toSorted((a, b) => a.sessionId - b.sessionId),
       );
+
+    const agentInventoryUnsafe = (): readonly AgentSessionSnapshot[] =>
+      Object.freeze(
+        [...sessions.values()]
+          .map((session) =>
+            Object.freeze({
+              ...sessionSnapshot(session),
+              outputTail: session.tty ? undefined : decoder.decode(session.snapshotStreamTail()),
+            }),
+          )
+          .toSorted((a, b) => a.sessionId - b.sessionId),
+      );
+
+    const publishInventory = (): void => {
+      const inventory = inventoryUnsafe();
+      for (const listener of inventoryListeners) notifyInventoryListener(listener, inventory);
+    };
+
+    const remove = (sessionId: number) =>
+      stateSemaphore
+        .withPermit(
+          Effect.sync(() => {
+            const session = sessions.get(sessionId);
+            sessions.delete(sessionId);
+            return session;
+          }),
+        )
+        .pipe(Effect.tap(() => Effect.sync(publishInventory)));
 
     const releaseReservation = (sessionId: number) =>
       stateSemaphore.withPermit(
@@ -102,6 +170,7 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
                     ),
                   );
                   const session = yield* ExecSession.spawn(id, options);
+                  session.onStateChange(publishInventory);
                   yield* stateSemaphore.withPermit(
                     Effect.suspend(() => {
                       pendingIds.delete(id);
@@ -114,6 +183,7 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
                       return Effect.void;
                     }),
                   );
+                  yield* Effect.sync(publishInventory);
                   return { session };
                 }),
               ),
@@ -133,7 +203,23 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
         stateSemaphore.withPermit(
           Effect.sync(() => [...sessions.values()].toSorted((a, b) => a.id - b.id)),
         ),
+      inventory: stateSemaphore.withPermit(Effect.sync(inventoryUnsafe)),
+      agentInventory: stateSemaphore.withPermit(Effect.sync(agentInventoryUnsafe)),
+      subscribe: (listener) =>
+        Effect.sync(() => {
+          inventoryListeners.add(listener);
+          notifyInventoryListener(listener, inventoryUnsafe());
+          return () => {
+            inventoryListeners.delete(listener);
+          };
+        }),
       remove,
+      signal: (sessionId, signal) =>
+        Effect.gen(function* () {
+          const session = yield* api.get(sessionId);
+          yield* session.kill(signal);
+          return sessionSnapshot(session);
+        }),
       terminate: (sessionId, signal) =>
         Effect.gen(function* () {
           const session = yield* api.get(sessionId);
@@ -161,14 +247,37 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
             return owned;
           }),
         )
-        .pipe(Effect.flatMap(terminateOwnedSessions)),
-      resume: stateSemaphore.withPermit(
-        Effect.sync(() => {
-          shuttingDown = false;
-        }),
-      ),
+        .pipe(
+          Effect.tap(() => Effect.sync(publishInventory)),
+          Effect.flatMap(terminateOwnedSessions),
+        ),
+      resume: stateSemaphore
+        .withPermit(
+          Effect.sync(() => {
+            shuttingDown = false;
+          }),
+        )
+        .pipe(Effect.tap(() => Effect.sync(publishInventory))),
     };
     return api;
+  });
+}
+
+function sessionSnapshot(session: ExecSession): SessionSnapshot {
+  return Object.freeze({
+    sessionId: session.id,
+    phase: session.hasExited ? "exited" : session.requestedSignal ? "stopping" : "running",
+    pid: session.pid,
+    command: session.displayCommand,
+    cwd: session.cwd,
+    tty: session.tty,
+    startedAt: session.startedAt,
+    requestedSignal: session.requestedSignal,
+    exitCode: session.exitCode,
+    exitSignal: session.signal,
+    failureMessage: session.failureMessage,
+    outputBytesTotal: session.totalBytesSeen,
+    logPath: session.logPath,
   });
 }
 
