@@ -4,7 +4,7 @@ allowBuilds:
   "@google/genai": false
   esbuild: true
   msgpackr-extract: false
-  node-pty: true
+  "@homebridge/node-pty-prebuilt-multiarch": true
   protobufjs: false
 
 minimumReleaseAgeExclude:

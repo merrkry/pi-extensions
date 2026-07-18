@@ -15,15 +15,19 @@ const targetDirectory = join(agentDir, "extensions", "pi-extensions");
 const source = join(root, "dist", "index.js");
 const target = join(targetDirectory, "index.js");
 const temporary = join(targetDirectory, `.index.js.tmp-${process.pid}`);
-const runtimeSource = dirname(require.resolve("node-pty/package.json"));
-const runtimeTarget = join(targetDirectory, "node_modules", "node-pty");
-const temporaryRuntime = join(targetDirectory, "node_modules", `.node-pty.tmp-${process.pid}`);
+const ptyPackage = "@homebridge/node-pty-prebuilt-multiarch";
+const runtimeSource = dirname(require.resolve(`${ptyPackage}/package.json`));
+const runtimeTarget = join(targetDirectory, "node_modules", ...ptyPackage.split("/"));
+const runtimeParent = dirname(runtimeTarget);
+const temporaryRuntime = join(runtimeParent, `.node-pty.tmp-${process.pid}`);
+const legacyRuntime = join(targetDirectory, "node_modules", "node-pty");
 
-await mkdir(join(targetDirectory, "node_modules"), { recursive: true });
+await mkdir(runtimeParent, { recursive: true });
 try {
-  await copyNodePtyRuntime(runtimeSource, temporaryRuntime);
+  await copyPtyRuntime(runtimeSource, temporaryRuntime);
   await rm(runtimeTarget, { recursive: true, force: true });
   await rename(temporaryRuntime, runtimeTarget);
+  await rm(legacyRuntime, { recursive: true, force: true });
   await copyFile(source, temporary);
   await rename(temporary, target);
 } finally {
@@ -33,7 +37,7 @@ try {
 
 console.log(`Applied pi-extensions -> ${target}`);
 
-async function copyNodePtyRuntime(sourceDirectory, destinationDirectory) {
+async function copyPtyRuntime(sourceDirectory, destinationDirectory) {
   await mkdir(destinationDirectory, { recursive: true });
   const platformPrebuild = `${process.platform}-${process.arch}`;
   await Promise.all([

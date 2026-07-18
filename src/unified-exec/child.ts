@@ -61,7 +61,7 @@ let ptyLoadFailure: string | undefined;
 let ptyLoading: Promise<PtyModule> | undefined;
 
 function loadPtyPromise(): Promise<PtyModule> {
-  return (ptyLoading ??= import("node-pty")
+  return (ptyLoading ??= import("@homebridge/node-pty-prebuilt-multiarch")
     .then((imported) => {
       const candidate = imported as unknown as Partial<PtyModule> & { default?: PtyModule };
       const loaded =
@@ -80,7 +80,7 @@ export const loadPty = Effect.tryPromise({
   try: () => loadPtyPromise(),
   catch: (cause) =>
     new UnifiedExecUnavailableError({
-      message: `tty: true requires node-pty, but it failed to load: ${
+      message: `tty: true requires @homebridge/node-pty-prebuilt-multiarch, but it failed to load: ${
         cause instanceof Error ? cause.message : String(cause)
       }. Call with tty: false to use pipes instead.`,
       cause,
@@ -132,14 +132,18 @@ function disposeWindowsConpty(child: unknown): void {
     outputSocket?.destroy?.();
     worker?.dispose?.();
   } catch {
-    // node-pty internals are best-effort cleanup on Windows.
+    // node-pty-compatible internals are best-effort cleanup on Windows.
   }
 }
 
 export function spawnChild(options: SpawnOptions, loadedPty?: PtyModule): SpawnedChild {
   if (options.tty) {
     const module = loadedPty ?? ptyModule;
-    if (!module) throw new Error(`node-pty is unavailable: ${ptyLoadFailure ?? "not loaded"}`);
+    if (!module) {
+      throw new Error(
+        `@homebridge/node-pty-prebuilt-multiarch is unavailable: ${ptyLoadFailure ?? "not loaded"}`,
+      );
+    }
     return spawnPty(module, options);
   }
   return spawnPipes(options);

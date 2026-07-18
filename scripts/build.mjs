@@ -16,7 +16,7 @@ await build({
     "@earendil-works/pi-ai",
     "@earendil-works/pi-coding-agent",
     "@earendil-works/pi-tui",
-    "node-pty",
+    "@homebridge/node-pty-prebuilt-multiarch",
     "typebox",
   ],
 });
