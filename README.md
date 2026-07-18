@@ -18,5 +18,8 @@ See [architecture](docs/architecture.md) and [compatibility notes](docs/compatib
 ```bash
 pnpm format
 pnpm check
+pnpm run dev
 pnpm apply
 ```
+
+`pnpm run dev` builds the bundle and starts the development Pi instance with its agent directory isolated under `.local/`.

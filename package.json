@@ -7,6 +7,7 @@
     "build": "node scripts/build.mjs",
     "apply": "node scripts/apply.mjs",
     "check": "node scripts/check.mjs",
+    "dev": "pnpm run build && PI_CODING_AGENT_DIR=.local pi --no-extensions --extension .",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint . --deny-warnings",
