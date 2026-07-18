@@ -1,60 +1,33 @@
-import { copyFile, mkdir, readdir, rename, rm } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { copyFile, mkdir, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
 
-const rootDir = fileURLToPath(new URL("../", import.meta.url));
-const packagesDir = join(rootDir, "packages");
-const requestedPackages = new Set(process.argv.slice(2).filter((arg) => arg !== "--"));
-const availablePackages = (await readdir(packagesDir, { withFileTypes: true }))
-  .filter((entry) => entry.isDirectory())
-  .map((entry) => entry.name)
-  .toSorted();
-const packageNames = availablePackages.filter(
-  (name) => requestedPackages.size === 0 || requestedPackages.has(name),
-);
+const root = fileURLToPath(new URL("..", import.meta.url));
+await runBuild();
 
-if (requestedPackages.size > 0 && packageNames.length !== requestedPackages.size) {
-  const missing = [...requestedPackages].filter((name) => !availablePackages.includes(name));
-  throw new Error(`Unknown package(s): ${missing.join(", ")}`);
+const piConfigDir = process.env.PI_CONFIG_DIR || join(homedir(), ".pi");
+const agentDir = process.env.PI_CODING_AGENT_DIR || join(piConfigDir, "agent");
+const targetDirectory = join(agentDir, "extensions", "pi-extensions");
+const source = join(root, "dist", "index.js");
+const target = join(targetDirectory, "index.js");
+const temporary = join(targetDirectory, `.index.js.tmp-${process.pid}`);
+
+await mkdir(targetDirectory, { recursive: true });
+try {
+  await copyFile(source, temporary);
+  await rename(temporary, target);
+} finally {
+  await rm(temporary, { force: true });
 }
 
-await runBuild(packageNames);
+console.log(`Applied pi-extensions -> ${target}`);
 
-const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-const extensionsDir = join(agentDir, "extensions");
-await mkdir(extensionsDir, { recursive: true });
-
-await Promise.all(packageNames.map(applyPackage));
-
-async function applyPackage(name) {
-  const source = join(packagesDir, name, "dist", "index.js");
-  const targetDir = join(extensionsDir, name);
-  const target = join(targetDir, "index.ts");
-  const temporary = join(targetDir, `.index.ts.tmp-${process.pid}`);
-
-  await mkdir(targetDir, { recursive: true });
-  try {
-    await copyFile(source, temporary);
-    await rename(temporary, target);
-  } finally {
-    await rm(temporary, { force: true });
-  }
-
-  // Remove files from the previous flat deployment layout to avoid loading twice.
-  await Promise.all([
-    rm(join(extensionsDir, `${name}.ts`), { force: true }),
-    rm(join(extensionsDir, `${name}.js`), { force: true }),
-  ]);
-
-  console.log(`Applied ${name} -> ${target}`);
-}
-
-function runBuild(names) {
+function runBuild() {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [join(rootDir, "scripts", "build.mjs"), ...names], {
-      cwd: rootDir,
+    const child = spawn(process.execPath, [join(root, "scripts", "build.mjs")], {
+      cwd: root,
       stdio: "inherit",
     });
     child.once("error", reject);

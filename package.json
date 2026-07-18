@@ -1,5 +1,6 @@
 {
   "name": "pi-extensions",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,6 +14,9 @@
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json"
   },
+  "dependencies": {
+    "effect": "4.0.0-beta.97"
+  },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.80.6",
     "@earendil-works/pi-tui": "0.80.6",
@@ -24,5 +28,15 @@
     "typescript": "^5.9.3",
     "vitest": "^4.1.9"
   },
-  "packageManager": "pnpm@11.8.0"
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "packageManager": "pnpm@11.8.0",
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
 }

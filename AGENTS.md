@@ -1,16 +1,17 @@
 # AGENTS.md
 
-This is a monorepo of several Pi Coding Agent extensions.
+This repository contains one Pi Coding Agent package with one bundled extension entry point. Feature code remains modular under `src/`.
 
-User's Pi setup is at `${PI_CONFIG_DIR:-$HOME/.pi}`.
+Pi's configuration root is `${PI_CONFIG_DIR:-$HOME/.pi}`. Its agent directory is `${PI_CODING_AGENT_DIR}` when set, otherwise `${PI_CONFIG_DIR:-$HOME/.pi}/agent`.
 
 ## Documentation
 
-- See [compatibility notes](docs/compatibility.md) for the external extensions and CLIs relied on by packages in this repository, including the checklist for how newly registered or activated tools interact with child subagent sessions. Each package README documents that package's own integration behavior.
+- See [compatibility notes](docs/compatibility.md) for the external extension and CLI contracts used by the bundle.
+- Keep `src/index.ts` composition order explicit and coordinate features through typed shared code rather than event-order assumptions.
 
 ## Workflows
 
 - Use `pnpm format` for formatting.
-- Use `pnpm check` for verification. Pass `[<package-dir>...]` to only execute on selected packages, e.g. `pnpm check better-tui-chrome early-env`.
-- Use `pnpm apply [<package-dir>...]` to install extension packages to user's Pi setup.
-- Unless explicitly permitted, you should not execute any command that modifies user's Pi setup.
+- Use `pnpm check` for full verification; scripts do not accept package targets.
+- Use `pnpm apply` to build and atomically install `dist/index.js` as `extensions/pi-extensions/index.js` under Pi's agent directory.
+- Unless explicitly permitted, do not run `pnpm apply` or any command that modifies the user's Pi setup.
