@@ -169,6 +169,7 @@ function disposeWindowsConpty(child: unknown): void {
 }
 
 export function spawnChild(options: SpawnOptions, loadedPty?: PtyModule): SpawnedChild {
+  const normalized = { ...options, env: childProcessEnvironment(options.env, options.tty) };
   if (options.tty) {
     const module = loadedPty ?? ptyModule;
     if (!module) {
@@ -176,9 +177,28 @@ export function spawnChild(options: SpawnOptions, loadedPty?: PtyModule): Spawne
         `@homebridge/node-pty-prebuilt-multiarch is unavailable: ${ptyLoadFailure ?? "not loaded"}`,
       );
     }
-    return spawnPty(module, options);
+    return spawnPty(module, normalized);
   }
-  return spawnPipes(options);
+  return spawnPipes(normalized);
+}
+
+export function childProcessEnvironment(
+  inherited: NodeJS.ProcessEnv,
+  tty: boolean,
+): NodeJS.ProcessEnv {
+  const env = { ...inherited };
+  if (tty) {
+    if (!env.TERM || env.TERM === "dumb") env.TERM = "xterm-256color";
+    return env;
+  }
+
+  env.TERM = "dumb";
+  env.NO_COLOR = "1";
+  env.FORCE_COLOR = "0";
+  env.CLICOLOR = "0";
+  env.CLICOLOR_FORCE = "0";
+  delete env.COLORTERM;
+  return env;
 }
 
 function spawnPty(module: PtyModule, options: SpawnOptions): SpawnedChild {
@@ -191,7 +211,7 @@ function spawnPty(module: PtyModule, options: SpawnOptions): SpawnedChild {
     env: options.env,
     cols: options.cols ?? 120,
     rows: options.rows ?? 30,
-    name: "xterm-256color",
+    name: options.env.TERM ?? "xterm-256color",
     encoding: null,
   });
   const dataHandlers = new Set<(chunk: Uint8Array) => void>();

@@ -1,15 +1,30 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ContextUsage, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { describe, expect, it, vi } from "vitest";
 
 import { FastMode, type FastModeApi } from "../shared/fast-mode.js";
 import { UnifiedExec, type SessionSnapshot, type UnifiedExecApi } from "../unified-exec/service.js";
-import installBetterTuiChrome from "./install.js";
+import installBetterTuiChrome, { contextInfo } from "./install.js";
 
 type Handler = (...args: any[]) => unknown;
 
 describe("better-tui-chrome fast-mode coordination", () => {
+  it("treats incomplete runtime usage data as unknown instead of throwing", () => {
+    const incomplete = {
+      tokens: undefined,
+      percent: undefined,
+      contextWindow: undefined,
+    } as unknown as ContextUsage;
+
+    expect(() => contextInfo(incomplete, undefined)).not.toThrow();
+    expect(contextInfo(incomplete, undefined)).toEqual({
+      text: "?/?",
+      percent: 0,
+      known: false,
+    });
+  });
+
   it("subscribes only for TUI sessions and disposes on shutdown", () => {
     const handlers = new Map<string, Handler[]>();
     const unsubscribe = vi.fn();

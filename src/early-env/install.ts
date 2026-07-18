@@ -2,6 +2,8 @@ import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
+
 let lastLoadWarning: string | undefined;
 
 const ENV_KEY_CONTROL_CHAR_PATTERN = new RegExp(String.raw`[\u0000-\u001f\u007f-\u009f]`, "u");
@@ -124,7 +126,7 @@ export default function earlyEnv(pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     if (ctx.hasUI && lastLoadWarning) {
-      ctx.ui.notify(lastLoadWarning, "warning");
+      ctx.ui.notify(sanitizeTerminalOutput(lastLoadWarning), "warning");
     }
   });
 }

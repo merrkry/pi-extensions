@@ -1,5 +1,3 @@
-import { stripVTControlCharacters } from "node:util";
-
 import {
   DynamicBorder,
   truncateHead,
@@ -18,6 +16,7 @@ import {
 import * as Effect from "effect/Effect";
 
 import { formatHomePath } from "../shared/display-path.js";
+import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
 import { errorMessage, type UnifiedExecError } from "./errors.js";
 import type { AgentSessionSnapshot, SessionSnapshot, UnifiedExecApi } from "./service.js";
 
@@ -379,8 +378,7 @@ function renderProcessValue(
 }
 
 function sanitizeDisplayValue(value: string): string {
-  const withoutAnsi = stripVTControlCharacters(value);
-  return [...withoutAnsi]
+  return [...sanitizeTerminalOutput(value)]
     .map((character) => {
       const code = character.codePointAt(0) ?? 0;
       if (code === 9) return "  ";
@@ -396,16 +394,18 @@ function plainListLabel(session: SessionSnapshot): string {
 }
 
 function renderDetails(session: SessionSnapshot): string {
-  return [
-    `Session ${session.sessionId} — ${describeAgentState(session)}`,
-    `pid: ${session.pid ?? "?"}`,
-    `mode: ${session.tty ? "tty" : "pipe"}`,
-    `running time: ${formatElapsed(sessionDuration(session, Date.now()))}`,
-    `cwd: ${formatHomePath(session.cwd)}`,
-    `command: ${singleLine(session.command, 1_024)}`,
-    `output bytes: ${session.outputBytesTotal}`,
-    `log: ${session.logPath}`,
-  ].join("\n");
+  return sanitizeTerminalOutput(
+    [
+      `Session ${session.sessionId} — ${describeAgentState(session)}`,
+      `pid: ${session.pid ?? "?"}`,
+      `mode: ${session.tty ? "tty" : "pipe"}`,
+      `running time: ${formatElapsed(sessionDuration(session, Date.now()))}`,
+      `cwd: ${formatHomePath(session.cwd)}`,
+      `command: ${singleLine(session.command, 1_024)}`,
+      `output bytes: ${session.outputBytesTotal}`,
+      `log: ${session.logPath}`,
+    ].join("\n"),
+  );
 }
 
 function renderOutputTails(sessions: readonly AgentSessionSnapshot[]): string[] {
@@ -459,25 +459,11 @@ function commandSummary(command: string): string {
 }
 
 function sanitizeOutput(value: string): string {
-  const withoutAnsi = stripVTControlCharacters(value)
-    .replaceAll("\r\n", "\n")
-    .replaceAll("\r", "\n");
-  return [...withoutAnsi]
-    .map((character) => {
-      const code = character.codePointAt(0) ?? 0;
-      return code < 32 && code !== 9 && code !== 10 ? " " : character;
-    })
-    .join("");
+  return sanitizeTerminalOutput(value);
 }
 
 function singleLine(value: string, maximum: number): string {
-  const printable = [...value]
-    .map((character) => {
-      const code = character.codePointAt(0) ?? 0;
-      return code < 32 || code === 127 ? " " : character;
-    })
-    .join("");
-  const normalized = printable.replace(/\s+/g, " ").trim();
+  const normalized = sanitizeTerminalOutput(value).replace(/\s+/g, " ").trim();
   return normalized.length <= maximum ? normalized : `${normalized.slice(0, maximum - 3)}...`;
 }
 
@@ -496,7 +482,7 @@ function isSessionNotFound(cause: unknown): boolean {
 
 function managementError(cause: unknown): string {
   if (cause && typeof cause === "object" && "_tag" in cause) {
-    return errorMessage(cause as UnifiedExecError);
+    return sanitizeTerminalOutput(errorMessage(cause as UnifiedExecError));
   }
-  return cause instanceof Error ? cause.message : String(cause);
+  return sanitizeTerminalOutput(cause instanceof Error ? cause.message : String(cause));
 }

@@ -18,7 +18,7 @@ interface CallableTool {
     toolCallId: string,
     parameters: Record<string, unknown>,
     signal: AbortSignal | undefined,
-    onUpdate: undefined,
+    onUpdate: ((update: AgentToolResult<unknown>) => void) | undefined,
     context: ExtensionContext,
   ): Promise<AgentToolResult<unknown>>;
 }
@@ -94,10 +94,15 @@ async function makeHarness(options: HarnessOptions = {}) {
         Promise.resolve<unknown[]>([]),
       );
     },
-    async call(name: string, parameters: Record<string, unknown>, signal?: AbortSignal) {
+    async call(
+      name: string,
+      parameters: Record<string, unknown>,
+      signal?: AbortSignal,
+      onUpdate?: (update: AgentToolResult<unknown>) => void,
+    ) {
       const tool = tools.get(name);
       if (!tool) throw new Error(`missing tool: ${name}`);
-      return tool.execute("test-call", parameters, signal, undefined, context);
+      return tool.execute("test-call", parameters, signal, onUpdate, context);
     },
   };
 }
@@ -149,6 +154,78 @@ describe("unified-exec Pi adapter", () => {
     expect(details.session_id).toBeUndefined();
     expect(details.output).toBe("adapter-ok");
     expect(result.content[0]).toMatchObject({ type: "text" });
+  });
+
+  it("removes terminal control sequences from pipe output", async () => {
+    const harness = await makeHarness();
+    await harness.emit("session_start");
+    const result = await harness.call("exec_command", {
+      cmd: "printf '\\033[31mred\\033[0m\\007'",
+    });
+    const details = result.details as ResponseShape;
+
+    expect(details.output).toBe("red");
+    expect(
+      ["\u001b", "\u0007"].some((control) =>
+        (result.content[0] as { text: string }).text.includes(control),
+      ),
+    ).toBe(false);
+  });
+
+  it("does not stream PTY output into the TUI update channel", async () => {
+    const harness = await makeHarness();
+    await harness.emit("session_start");
+    const updates: AgentToolResult<unknown>[] = [];
+    const result = await harness.call(
+      "exec_command",
+      {
+        cmd: "printf '\\033[31mfirst\\033[0m'; sleep 2",
+        tty: true,
+        yield_time_ms: 1_000,
+      },
+      undefined,
+      (update) => updates.push(update),
+    );
+    const details = result.details as ResponseShape;
+
+    try {
+      expect(updates).toEqual([]);
+      expect(details.output).toContain("first");
+      expect(details.output).not.toContain("\u001b");
+    } finally {
+      if (details.session_id !== undefined) {
+        await harness.call("kill_session", { session_id: details.session_id });
+      }
+    }
+  });
+
+  it("sanitizes streamed pipe output before sending TUI updates", async () => {
+    const harness = await makeHarness();
+    await harness.emit("session_start");
+    const updates: AgentToolResult<unknown>[] = [];
+    const result = await harness.call(
+      "exec_command",
+      {
+        cmd: "printf '\\033[31mfirst\\033[0m\\007'; sleep 2",
+        yield_time_ms: 1_000,
+      },
+      undefined,
+      (update) => updates.push(update),
+    );
+    const details = result.details as ResponseShape;
+
+    try {
+      expect(updates.length).toBeGreaterThan(0);
+      for (const update of updates) {
+        const text = (update.content[0] as { text: string }).text;
+        expect(text).toContain("first");
+        expect(["\u001b", "\u0007"].some((control) => text.includes(control))).toBe(false);
+      }
+    } finally {
+      if (details.session_id !== undefined) {
+        await harness.call("kill_session", { session_id: details.session_id });
+      }
+    }
   });
 
   it("keeps the transient Agent inventory synchronized", async () => {

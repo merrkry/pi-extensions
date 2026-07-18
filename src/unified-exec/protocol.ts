@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import * as Effect from "effect/Effect";
 
+import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
 import { InvalidInputError } from "./errors.js";
 import { unescapeChars } from "./unescape.js";
 
@@ -139,7 +140,7 @@ export function finalizeResponse(input: FinalizeInput): ResponseShape {
   return {
     chunk_id: randomBytes(3).toString("hex"),
     wall_time_seconds: (Date.now() - input.startedAt) / 1000,
-    output: truncation.content,
+    output: sanitizeTerminalOutput(truncation.content),
     original_token_count: Math.ceil(input.collected.length / 4),
     tty: input.tty,
     ...(input.sessionId === undefined ? {} : { session_id: input.sessionId }),
@@ -147,10 +148,10 @@ export function finalizeResponse(input: FinalizeInput): ResponseShape {
       ? {}
       : { exit_code: input.exitCode }),
     ...(input.signal ? { signal: input.signal } : {}),
-    ...(input.failure ? { failure_message: input.failure } : {}),
-    ...(input.logPath ? { log_path: input.logPath } : {}),
-    ...(input.cwd ? { cwd: input.cwd } : {}),
-    ...(input.command ? { command: input.command } : {}),
+    ...(input.failure ? { failure_message: sanitizeTerminalOutput(input.failure) } : {}),
+    ...(input.logPath ? { log_path: sanitizeTerminalOutput(input.logPath) } : {}),
+    ...(input.cwd ? { cwd: sanitizeTerminalOutput(input.cwd) } : {}),
+    ...(input.command ? { command: sanitizeTerminalOutput(input.command) } : {}),
     ...(input.yieldTimeMs ? { yield_time_ms: input.yieldTimeMs } : {}),
     ...(truncation.truncated ? { truncation } : {}),
   };

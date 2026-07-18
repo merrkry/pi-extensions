@@ -16,10 +16,10 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import * as Effect from "effect/Effect";
-import { stripVTControlCharacters } from "node:util";
 
 import { formatHomePath } from "../shared/display-path.js";
 import { FastMode } from "../shared/fast-mode.js";
+import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
 import { UnifiedExec } from "../unified-exec/service.js";
 
 const EDITOR_INSET = 1;
@@ -46,12 +46,9 @@ function fitToWidth(line: string, width: number): string {
   return truncateToWidth(line, width, "", true);
 }
 
-const CONTROL_CHAR_PATTERN = new RegExp(String.raw`[\u0000-\u001f\u007f-\u009f]`, "g");
-
-function sanitizeStatusText(text: string): string {
-  return stripVTControlCharacters(text)
-    .replace(CONTROL_CHAR_PATTERN, " ")
-    .replace(/ +/g, " ")
+function sanitizeStatusText(text: unknown): string {
+  return sanitizeTerminalOutput(typeof text === "string" ? text : "")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
@@ -63,6 +60,7 @@ function addEditorInset(line: string, width: number): string {
 }
 
 function formatTokens(count: number): string {
+  if (!Number.isFinite(count) || count < 0) return "?";
   if (count < 1000) return count.toString();
   if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
   if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
@@ -74,7 +72,7 @@ function formatContextWindow(contextWindow: number): string {
   return contextWindow > 0 ? formatTokens(contextWindow) : "?";
 }
 
-function contextInfo(
+export function contextInfo(
   usage: ContextUsage | undefined,
   model: { contextWindow?: number } | undefined,
 ): {
@@ -82,15 +80,27 @@ function contextInfo(
   percent: number;
   known: boolean;
 } {
-  const contextWindow = usage?.contextWindow ?? model?.contextWindow ?? 0;
+  const rawContextWindow = usage?.contextWindow ?? model?.contextWindow;
+  const contextWindow =
+    typeof rawContextWindow === "number" && Number.isFinite(rawContextWindow)
+      ? rawContextWindow
+      : 0;
+  const tokens = usage?.tokens;
+  const percent = usage?.percent;
 
-  if (!usage || usage.tokens === null || usage.percent === null) {
+  if (
+    !usage ||
+    typeof tokens !== "number" ||
+    !Number.isFinite(tokens) ||
+    typeof percent !== "number" ||
+    !Number.isFinite(percent)
+  ) {
     return { text: `?/${formatContextWindow(contextWindow)}`, percent: 0, known: false };
   }
 
   return {
-    text: `${usage.percent.toFixed(1)}%/${formatContextWindow(contextWindow)}`,
-    percent: usage.percent,
+    text: `${percent.toFixed(1)}%/${formatContextWindow(contextWindow)}`,
+    percent,
     known: true,
   };
 }
@@ -154,7 +164,8 @@ function renderFooterLine(
   const context = contextInfo(usage, currentModel);
   const branch = footerData.getGitBranch();
   const cwdText = sanitizeStatusText(formatHomePath(ctx.cwd));
-  const rightText = branch ? `${cwdText} • ${sanitizeStatusText(branch)}` : cwdText;
+  const rightText =
+    typeof branch === "string" && branch ? `${cwdText} • ${sanitizeStatusText(branch)}` : cwdText;
 
   const fastMode = fastModeEnabled ? theme.fg("dim", "fast • ") : "";
   const left =

@@ -1,5 +1,10 @@
 # Unified Exec
 
+Pipe sessions advertise a non-interactive, colorless terminal environment (`TERM=dumb`,
+`NO_COLOR=1`, and the common color-force variables disabled). PTY sessions advertise a
+usable terminal type. Output sanitization remains a final safety boundary for programs that
+ignore those conventions.
+
 Provides persistent, owned shell sessions through four model-facing tools:
 
 - `exec_command` runs a pipe or PTY command and yields a session id when it remains active.

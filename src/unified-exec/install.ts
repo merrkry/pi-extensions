@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import { Type } from "typebox";
 
+import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
 import { loadPty } from "./child.js";
 import { manageProcesses, renderAgentInventory } from "./management.js";
 import {
@@ -77,7 +78,9 @@ export default function installUnifiedExec(
       if (pi.getFlag("keep-builtin-bash") !== true) {
         pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "bash"));
       }
-      if (ptyWarning && context.hasUI) context.ui.notify(ptyWarning, "warning");
+      if (ptyWarning && context.hasUI) {
+        context.ui.notify(sanitizeTerminalOutput(ptyWarning), "warning");
+      }
     });
 
     pi.on("before_agent_start", async () => {
@@ -222,7 +225,7 @@ export default function installUnifiedExec(
           }).pipe(Effect.mapError(toBoundaryError)),
           signal,
         );
-        const output = new TextDecoder().decode(outcome.finalOutput);
+        const output = sanitizeTerminalOutput(new TextDecoder().decode(outcome.finalOutput));
         return {
           content: [
             {
@@ -264,7 +267,7 @@ export default function installUnifiedExec(
             )
           : ["(no sessions)"];
         return {
-          content: [{ type: "text", text: lines.join("\n") }],
+          content: [{ type: "text", text: sanitizeTerminalOutput(lines.join("\n")) }],
           details: {
             sessions,
             active_count: sessions.filter((session) => session.running).length,
@@ -378,14 +381,15 @@ function withStreaming<E>(
   onUpdate: AgentToolUpdateCallback<ResponseShape> | undefined,
   operation: Effect.Effect<Uint8Array, E>,
 ): Effect.Effect<Uint8Array, E> {
-  if (!onUpdate) return operation;
+  if (!onUpdate || session.tty) return operation;
   return Effect.scoped(
     Effect.gen(function* () {
       yield* Effect.forkScoped(
         session.streamUpdates(deadline, (update) => {
+          const response = streamResponse(update, session.startedAt);
           onUpdate({
-            content: [{ type: "text", text: update.output }],
-            details: streamResponse(update, session.startedAt),
+            content: [{ type: "text", text: response.output }],
+            details: response,
           });
         }),
       );
@@ -400,7 +404,7 @@ function streamResponse(update: StreamUpdate, startedAt: number): ResponseShape 
   return {
     chunk_id: "stream",
     wall_time_seconds: (Date.now() - startedAt) / 1000,
-    output: update.output,
+    output: sanitizeTerminalOutput(update.output),
     original_token_count: Math.ceil(update.total_bytes / 4),
     tty: update.tty,
     session_id: update.session_id,
@@ -436,8 +440,8 @@ function finalizeForSession(
 function sessionSummary(session: ExecSession, now: number) {
   return {
     session_id: session.id,
-    command: session.displayCommand,
-    cwd: session.cwd,
+    command: sanitizeTerminalOutput(session.displayCommand),
+    cwd: sanitizeTerminalOutput(session.cwd),
     tty: session.tty,
     pid: session.pid,
     started_at_ms: session.startedAt,
@@ -446,8 +450,9 @@ function sessionSummary(session: ExecSession, now: number) {
     running: !session.hasExited,
     exit_code: session.exitCode,
     signal: session.signal,
-    failure_message: session.failureMessage,
+    failure_message:
+      session.failureMessage === null ? null : sanitizeTerminalOutput(session.failureMessage),
     output_bytes_total: session.totalBytesSeen,
-    log_path: session.logPath,
+    log_path: sanitizeTerminalOutput(session.logPath),
   };
 }

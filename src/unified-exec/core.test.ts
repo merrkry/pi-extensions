@@ -1,8 +1,9 @@
 import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vitest";
 
+import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
 import { HeadTailBuffer } from "./buffer.js";
-import { ptyRuntimeFailure } from "./child.js";
+import { childProcessEnvironment, ptyRuntimeFailure } from "./child.js";
 import {
   clampYield,
   DEFAULT_MAX_EMPTY_POLL_MS,
@@ -48,6 +49,40 @@ describe("PTY runtime support", () => {
   });
 });
 
+describe("child terminal environment", () => {
+  it("advertises plain output to pipe processes without mutating the parent environment", () => {
+    const inherited = {
+      TERM: "xterm-256color",
+      COLORTERM: "truecolor",
+      FORCE_COLOR: "3",
+      PATH: "/bin",
+    };
+
+    expect(childProcessEnvironment(inherited, false)).toEqual({
+      TERM: "dumb",
+      NO_COLOR: "1",
+      FORCE_COLOR: "0",
+      CLICOLOR: "0",
+      CLICOLOR_FORCE: "0",
+      PATH: "/bin",
+    });
+    expect(inherited).toEqual({
+      TERM: "xterm-256color",
+      COLORTERM: "truecolor",
+      FORCE_COLOR: "3",
+      PATH: "/bin",
+    });
+  });
+
+  it("gives PTY processes a usable TERM while preserving explicit preferences", () => {
+    expect(childProcessEnvironment({ TERM: "dumb", NO_COLOR: "1" }, true)).toEqual({
+      TERM: "xterm-256color",
+      NO_COLOR: "1",
+    });
+    expect(childProcessEnvironment({ TERM: "screen-256color" }, true).TERM).toBe("screen-256color");
+  });
+});
+
 describe("yield limits", () => {
   it("keeps empty polls below the prompt-cache TTL by default", () => {
     const maximum = resolveMaxEmptyPollMs({});
@@ -79,5 +114,16 @@ describe("write_stdin input decoding", () => {
     await expect(
       Effect.runPromise(resolveWriteInput({ session_id: 1, chars_b64: "%%%=" })),
     ).rejects.toMatchObject({ _tag: "InvalidInputError" });
+  });
+});
+
+describe("terminal output sanitization", () => {
+  it("removes ANSI sequences and residual terminal controls", () => {
+    expect(
+      sanitizeTerminalOutput(
+        "safe\u001b[31m red\u001b[0m\u001b]8;;https://example.com\u0007link\u001b]8;;\u0007" +
+          "\u0000\u0008\u009b2J\rnext\tvalue\u001b[",
+      ),
+    ).toBe("safe redlink\nnext\tvalue[");
   });
 });

@@ -9,6 +9,7 @@ import {
 import { Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 
 import { formatHomePath } from "../shared/display-path.js";
+import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
 import type { ExecCommandArgs, ResponseShape, WriteStdinArgs } from "./protocol.js";
 
 export const COMMAND_PREVIEW_LINES = 4;
@@ -38,13 +39,16 @@ class ExecCallComponent implements Component {
 
   render(width: number): string[] {
     if (width <= 0) return [];
-    const command = this.args.cmd || "...";
+    const rawCommand = typeof this.args.cmd === "string" ? this.args.cmd : "";
+    const command = sanitizeTerminalOutput(rawCommand) || "...";
     const styled = this.theme.fg("toolTitle", this.theme.bold(`$ ${command}`));
     const commandLines = new Text(styled, 0, 0).render(width);
     const visibleCommand = this.expanded
       ? headWithHardLimit(commandLines, COMMAND_EXPANDED_LINES, width, this.theme)
       : headWithExpansionHint(commandLines, COMMAND_PREVIEW_LINES, width, this.theme);
-    const effectiveCwd = this.args.workdir?.trim() || this.cwd;
+    const requestedCwd =
+      typeof this.args.workdir === "string" ? this.args.workdir.trim() : undefined;
+    const effectiveCwd = sanitizeTerminalOutput(requestedCwd || this.cwd);
     const cwdLine = truncateToWidth(
       this.theme.fg("muted", `cwd  ${formatHomePath(effectiveCwd)}`),
       width,
@@ -75,8 +79,10 @@ class ResultComponent implements Component {
 
   render(width: number): string[] {
     if (width <= 0) return [];
-    const details = this.result?.details;
-    const output = details?.output ?? (this.result ? textContent(this.result) : "");
+    const details = asRecord(this.result?.details);
+    const output = sanitizeTerminalOutput(
+      stringField(details, "output") ?? (this.result ? textContent(this.result) : ""),
+    );
     const lines: string[] = [];
 
     if (output) {
@@ -96,8 +102,9 @@ class ResultComponent implements Component {
     const warning = details ? truncationWarning(details) : undefined;
     if (warning) lines.push("", truncateToWidth(this.theme.fg("warning", warning), width, "..."));
 
-    if (details) {
-      lines.push("", truncateToWidth(statusLine(details, this.options, this.theme), width, "..."));
+    const status = details ? statusLine(details, this.options, this.theme) : undefined;
+    if (status) {
+      lines.push("", truncateToWidth(status, width, "..."));
     }
     return lines;
   }
@@ -216,43 +223,55 @@ function hardLimitHint(
 }
 
 function statusLine(
-  details: ResponseShape,
+  details: Record<string, unknown>,
   options: ToolRenderResultOptions,
   theme: Theme,
-): string {
+): string | undefined {
   const fields: string[] = [];
-  const timeLabel = options.isPartial
-    ? "elapsed"
-    : details.session_id === undefined
-      ? "took"
-      : "yielded";
-  fields.push(`${timeLabel} ${details.wall_time_seconds.toFixed(1)}s`);
-  if (details.session_id !== undefined) {
-    fields.push(`session ${details.session_id}`);
-  } else if (details.exit_code !== undefined) {
-    fields.push(
-      details.exit_code === 0
-        ? `exit ${details.exit_code}`
-        : theme.fg("error", `exit ${details.exit_code}`),
-    );
-  } else if (details.signal) {
-    fields.push(theme.fg("error", details.signal));
+  const wallTime = finiteNumberField(details, "wall_time_seconds");
+  const sessionId = finiteNumberField(details, "session_id");
+  const exitCode = finiteNumberField(details, "exit_code");
+  if (wallTime !== undefined) {
+    const timeLabel = options.isPartial ? "elapsed" : sessionId === undefined ? "took" : "yielded";
+    fields.push(`${timeLabel} ${wallTime.toFixed(1)}s`);
   }
-  if (details.failure_message) fields.push(theme.fg("error", details.failure_message));
-  if (details.log_path) fields.push(`log ${formatHomePath(details.log_path)}`);
-  return theme.fg("muted", fields.join(" · "));
+  if (sessionId !== undefined) {
+    fields.push(`session ${sessionId}`);
+  } else if (exitCode !== undefined) {
+    fields.push(exitCode === 0 ? `exit ${exitCode}` : theme.fg("error", `exit ${exitCode}`));
+  } else {
+    const signal = stringField(details, "signal");
+    if (signal) fields.push(theme.fg("error", sanitizeTerminalOutput(signal)));
+  }
+  const failure = stringField(details, "failure_message");
+  if (failure) {
+    fields.push(theme.fg("error", sanitizeTerminalOutput(failure)));
+  }
+  const logPath = stringField(details, "log_path");
+  if (logPath) {
+    fields.push(`log ${formatHomePath(sanitizeTerminalOutput(logPath))}`);
+  }
+  return fields.length > 0 ? theme.fg("muted", fields.join(" · ")) : undefined;
 }
 
-function truncationWarning(details: ResponseShape): string | undefined {
-  const truncation = details.truncation;
-  if (!truncation?.truncated) return undefined;
-  const log = details.log_path ? `. Full output: ${details.log_path}` : "";
-  if (truncation.truncatedBy === "lines") {
-    return `[Truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines${log}]`;
+function truncationWarning(details: Record<string, unknown>): string | undefined {
+  const truncation = asRecord(details["truncation"]);
+  if (truncation?.["truncated"] !== true) return undefined;
+  const logPath = stringField(details, "log_path");
+  const log = logPath ? `. Full output: ${sanitizeTerminalOutput(logPath)}` : "";
+  const outputLines = finiteNumberField(truncation, "outputLines");
+  const totalLines = finiteNumberField(truncation, "totalLines");
+  if (
+    truncation["truncatedBy"] === "lines" &&
+    outputLines !== undefined &&
+    totalLines !== undefined
+  ) {
+    return `[Truncated: showing ${outputLines} of ${totalLines} lines${log}]`;
   }
-  return `[Truncated: ${truncation.outputLines} lines shown (${formatSize(
-    truncation.maxBytes ?? DEFAULT_MAX_BYTES,
-  )} limit)${log}]`;
+  const maximum = finiteNumberField(truncation, "maxBytes") ?? DEFAULT_MAX_BYTES;
+  const shown =
+    outputLines === undefined ? "Output truncated" : `Truncated: ${outputLines} lines shown`;
+  return `[${shown} (${formatSize(maximum)} limit)${log}]`;
 }
 
 function describeWrite(args: WriteStdinArgs): string | undefined {
@@ -264,16 +283,18 @@ function describeWrite(args: WriteStdinArgs): string | undefined {
 }
 
 function visibleInput(input: string): string {
-  const visible = input
-    .split("\u0003")
-    .join("^C")
-    .split("\u0004")
-    .join("^D")
-    .split("\u001b")
-    .join("^[")
-    .replace(/\n/g, "\\n")
-    .replace(/\r/g, "\\r")
-    .replace(/\t/g, "\\t");
+  const visible = sanitizeTerminalOutput(
+    input
+      .split("\u0003")
+      .join("^C")
+      .split("\u0004")
+      .join("^D")
+      .split("\u001b")
+      .join("^[")
+      .replace(/\n/g, "\\n")
+      .replace(/\r/g, "\\r")
+      .replace(/\t/g, "\\t"),
+  );
   return visible.length <= 40 ? visible : `${visible.slice(0, 37)}...`;
 }
 
@@ -284,6 +305,26 @@ function base64ByteLength(base64: string): number {
 }
 
 function textContent(result: AgentToolResult<unknown>): string {
-  const first = result.content[0];
-  return first?.type === "text" ? first.text : "";
+  if (!Array.isArray(result.content)) return "";
+  const first = asRecord(result.content[0]);
+  return first?.["type"] === "text" && typeof first["text"] === "string" ? first["text"] : "";
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function stringField(record: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function finiteNumberField(
+  record: Record<string, unknown> | undefined,
+  key: string,
+): number | undefined {
+  const value = record?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }

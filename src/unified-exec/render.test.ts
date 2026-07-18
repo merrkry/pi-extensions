@@ -132,4 +132,58 @@ describe("unified-exec rendering", () => {
       OUTPUT_EXPANDED_LINES,
     );
   });
+
+  it("does not pass process or command control sequences to the TUI", () => {
+    const args = { cmd: "printf '\u001b[31mdanger\u001b[0m'\u0007" };
+    const callLines = renderExecCommandCall(args, theme, callContext(args, false)).render(80);
+    expect(callLines.join("\n")).toContain("danger");
+    expect(["\u001b", "\u0007"].some((control) => callLines.join("\n").includes(control))).toBe(
+      false,
+    );
+
+    const output = "before\u001b[2J\u001b]0;owned\u0007after\u0008";
+    const result: AgentToolResult<ResponseShape> = {
+      content: [{ type: "text", text: output }],
+      details: response(output),
+    };
+    const rendered = renderResult(result, { expanded: false, isPartial: true }, theme, {
+      args: {},
+      cwd: "/workspace/project",
+      expanded: false,
+      lastComponent: undefined,
+    })
+      .render(80)
+      .join("\n");
+
+    expect(rendered).toContain("beforeafter");
+    expect(["\u001b", "\u0007", "\u0008"].some((control) => rendered.includes(control))).toBe(
+      false,
+    );
+    expect(rendered).not.toContain("owned");
+  });
+
+  it("tolerates partial results with incomplete or malformed details", () => {
+    const result = {
+      content: [{ type: "text", text: "content fallback" }],
+      details: {
+        output: "partial output",
+        wall_time_seconds: undefined,
+        session_id: "not-a-number",
+        truncation: { truncated: true },
+      },
+    } as unknown as AgentToolResult<ResponseShape>;
+
+    const component = renderResult(result, { expanded: false, isPartial: true }, theme, {
+      args: {},
+      cwd: "/workspace/project",
+      expanded: false,
+      lastComponent: undefined,
+    });
+
+    expect(() => component.render(80)).not.toThrow();
+    const rendered = component.render(80).join("\n");
+    expect(rendered).toContain("partial output");
+    expect(rendered).toContain("Output truncated");
+    expect(rendered).not.toContain("elapsed");
+  });
 });
