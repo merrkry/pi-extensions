@@ -14,6 +14,7 @@ import {
 } from "./errors.js";
 import {
   clampYield,
+  DEFAULT_MAX_EMPTY_POLL_MS,
   EARLY_EXIT_GRACE_PERIOD_MS,
   type ExecCommandArgs,
   finalizeResponse,
@@ -119,7 +120,7 @@ export default function installUnifiedExec(
       promptSnippet: "Run a shell command; long-running ones yield a session_id",
       promptGuidelines: [
         "Normally omit yield_time_ms and keep the 5s default. Use 1s only for interactive commands.",
-        "For long-running non-interactive commands, use one empty write_stdin poll of 5 minutes or longer.",
+        `For long-running non-interactive commands, use one empty write_stdin poll with yield-time_ms up to ${DEFAULT_MAX_EMPTY_POLL_MS} (290 seconds) rather than repeated short polls.`,
       ],
       executionMode: "parallel",
       parameters: Type.Object({
@@ -166,7 +167,8 @@ export default function installUnifiedExec(
       promptSnippet: "Send input to or poll a running session",
       promptGuidelines: [
         "Normally omit yield_time_ms and keep the 5s default. Use 1s only for interactive sessions.",
-        "For long-running non-interactive jobs, use one empty poll of 5 minutes or longer.",
+        `For long-running non-interactive jobs, use one empty poll with yield-time_ms up to ${DEFAULT_MAX_EMPTY_POLL_MS} (290 seconds).`,
+        "Prefer one long empty poll over repeated short polls.",
         "In tty sessions, submit lines with \\r rather than \\n for portable Enter behavior.",
       ],
       executionMode: "parallel",

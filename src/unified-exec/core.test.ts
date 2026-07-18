@@ -3,7 +3,14 @@ import { describe, expect, it } from "vitest";
 
 import { HeadTailBuffer } from "./buffer.js";
 import { ptyRuntimeFailure } from "./child.js";
-import { resolveWriteInput } from "./protocol.js";
+import {
+  clampYield,
+  DEFAULT_MAX_EMPTY_POLL_MS,
+  MAX_EMPTY_POLL_ENV_VAR,
+  MAX_YIELD_TIME_MS,
+  resolveMaxEmptyPollMs,
+  resolveWriteInput,
+} from "./protocol.js";
 import { unescapeChars } from "./unescape.js";
 
 const encode = (text: string) => new TextEncoder().encode(text);
@@ -38,6 +45,20 @@ describe("PTY runtime support", () => {
       message: expect.stringContaining("Bun 1.2.3"),
     });
     expect(ptyRuntimeFailure({})).toBeUndefined();
+  });
+});
+
+describe("yield limits", () => {
+  it("keeps empty polls below the prompt-cache TTL by default", () => {
+    const maximum = resolveMaxEmptyPollMs({});
+
+    expect(maximum).toBe(DEFAULT_MAX_EMPTY_POLL_MS);
+    expect(clampYield(DEFAULT_MAX_EMPTY_POLL_MS + 1, maximum)).toBe(DEFAULT_MAX_EMPTY_POLL_MS);
+  });
+
+  it("allows the empty-poll cap to be raised explicitly up to the absolute limit", () => {
+    expect(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "600000" })).toBe(600_000);
+    expect(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "9999999" })).toBe(MAX_YIELD_TIME_MS);
   });
 });
 

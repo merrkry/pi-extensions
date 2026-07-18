@@ -16,6 +16,9 @@ export const MIN_YIELD_TIME_MS = 1_000;
 export const MAX_YIELD_TIME_MS = 1_800_000;
 export const DEFAULT_YIELD_MS = 5_000;
 export const EARLY_EXIT_GRACE_PERIOD_MS = 500;
+// Keep empty polls below Anthropic's five-minute prompt-cache TTL so a wait cannot
+// outlive the cached prompt prefix. Cache-insensitive runs can raise this via the env override.
+export const DEFAULT_MAX_EMPTY_POLL_MS = 290_000;
 export const MAX_EMPTY_POLL_ENV_VAR = "PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS";
 
 export interface ExecCommandArgs {
@@ -104,9 +107,9 @@ export function clampYield(ms: number | undefined, maximum = MAX_YIELD_TIME_MS):
 
 export function resolveMaxEmptyPollMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env[MAX_EMPTY_POLL_ENV_VAR]?.trim();
-  if (!raw) return MAX_YIELD_TIME_MS;
+  if (!raw) return DEFAULT_MAX_EMPTY_POLL_MS;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) return MAX_YIELD_TIME_MS;
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MAX_EMPTY_POLL_MS;
   return Math.min(MAX_YIELD_TIME_MS, Math.max(MIN_YIELD_TIME_MS, Math.floor(parsed)));
 }
 
