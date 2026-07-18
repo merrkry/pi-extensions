@@ -232,18 +232,18 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
                   if (!directory) return yield* Effect.fail(new SessionShuttingDownError());
                   const session = yield* ExecSession.spawn(id, options, directory);
                   session.onStateChange(publishInventory);
-                  yield* stateSemaphore.withPermit(
-                    Effect.suspend(() => {
+                  const accepted = yield* stateSemaphore.withPermit(
+                    Effect.sync(() => {
                       pendingIds.delete(id);
-                      if (shuttingDown) {
-                        return session
-                          .kill()
-                          .pipe(Effect.andThen(Effect.fail(new SessionShuttingDownError())));
-                      }
+                      if (shuttingDown) return false;
                       sessions.set(id, session);
-                      return Effect.void;
+                      return true;
                     }),
                   );
+                  if (!accepted) {
+                    yield* terminateOwnedSessions([session]);
+                    return yield* Effect.fail(new SessionShuttingDownError());
+                  }
                   yield* Effect.sync(publishInventory);
                   return { session };
                 }),

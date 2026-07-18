@@ -29,6 +29,6 @@ Each runtime owns a temporary log directory containing complete process output. 
 
 Live capacity and exited history are bounded independently: up to 64 live or pending sessions and 64 FIFO tombstones. Capacity pressure never evicts a live process.
 
-Pipe mode uses Node child processes. PTY mode uses the optional `@homebridge/node-pty-prebuilt-multiarch` package and fails explicitly when its native module is unavailable. Interrupt maps to `SIGINT` on POSIX and terminal Ctrl-C input for Windows PTY sessions; Windows pipe sessions do not expose a reliable graceful interrupt.
+Pipe mode uses Node child processes. PTY mode uses the optional `@homebridge/node-pty-prebuilt-multiarch` package and fails explicitly when its native module is unavailable. Pi warns at session start when the PTY provider cannot load or the runtime is Bun; pipe mode remains available. Interrupt maps to `SIGINT` on POSIX and terminal Ctrl-C input for Windows PTY sessions; Windows pipe sessions do not expose a reliable graceful interrupt.
 
 Tool and management rendering is always bounded. Full output remains available through the runtime log while in-memory buffers and Agent-facing tails stay capped.

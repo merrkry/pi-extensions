@@ -4,10 +4,12 @@ import type {
   ExtensionContext,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import * as Effect from "effect/Effect";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import { afterEach, describe, expect, it } from "vitest";
 
-import installUnifiedExec from "./install.js";
+import { UnifiedExecUnavailableError } from "./errors.js";
+import installUnifiedExec, { type UnifiedExecInstallOptions } from "./install.js";
 import type { ResponseShape } from "./protocol.js";
 import { UnifiedExecLive } from "./service.js";
 
@@ -26,21 +28,28 @@ afterEach(async () => {
   await Promise.all(disposals.splice(0).map((dispose) => dispose()));
 });
 
-async function makeHarness() {
+interface HarnessOptions extends UnifiedExecInstallOptions {
+  readonly hasUI?: boolean;
+}
+
+async function makeHarness(options: HarnessOptions = {}) {
   const tools = new Map<string, CallableTool>();
   const commands = new Set<string>();
   const handlers = new Map<string, Array<(event: unknown, context: ExtensionContext) => unknown>>();
+  const notifications: Array<{ message: string; level: string }> = [];
   let activeTools = ["bash", "read"];
   const ui = {
     theme: {
       fg: (_color: string, text: string) => text,
     },
-    notify() {},
+    notify(message: string, level: string) {
+      notifications.push({ message, level });
+    },
     setWidget() {},
   };
   const context = {
     cwd: process.cwd(),
-    hasUI: false,
+    hasUI: options.hasUI ?? false,
     ui,
   } as unknown as ExtensionContext;
   const pi = {
@@ -68,11 +77,14 @@ async function makeHarness() {
   } as unknown as ExtensionAPI;
   const runtime = ManagedRuntime.make(UnifiedExecLive);
   disposals.push(() => runtime.dispose());
-  await runtime.runPromise(installUnifiedExec(pi));
+  await runtime.runPromise(
+    installUnifiedExec(pi, options.ptyProbe === undefined ? {} : { ptyProbe: options.ptyProbe }),
+  );
 
   return {
     tools,
     commands,
+    notifications,
     get activeTools() {
       return activeTools;
     },
@@ -103,6 +115,28 @@ describe("unified-exec Pi adapter", () => {
     ]);
     expect(harness.commands).toContain("processes");
     expect(harness.activeTools).toEqual(["read"]);
+  });
+
+  it("warns in UI mode when PTY support is unavailable", async () => {
+    const harness = await makeHarness({
+      hasUI: true,
+      ptyProbe: Effect.fail(
+        new UnifiedExecUnavailableError({
+          message:
+            "tty: true requires @homebridge/node-pty-prebuilt-multiarch, but it failed to load.",
+        }),
+      ),
+    });
+
+    await harness.emit("session_start");
+
+    expect(harness.notifications).toEqual([
+      {
+        level: "warning",
+        message:
+          "unified-exec: tty: true requires @homebridge/node-pty-prebuilt-multiarch, but it failed to load.",
+      },
+    ]);
   });
 
   it("executes short commands through the public exec_command contract", async () => {
@@ -169,6 +203,26 @@ describe("unified-exec Pi adapter", () => {
     };
     expect(details.active_count).toBe(1);
     await harness.call("kill_session", { session_id: details.sessions[0]!.session_id });
+  });
+
+  it("terminates a command when shutdown races its initial wait", async () => {
+    const harness = await makeHarness();
+    await harness.emit("session_start");
+    const pending = harness.call("exec_command", {
+      cmd: "sleep 30",
+      yield_time_ms: 5_000,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await harness.emit("session_shutdown", { type: "session_shutdown", reason: "reload" });
+
+    const result = await pending;
+    const details = result.details as ResponseShape;
+    expect(details.session_id).toBeUndefined();
+    expect(details.signal !== undefined || details.exit_code !== undefined).toBe(true);
+
+    const listed = await harness.call("list_sessions", {});
+    expect(listed.details).toMatchObject({ active_count: 0, sessions: [] });
   });
 
   it("maps typed input failures to ordinary tool errors at the boundary", async () => {

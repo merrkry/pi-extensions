@@ -56,39 +56,71 @@ interface PtyModule {
   ): PtyProcess;
 }
 
-let ptyModule: PtyModule | undefined;
-let ptyLoadFailure: string | undefined;
-let ptyLoading: Promise<PtyModule> | undefined;
+const PTY_PACKAGE = "@homebridge/node-pty-prebuilt-multiarch";
 
-function loadPtyPromise(): Promise<PtyModule> {
-  return (ptyLoading ??= import("@homebridge/node-pty-prebuilt-multiarch")
-    .then((imported) => {
+let ptyModule: PtyModule | undefined;
+let ptyLoadFailure: UnifiedExecUnavailableError | undefined;
+
+export function ptyRuntimeFailure(versions?: {
+  readonly bun?: string;
+}): UnifiedExecUnavailableError | undefined {
+  const bunVersion =
+    versions === undefined
+      ? (process.versions as NodeJS.ProcessVersions & { readonly bun?: string }).bun
+      : versions.bun;
+  if (!bunVersion) return undefined;
+  return new UnifiedExecUnavailableError({
+    message: `PTY mode is unavailable under Bun ${bunVersion}; run Pi with Node.js 22.19 or newer, or call with tty: false to use pipes.`,
+  });
+}
+
+function loadPtyModule(): Effect.Effect<PtyModule, UnifiedExecUnavailableError> {
+  const runtimeFailure = ptyRuntimeFailure();
+  if (runtimeFailure) return Effect.fail(runtimeFailure);
+  return Effect.tryPromise({
+    try: () => import("@homebridge/node-pty-prebuilt-multiarch"),
+    catch: (cause) =>
+      new UnifiedExecUnavailableError({
+        message: `tty: true requires ${PTY_PACKAGE}, but it failed to load: ${
+          cause instanceof Error ? cause.message : String(cause)
+        }. Call with tty: false to use pipes instead.`,
+        cause,
+      }),
+  }).pipe(
+    Effect.flatMap((imported) => {
       const candidate = imported as unknown as Partial<PtyModule> & { default?: PtyModule };
       const loaded =
         typeof candidate.spawn === "function" ? (candidate as PtyModule) : candidate.default;
-      if (!loaded) throw new Error("module has no spawn export");
-      ptyModule = loaded;
-      return loaded;
-    })
-    .catch((cause: unknown) => {
-      ptyLoadFailure = cause instanceof Error ? cause.message : String(cause);
-      throw cause;
-    }));
+      return loaded
+        ? Effect.succeed(loaded)
+        : Effect.fail(
+            new UnifiedExecUnavailableError({
+              message: `tty: true requires ${PTY_PACKAGE}, but the loaded module has no spawn export. Call with tty: false to use pipes instead.`,
+            }),
+          );
+    }),
+  );
 }
 
-export const loadPty = Effect.tryPromise({
-  try: () => loadPtyPromise(),
-  catch: (cause) =>
-    new UnifiedExecUnavailableError({
-      message: `tty: true requires @homebridge/node-pty-prebuilt-multiarch, but it failed to load: ${
-        cause instanceof Error ? cause.message : String(cause)
-      }. Call with tty: false to use pipes instead.`,
-      cause,
-    }),
+export const loadPty: Effect.Effect<PtyModule, UnifiedExecUnavailableError> = Effect.suspend(() => {
+  if (ptyModule) return Effect.succeed(ptyModule);
+  if (ptyLoadFailure) return Effect.fail(ptyLoadFailure);
+  return loadPtyModule().pipe(
+    Effect.tap((loaded) =>
+      Effect.sync(() => {
+        ptyModule = loaded;
+      }),
+    ),
+    Effect.tapError((failure) =>
+      Effect.sync(() => {
+        ptyLoadFailure = failure;
+      }),
+    ),
+  );
 });
 
 export function ptyLoadError(): string | undefined {
-  return ptyLoadFailure;
+  return ptyLoadFailure?.message;
 }
 
 export function isPtyAvailable(): boolean {

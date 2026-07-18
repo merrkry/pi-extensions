@@ -10,6 +10,7 @@ import {
   InvalidInputError,
   type StdinWriteError,
   type UnifiedExecError,
+  type UnifiedExecUnavailableError,
 } from "./errors.js";
 import {
   clampYield,
@@ -43,14 +44,23 @@ function toBoundaryError(error: UnifiedExecError): Error {
   return new Error(errorMessage(error), { cause: error });
 }
 
+export interface UnifiedExecInstallOptions {
+  readonly ptyProbe?: Effect.Effect<unknown, UnifiedExecUnavailableError>;
+}
+
 export default function installUnifiedExec(
   pi: ExtensionAPI,
+  options: UnifiedExecInstallOptions = {},
 ): Effect.Effect<void, never, UnifiedExec> {
   return Effect.gen(function* () {
     const manager = yield* UnifiedExec;
 
-    // Warm the optional native module once. Pipe mode remains available on failure.
-    yield* loadPty.pipe(Effect.catch(() => Effect.void));
+    const ptyWarning = yield* (options.ptyProbe ?? loadPty).pipe(
+      Effect.match({
+        onFailure: (failure) => `unified-exec: ${failure.message}`,
+        onSuccess: () => undefined,
+      }),
+    );
 
     pi.registerFlag("keep-builtin-bash", {
       description:
@@ -61,11 +71,12 @@ export default function installUnifiedExec(
 
     let pendingAgentInventory: string | undefined;
 
-    pi.on("session_start", async () => {
+    pi.on("session_start", async (_event, context) => {
       await runEffect(manager.resume);
       if (pi.getFlag("keep-builtin-bash") !== true) {
         pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "bash"));
       }
+      if (ptyWarning && context.hasUI) context.ui.notify(ptyWarning, "warning");
     });
 
     pi.on("before_agent_start", async () => {

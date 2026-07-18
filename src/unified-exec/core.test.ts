@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vitest";
 
 import { HeadTailBuffer } from "./buffer.js";
+import { ptyRuntimeFailure } from "./child.js";
 import { resolveWriteInput } from "./protocol.js";
 import { unescapeChars } from "./unescape.js";
 
@@ -27,6 +28,16 @@ describe("HeadTailBuffer", () => {
     expect(decode(buffer.toBytes())).toBe("hello");
     expect(decode(buffer.drainChunks()[0]!)).toBe("hello");
     expect(buffer.retainedBytes).toBe(0);
+  });
+});
+
+describe("PTY runtime support", () => {
+  it("reports Bun as an explicit typed PTY failure", () => {
+    expect(ptyRuntimeFailure({ bun: "1.2.3" })).toMatchObject({
+      _tag: "UnifiedExecUnavailableError",
+      message: expect.stringContaining("Bun 1.2.3"),
+    });
+    expect(ptyRuntimeFailure({})).toBeUndefined();
   });
 });
 
