@@ -59,6 +59,12 @@ function addEditorInset(line: string, width: number): string {
   return EDITOR_INSET_TEXT + fitToWidth(line, width - insetWidth) + EDITOR_INSET_TEXT;
 }
 
+function wrapEditorLine(line: string): string {
+  // CustomEditor already constrains every rendered line to the width it receives.
+  // Adding the reserved outer columns does not need another ANSI/grapheme scan.
+  return EDITOR_INSET_TEXT + line + EDITOR_INSET_TEXT;
+}
+
 function formatTokens(count: number): string {
   if (!Number.isFinite(count) || count < 0) return "?";
   if (count < 1000) return count.toString();
@@ -218,7 +224,7 @@ class InsetEditor extends CustomEditor {
     this.refreshBorderColor();
     if (width <= insetWidth) return super.render(width);
 
-    return super.render(width - insetWidth).map((line) => addEditorInset(line, width));
+    return super.render(width - insetWidth).map(wrapEditorLine);
   }
 }
 

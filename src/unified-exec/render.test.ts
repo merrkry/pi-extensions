@@ -1,6 +1,6 @@
 import { initTheme, type AgentToolResult, type Theme } from "@earendil-works/pi-coding-agent";
-import { visibleWidth, type Component } from "@earendil-works/pi-tui";
-import { beforeAll, describe, expect, it } from "vitest";
+import { Text, visibleWidth, type Component } from "@earendil-works/pi-tui";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
 import type { ExecCommandArgs, ResponseShape } from "./protocol.js";
@@ -41,6 +41,47 @@ const response = (output: string): ResponseShape => ({
 });
 
 describe("unified-exec rendering", () => {
+  it("reuses rendered lines until call data, result data, or width changes", () => {
+    const textRender = vi.spyOn(Text.prototype, "render");
+    const args = { cmd: "printf safe" };
+    const call = renderExecCommandCall(args, theme, callContext(args, false));
+
+    call.render(80);
+    call.render(80);
+    expect(textRender).toHaveBeenCalledTimes(1);
+
+    const output = Array.from({ length: 100 }, (_, index) => `row-${index}`).join("\n");
+    const result: AgentToolResult<ResponseShape> = {
+      content: [{ type: "text", text: output }],
+      details: response(output),
+    };
+    const component = renderResult(result, { expanded: false, isPartial: true }, theme, {
+      args: {},
+      cwd: "/workspace/project",
+      expanded: false,
+      lastComponent: undefined,
+    });
+    const first = component.render(80);
+    const second = component.render(80);
+
+    expect(second).toEqual(first);
+    expect(second).not.toBe(first);
+    expect(textRender).toHaveBeenCalledTimes(2);
+    expect(component.render(60)).not.toEqual(first);
+    expect(textRender).toHaveBeenCalledTimes(3);
+
+    const updated = renderResult(result, { expanded: true, isPartial: false }, theme, {
+      args: {},
+      cwd: "/workspace/project",
+      expanded: true,
+      lastComponent: component,
+    });
+    expect(updated).toBe(component);
+    expect(updated.render(80)).not.toEqual(first);
+    expect(textRender).toHaveBeenCalledTimes(4);
+    textRender.mockRestore();
+  });
+
   it("caps a streaming command while keeping cwd on a stable separate line", () => {
     const args = {
       cmd: ["first", "second", "third", "fourth", "fifth", "sixth"].join("\n"),

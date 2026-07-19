@@ -47,16 +47,20 @@ class ExecCallComponent implements Component {
   private theme!: Theme;
   private cwd = "";
   private expanded = false;
+  private cachedRender: { readonly width: number; readonly lines: readonly string[] } | undefined;
 
   update(args: unknown, theme: Theme, cwd: unknown, expanded: unknown): void {
     this.args = asRecord(args) ? (args as ExecCommandArgs) : { cmd: "" };
     this.theme = theme;
     this.cwd = typeof cwd === "string" ? cwd : "";
     this.expanded = expanded === true;
+    this.cachedRender = undefined;
   }
 
   render(width: number): string[] {
     if (width <= 0) return [];
+    if (this.cachedRender?.width === width) return [...this.cachedRender.lines];
+
     const rawCommand = typeof this.args.cmd === "string" ? this.args.cmd : "";
     const command = sanitizeTerminalOutput(rawCommand) || "...";
     const styled = this.theme.fg("toolTitle", this.theme.bold(`$ ${command}`));
@@ -72,11 +76,13 @@ class ExecCallComponent implements Component {
       width,
       "...",
     );
-    return [...visibleCommand, cwdLine];
+    const lines = [...visibleCommand, cwdLine];
+    this.cachedRender = { width, lines };
+    return [...lines];
   }
 
   invalidate(): void {
-    // Rendering is derived directly from the latest arguments, width, and theme.
+    this.cachedRender = undefined;
   }
 }
 
@@ -94,15 +100,19 @@ class ResultComponent implements Component {
   };
   private options: ToolRenderResultOptions = { expanded: false, isPartial: false };
   private theme!: Theme;
+  private cachedRender: { readonly width: number; readonly lines: readonly string[] } | undefined;
 
   update(result: unknown, options: ToolRenderResultOptions, theme: Theme): void {
     this.model = parseResultRenderModel(result);
     this.options = options;
     this.theme = theme;
+    this.cachedRender = undefined;
   }
 
   render(width: number): string[] {
     if (width <= 0) return [];
+    if (this.cachedRender?.width === width) return [...this.cachedRender.lines];
+
     const { output } = this.model;
     const lines: string[] = [];
 
@@ -127,11 +137,12 @@ class ResultComponent implements Component {
     if (status) {
       lines.push("", truncateToWidth(status, width, "..."));
     }
-    return lines;
+    this.cachedRender = { width, lines };
+    return [...lines];
   }
 
   invalidate(): void {
-    // Rendering is derived directly from the latest result, width, and theme.
+    this.cachedRender = undefined;
   }
 }
 
