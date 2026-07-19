@@ -36,12 +36,7 @@ import {
 import { renderExecCommandCall, renderResult, renderWriteStdinCall } from "./render.js";
 import { type ExecSession, type StreamUpdate } from "./session.js";
 import { UnifiedExec, type UnifiedExecApi } from "./service.js";
-import {
-  buildShellCommand,
-  IS_WINDOWS,
-  resolveDefaultShell,
-  resolveWindowsShell,
-} from "./shell.js";
+import { buildShellCommand } from "./shell.js";
 
 function runEffect<A, E>(effect: Effect.Effect<A, E>, signal?: AbortSignal): Promise<A> {
   return Effect.runPromise(effect, signal ? { signal } : {});
@@ -135,12 +130,6 @@ export default function installUnifiedExec(
         cmd: Type.String({ description: "Shell command to execute." }),
         workdir: Type.Optional(
           Type.String({ description: "Working directory. Defaults to the session cwd." }),
-        ),
-        shell: Type.Optional(
-          Type.String({
-            description:
-              "Shell binary. Defaults to bash (on Windows: bash if available, else powershell).",
-          }),
         ),
         tty: Type.Optional(
           Type.Boolean({ description: "Allocate a PTY. Default false.", default: false }),
@@ -286,21 +275,8 @@ function runExecCommand(
   return Effect.gen(function* () {
     const startedAt = Date.now();
     const tty = arguments_.tty ?? false;
-    let shell = arguments_.shell;
-    if (!shell) {
-      shell = resolveDefaultShell().shell;
-    } else if (IS_WINDOWS) {
-      const requestedShell = shell;
-      shell = yield* Effect.try({
-        try: () => resolveWindowsShell(requestedShell),
-        catch: (cause) =>
-          new InvalidInputError({
-            message: cause instanceof Error ? cause.message : String(cause),
-          }),
-      });
-    }
     const shellCommand = yield* Effect.try({
-      try: () => buildShellCommand(shell, arguments_.cmd),
+      try: () => buildShellCommand(arguments_.cmd, tty),
       catch: (cause) =>
         new InvalidInputError({ message: cause instanceof Error ? cause.message : String(cause) }),
     });
@@ -312,9 +288,9 @@ function runExecCommand(
       env: process.env,
       tty,
       displayCommand: arguments_.cmd,
-      ...(shellCommand.windowsVerbatimArguments === undefined
+      ...(shellCommand.initialStdin === undefined
         ? {}
-        : { windowsVerbatimArguments: shellCommand.windowsVerbatimArguments }),
+        : { initialStdin: shellCommand.initialStdin }),
     });
 
     const exitedEarly = yield* session.awaitExit(EARLY_EXIT_GRACE_PERIOD_MS);

@@ -13,10 +13,16 @@ import {
   resolveWriteInput,
   finalizeResponse,
 } from "./protocol.js";
+import { buildShellCommand } from "./shell.js";
 import { unescapeChars } from "./unescape.js";
 
 const encode = (text: string) => new TextEncoder().encode(text);
 const decode = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
+const resolveStdinShell = () => ({
+  shell: "C:\\Windows\\System32\\bash.exe",
+  args: ["-s"],
+  commandTransport: "stdin" as const,
+});
 
 describe("HeadTailBuffer", () => {
   it("retains a stable head and the newest tail", () => {
@@ -47,6 +53,23 @@ describe("PTY runtime support", () => {
       message: expect.stringContaining("Bun 1.2.3"),
     });
     expect(ptyRuntimeFailure({})).toBeUndefined();
+  });
+});
+
+describe("shell command construction", () => {
+  it("uses Pi's resolved shell argv", () => {
+    expect(
+      buildShellCommand("printf ok", false, () => ({ shell: "/bin/bash", args: ["-c"] })),
+    ).toEqual({ command: ["/bin/bash", "-c", "printf ok"] });
+  });
+
+  it("supports Pi's stdin command transport for pipe sessions only", () => {
+    const command = buildShellCommand("printf ok", false, resolveStdinShell);
+    expect(command.command).toEqual(["C:\\Windows\\System32\\bash.exe", "-s"]);
+    expect(decode(command.initialStdin!)).toBe("printf ok");
+    expect(() => buildShellCommand("printf ok", true, resolveStdinShell)).toThrow(
+      "cannot use a PTY",
+    );
   });
 });
 

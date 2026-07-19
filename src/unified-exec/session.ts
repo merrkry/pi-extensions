@@ -24,7 +24,7 @@ export interface SessionSpawnOptions {
   readonly env: NodeJS.ProcessEnv;
   readonly tty: boolean;
   readonly displayCommand: string;
-  readonly windowsVerbatimArguments?: boolean;
+  readonly initialStdin?: Uint8Array;
   readonly headTailMaxBytes?: number;
   readonly streamTailBytes?: number;
 }
@@ -114,7 +114,7 @@ export class ExecSession {
             logStream.end();
             throw cause;
           }
-          return new ExecSession(
+          const session = new ExecSession(
             id,
             child,
             options.displayCommand,
@@ -126,6 +126,11 @@ export class ExecSession {
             logStream,
             outputSignal,
           );
+          if (options.initialStdin && !child.end(options.initialStdin)) {
+            child.kill();
+            throw new Error("failed to send the command to the shell over stdin");
+          }
+          return session;
         },
         catch: (cause) =>
           new SpawnError({

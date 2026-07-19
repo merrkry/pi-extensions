@@ -3,7 +3,7 @@ import { constants as osConstants } from "node:os";
 import * as Effect from "effect/Effect";
 
 import { UnifiedExecUnavailableError } from "./errors.js";
-import { IS_WINDOWS, resolveBinary } from "./shell.js";
+import { IS_WINDOWS } from "./shell.js";
 
 export interface SpawnOptions {
   readonly command: string[];
@@ -12,7 +12,6 @@ export interface SpawnOptions {
   readonly tty: boolean;
   readonly cols?: number;
   readonly rows?: number;
-  readonly windowsVerbatimArguments?: boolean;
 }
 
 export type ExitCallback = (
@@ -25,6 +24,7 @@ export interface SpawnedChild {
   readonly pid: number | undefined;
   readonly tty: boolean;
   write(data: Uint8Array): boolean;
+  end(data: Uint8Array): boolean;
   onData(handler: (chunk: Uint8Array) => void): () => void;
   onExit(handler: ExitCallback): void;
   interrupt(): boolean;
@@ -202,11 +202,9 @@ export function childProcessEnvironment(
 }
 
 function spawnPty(module: PtyModule, options: SpawnOptions): SpawnedChild {
-  let [file, ...args] = options.command;
+  const [file, ...args] = options.command;
   if (!file) throw new Error("cannot spawn an empty command");
-  if (IS_WINDOWS) file = resolveBinary(file);
-  const ptyArgs = IS_WINDOWS && options.windowsVerbatimArguments ? args.join(" ") : args;
-  const child = module.spawn(file, ptyArgs, {
+  const child = module.spawn(file, args, {
     cwd: options.cwd,
     env: options.env,
     cols: options.cols ?? 120,
@@ -243,6 +241,9 @@ function spawnPty(module: PtyModule, options: SpawnOptions): SpawnedChild {
       } catch {
         return false;
       }
+    },
+    end() {
+      return false;
     },
     onData(handler) {
       dataHandlers.add(handler);
@@ -297,7 +298,6 @@ function spawnPipes(options: SpawnOptions): SpawnedChild {
     detached: !IS_WINDOWS,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
-    windowsVerbatimArguments: options.windowsVerbatimArguments,
   });
   const dataHandlers = new Set<(chunk: Uint8Array) => void>();
   const exitHandlers = new Set<ExitCallback>();
@@ -336,6 +336,16 @@ function spawnPipes(options: SpawnOptions): SpawnedChild {
       if (exited || !stdin || stdin.destroyed || stdin.writableEnded) return false;
       try {
         stdin.write(Buffer.from(data));
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    end(data) {
+      const stdin = child.stdin;
+      if (exited || !stdin || stdin.destroyed || stdin.writableEnded) return false;
+      try {
+        stdin.end(Buffer.from(data));
         return true;
       } catch {
         return false;

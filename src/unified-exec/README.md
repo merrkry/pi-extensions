@@ -12,8 +12,6 @@ Provides persistent, owned shell sessions through four model-facing tools:
 - `kill_session` terminates a process tree.
 - `list_sessions` reports live sessions and recent exited-session tombstones.
 
-This is an Effect-based product redesign derived from `pi-unified-exec`, not a line-for-line port.
-
 ## Product shape
 
 Background processes remain available across Agent turns and `/tree` navigation. Better TUI Chrome shows the active count near the editor, while `/processes` provides a live, height-aware management view with process details, interrupt, and kill actions.

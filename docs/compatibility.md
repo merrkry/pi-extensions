@@ -14,6 +14,8 @@ Development uses Pi-compatible TypeBox because runtime schemas are created and v
 
 The bundle registers `exec_command`, `write_stdin`, `kill_session`, and `list_sessions`. A command that outlives `exec_command`'s bounded wait becomes a background session. After such a session exits, `list_sessions` reports its bounded FIFO tombstone until runtime shutdown or tombstone eviction; listing no longer consumes exited entries.
 
+`exec_command` uses Pi's public default-shell resolver and does not accept a per-call shell override. On Windows it requires a Bash installation discoverable by Pi and does not fall back to PowerShell.
+
 ## RTK CLI
 
 [`rtk`](https://github.com/rtk-ai/rtk) exposes `rtk rewrite` for converting supported commands to lower-output equivalents. The bundle requires `rtk >= 0.23.0` in `PATH` and disables only the RTK feature when the executable is missing, too old, or its version check fails.

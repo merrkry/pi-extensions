@@ -36,6 +36,28 @@ describe("UnifiedExec service", () => {
     expect(result.state).toMatchObject({ hasExited: true, exitCode: 0 });
   });
 
+  it("sends an initial command over stdin and closes the pipe", async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const manager = yield* UnifiedExec;
+        const command = "printf stdin-ok";
+        const { session } = yield* manager.launch({
+          ...spawnOptions(command),
+          command: ["bash", "-s"],
+          initialStdin: new TextEncoder().encode(command),
+        });
+        expect(yield* session.awaitExit(2_000)).toBe(true);
+        const output = yield* session.operationSemaphore.withPermit(
+          session.collectUntil(Date.now() + 200),
+        );
+        return { output: decode(output), state: session.snapshotState() };
+      }),
+    );
+
+    expect(result.output).toBe("stdin-ok");
+    expect(result.state).toMatchObject({ hasExited: true, exitCode: 0 });
+  });
+
   it("streams only when pipe output changes", async () => {
     const updates = await run(
       Effect.gen(function* () {

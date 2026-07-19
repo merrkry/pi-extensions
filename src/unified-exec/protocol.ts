@@ -25,7 +25,6 @@ export const MAX_EMPTY_POLL_ENV_VAR = "PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS";
 export interface ExecCommandArgs {
   readonly cmd: string;
   readonly workdir?: string;
-  readonly shell?: string;
   readonly tty?: boolean;
   readonly yield_time_ms?: number;
 }
