@@ -21,7 +21,6 @@ import { IS_WINDOWS } from "./shell.js";
 export const MAX_SESSIONS = 64;
 export const MAX_TOMBSTONES = 64;
 const MAX_CONCURRENT_SPAWNS = 8;
-const decoder = new TextDecoder("utf-8", { fatal: false });
 
 export interface LaunchOutcome {
   readonly session: ExecSession;
@@ -57,14 +56,9 @@ export interface SessionSnapshot {
   readonly logPath: string;
 }
 
-export interface AgentSessionSnapshot extends SessionSnapshot {
-  readonly outputTail: string | undefined;
-}
-
 interface SessionTombstone {
   readonly session: ExecSession;
   readonly snapshot: SessionSnapshot;
-  readonly outputTail: string | undefined;
 }
 
 export type InventoryListener = (sessions: readonly SessionSnapshot[]) => void;
@@ -79,7 +73,6 @@ export interface UnifiedExecApi {
   get(sessionId: number): Effect.Effect<ExecSession, SessionNotFoundError>;
   list(): Effect.Effect<readonly ExecSession[]>;
   inventory: Effect.Effect<readonly SessionSnapshot[]>;
-  agentInventory: Effect.Effect<readonly AgentSessionSnapshot[]>;
   subscribe(listener: InventoryListener): Effect.Effect<() => void>;
   remove(sessionId: number): Effect.Effect<ExecSession | undefined>;
   interrupt(sessionId: number): Effect.Effect<InterruptOutcome, SessionNotFoundError>;
@@ -142,7 +135,6 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
         tombstones.push({
           session,
           snapshot: sessionSnapshot(session),
-          outputTail: session.tty ? undefined : decoder.decode(session.snapshotStreamTail()),
         });
       }
       while (tombstones.length > MAX_TOMBSTONES) tombstones.shift();
@@ -154,23 +146,6 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
         [
           ...[...sessions.values()].map(sessionSnapshot),
           ...tombstones.map((tombstone) => tombstone.snapshot),
-        ].toSorted((a, b) => a.sessionId - b.sessionId),
-      );
-    };
-
-    const agentInventoryUnsafe = (): readonly AgentSessionSnapshot[] => {
-      reconcileExitedUnsafe();
-      return Object.freeze(
-        [
-          ...[...sessions.values()].map((session) =>
-            Object.freeze({
-              ...sessionSnapshot(session),
-              outputTail: session.tty ? undefined : decoder.decode(session.snapshotStreamTail()),
-            }),
-          ),
-          ...tombstones.map((tombstone) =>
-            Object.freeze({ ...tombstone.snapshot, outputTail: tombstone.outputTail }),
-          ),
         ].toSorted((a, b) => a.sessionId - b.sessionId),
       );
     };
@@ -273,7 +248,6 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
           }),
         ),
       inventory: stateSemaphore.withPermit(Effect.sync(inventoryUnsafe)),
-      agentInventory: stateSemaphore.withPermit(Effect.sync(agentInventoryUnsafe)),
       subscribe: (listener) =>
         Effect.sync(() => {
           inventoryListeners.add(listener);

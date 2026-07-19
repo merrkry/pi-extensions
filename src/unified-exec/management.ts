@@ -1,7 +1,5 @@
 import {
   DynamicBorder,
-  truncateHead,
-  truncateTail,
   type ExtensionCommandContext,
   type KeybindingsManager,
   type Theme,
@@ -18,37 +16,11 @@ import * as Effect from "effect/Effect";
 import { formatHomePath } from "../shared/display-path.js";
 import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
 import { errorMessage, type UnifiedExecError } from "./errors.js";
-import type { AgentSessionSnapshot, SessionSnapshot, UnifiedExecApi } from "./service.js";
-
-const AGENT_COMMAND_MAX_BYTES = 128;
-const AGENT_OUTPUT_MAX_BYTES_PER_SESSION = 256;
-const AGENT_OUTPUT_MAX_LINES_PER_SESSION = 4;
+import type { SessionSnapshot, UnifiedExecApi } from "./service.js";
 type ManagementAction =
   | { readonly type: "details"; readonly sessionId: number }
   | { readonly type: "interrupt"; readonly sessionId: number }
   | { readonly type: "kill"; readonly sessionId: number };
-
-export function renderAgentInventory(
-  sessions: readonly AgentSessionSnapshot[],
-  now = Date.now(),
-): string | undefined {
-  if (sessions.length === 0) return undefined;
-  const active = sessions.filter((session) => session.phase !== "exited").length;
-  const lines = [`<background_processes total="${sessions.length}" active="${active}">`];
-  for (const session of sessions) {
-    lines.push(
-      `#${session.sessionId} ${describeAgentState(session)} ${session.tty ? "tty" : "pipe"} running_for=${formatElapsed(
-        sessionDuration(session, now),
-      )} cwd=${JSON.stringify(session.cwd)} cmd=${JSON.stringify(commandSummary(session.command))}`,
-    );
-  }
-  lines.push(...renderOutputTails(sessions));
-  if (sessions.some((session) => session.tty && session.outputBytesTotal > 0)) {
-    lines.push("tty output tails omitted: raw PTY streams have no stable logical tail");
-  }
-  lines.push("</background_processes>");
-  return lines.join("\n");
-}
 
 export async function manageProcesses(
   manager: UnifiedExecApi,
@@ -408,25 +380,6 @@ function renderDetails(session: SessionSnapshot): string {
   );
 }
 
-function renderOutputTails(sessions: readonly AgentSessionSnapshot[]): string[] {
-  const lines: string[] = [];
-  for (const session of sessions) {
-    if (session.tty) continue;
-    const output = sanitizeOutput(session.outputTail ?? "");
-    if (!output.trim()) continue;
-    const truncated = truncateTail(output, {
-      maxBytes: AGENT_OUTPUT_MAX_BYTES_PER_SESSION,
-      maxLines: AGENT_OUTPUT_MAX_LINES_PER_SESSION,
-    }).content.trim();
-    if (!truncated) continue;
-    lines.push(
-      `output_tail #${session.sessionId}:`,
-      ...truncated.split("\n").map((line) => `  ${line}`),
-    );
-  }
-  return lines;
-}
-
 function describeAgentState(session: SessionSnapshot): string {
   if (session.phase === "stopping") return `stopping(${session.requestedSignal ?? "signal"})`;
   if (session.phase === "exited") {
@@ -447,19 +400,6 @@ function formatElapsed(milliseconds: number): string {
   if (minutes < 60) return `${minutes}m${String(seconds % 60).padStart(2, "0")}s`;
   const hours = Math.floor(minutes / 60);
   return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
-}
-
-function commandSummary(command: string): string {
-  const normalized = singleLine(command, Number.MAX_SAFE_INTEGER);
-  const truncated = truncateHead(normalized, {
-    maxBytes: AGENT_COMMAND_MAX_BYTES,
-    maxLines: 1,
-  });
-  return truncated.truncated ? `${truncated.content}…` : truncated.content;
-}
-
-function sanitizeOutput(value: string): string {
-  return sanitizeTerminalOutput(value);
 }
 
 function singleLine(value: string, maximum: number): string {

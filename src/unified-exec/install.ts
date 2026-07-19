@@ -9,7 +9,7 @@ import { Type } from "typebox";
 
 import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
 import { loadPty } from "./child.js";
-import { manageProcesses, renderAgentInventory } from "./management.js";
+import { manageProcesses } from "./management.js";
 import {
   errorMessage,
   InvalidInputError,
@@ -71,8 +71,6 @@ export default function installUnifiedExec(
       default: false,
     });
 
-    let pendingAgentInventory: string | undefined;
-
     pi.on("session_start", async (_event, context) => {
       await runEffect(manager.resume);
       if (pi.getFlag("keep-builtin-bash") !== true) {
@@ -83,30 +81,7 @@ export default function installUnifiedExec(
       }
     });
 
-    pi.on("before_agent_start", async () => {
-      pendingAgentInventory = renderAgentInventory(await runEffect(manager.agentInventory));
-    });
-
-    pi.on("context", (event) => {
-      const inventory = pendingAgentInventory;
-      pendingAgentInventory = undefined;
-      if (!inventory) return;
-      return {
-        messages: [
-          ...event.messages,
-          {
-            role: "custom" as const,
-            customType: "unified-exec-inventory",
-            content: inventory,
-            display: false,
-            timestamp: Date.now(),
-          },
-        ],
-      };
-    });
-
     pi.on("session_shutdown", async () => {
-      pendingAgentInventory = undefined;
       await runEffect(manager.shutdown);
     });
 

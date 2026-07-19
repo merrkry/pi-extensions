@@ -253,7 +253,7 @@ describe("unified-exec Pi adapter", () => {
     }
   });
 
-  it("keeps the transient Agent inventory synchronized", async () => {
+  it("does not inject background process inventory into Agent turns", async () => {
     const harness = await makeHarness();
     await harness.emit("session_start");
     const started = await harness.call("exec_command", {
@@ -263,18 +263,8 @@ describe("unified-exec Pi adapter", () => {
     const sessionId = (started.details as ResponseShape).session_id!;
 
     try {
-      await harness.emit("before_agent_start", { type: "before_agent_start" });
-      const [contextResult] = await harness.emit("context", { type: "context", messages: [] });
-      const messages = (contextResult as { messages: Array<{ content: string }> }).messages;
-      expect(messages.at(-1)?.content).toContain(`<background_processes total="1" active="1">`);
-      expect(messages.at(-1)?.content).toContain(`#${sessionId} running`);
-      expect(messages.at(-1)?.content).toContain(`cmd="cat"`);
-
-      const [laterContextResult] = await harness.emit("context", {
-        type: "context",
-        messages: [],
-      });
-      expect(laterContextResult).toBeUndefined();
+      expect(await harness.emit("before_agent_start", { type: "before_agent_start" })).toEqual([]);
+      expect(await harness.emit("context", { type: "context", messages: [] })).toEqual([]);
     } finally {
       await harness.call("kill_session", { session_id: sessionId });
     }
