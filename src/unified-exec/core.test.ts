@@ -128,6 +128,10 @@ describe("terminal output sanitization", () => {
     ).toBe("safe redlink\nnext\tvalue[");
   });
 
+  it("fails closed when an untyped runtime caller violates the string contract", () => {
+    expect(sanitizeTerminalOutput(undefined as unknown as string)).toBe("");
+  });
+
   it("does not retain raw output in truncation metadata", () => {
     const response = finalizeResponse({
       startedAt: Date.now(),

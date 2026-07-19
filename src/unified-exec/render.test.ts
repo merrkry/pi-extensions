@@ -63,6 +63,21 @@ describe("unified-exec rendering", () => {
     expect(updatedLines.at(-1)).toBe("cwd  /workspace/project");
   });
 
+  it("tolerates incomplete runtime call context", () => {
+    const args = { cmd: "printf safe" };
+    const context = {
+      args,
+      cwd: undefined,
+      expanded: undefined,
+      lastComponent: undefined,
+    } as unknown as Parameters<typeof renderExecCommandCall>[2];
+
+    const component = renderExecCommandCall(args, theme, context);
+
+    expect(() => component.render(80)).not.toThrow();
+    expect(component.render(80).some((line) => line.startsWith("cwd  "))).toBe(true);
+  });
+
   it("uses the global tool expansion state for full command and output", () => {
     const args = {
       cmd: ["first", "second", "third", "fourth", "fifth", "sixth"].join("\n"),

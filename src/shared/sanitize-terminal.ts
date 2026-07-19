@@ -15,7 +15,12 @@ export type TerminalSafeText = string & {
  * and logical line breaks remain useful as output formatting.
  */
 export function sanitizeTerminalOutput(value: string): TerminalSafeText {
-  const withoutSequences = stripVTControlCharacters(value)
+  // External extension and renderer boundaries can violate their declared
+  // TypeScript contracts at runtime. Keep the string-only public signature so
+  // internal misuse is rejected, but fail closed if an untyped caller passes
+  // a different value.
+  const input = typeof value === "string" ? value : "";
+  const withoutSequences = stripVTControlCharacters(input)
     .replaceAll("\r\n", "\n")
     .replaceAll("\r", "\n");
 

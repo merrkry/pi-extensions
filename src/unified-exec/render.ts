@@ -46,11 +46,11 @@ class ExecCallComponent implements Component {
   private cwd = "";
   private expanded = false;
 
-  update(args: ExecCommandArgs, theme: Theme, cwd: string, expanded: boolean): void {
-    this.args = args;
+  update(args: unknown, theme: Theme, cwd: unknown, expanded: unknown): void {
+    this.args = asRecord(args) ? (args as ExecCommandArgs) : { cmd: "" };
     this.theme = theme;
-    this.cwd = cwd;
-    this.expanded = expanded;
+    this.cwd = typeof cwd === "string" ? cwd : "";
+    this.expanded = expanded === true;
   }
 
   render(width: number): string[] {
