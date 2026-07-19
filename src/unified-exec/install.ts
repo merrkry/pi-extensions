@@ -213,8 +213,8 @@ export default function installUnifiedExec(
     pi.registerTool({
       name: "list_sessions",
       label: "list_sessions",
-      description: "List live sessions and retained exited-session tombstones.",
-      promptSnippet: "List live sessions and exited tombstones",
+      description: "List live sessions.",
+      promptSnippet: "List live sessions",
       executionMode: "parallel",
       parameters: Type.Object({}),
       async execute(_toolCallId, _parameters, signal) {
@@ -228,7 +228,7 @@ export default function installUnifiedExec(
                   session.tty ? "tty" : "pipe"
                 } cwd=${session.cwd}\n  ${session.command}\n  log: ${session.log_path}`,
             )
-          : ["(no sessions)"];
+          : ["(no live sessions)"];
         return {
           content: [{ type: "text", text: sanitizeTerminalOutput(lines.join("\n")) }],
           details: {

@@ -241,10 +241,7 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
         stateSemaphore.withPermit(
           Effect.sync(() => {
             reconcileExitedUnsafe();
-            return [
-              ...sessions.values(),
-              ...tombstones.map((tombstone) => tombstone.session),
-            ].toSorted((a, b) => a.id - b.id);
+            return [...sessions.values()].toSorted((a, b) => a.id - b.id);
           }),
         ),
       inventory: stateSemaphore.withPermit(Effect.sync(inventoryUnsafe)),

@@ -12,7 +12,7 @@ Development uses Pi-compatible TypeBox because runtime schemas are created and v
 
 ## Unified Exec tools
 
-The bundle registers `exec_command`, `write_stdin`, `kill_session`, and `list_sessions`. A command that outlives `exec_command`'s bounded wait becomes a background session. After such a session exits, `list_sessions` reports its bounded FIFO tombstone until runtime shutdown or tombstone eviction; listing no longer consumes exited entries.
+The bundle registers `exec_command`, `write_stdin`, `kill_session`, and `list_sessions`. A command that outlives `exec_command`'s bounded wait becomes a background session. `list_sessions` reports only live sessions. After a background session exits, its bounded FIFO tombstone remains addressable by known session id until runtime shutdown or tombstone eviction, so `write_stdin` can still collect the final result.
 
 `exec_command` uses Pi's public default-shell resolver and does not accept a per-call shell override. On Windows it requires a Bash installation discoverable by Pi and does not fall back to PowerShell.
 

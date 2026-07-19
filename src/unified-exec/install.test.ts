@@ -294,7 +294,13 @@ describe("unified-exec Pi adapter", () => {
       sessions: Array<{ session_id: number }>;
     };
     expect(details.active_count).toBe(1);
-    await harness.call("kill_session", { session_id: details.sessions[0]!.session_id });
+    const sessionId = details.sessions[0]!.session_id;
+    await harness.call("kill_session", { session_id: sessionId });
+
+    const afterExit = await harness.call("list_sessions", {});
+    expect(afterExit.details).toMatchObject({ active_count: 0, sessions: [] });
+    const final = await harness.call("write_stdin", { session_id: sessionId });
+    expect(final.details).toMatchObject({ phase: "exited", signal: "SIGTERM" });
   });
 
   it("terminates a command when shutdown races its initial wait", async () => {

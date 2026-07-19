@@ -10,13 +10,13 @@ Provides persistent, owned shell sessions through four model-facing tools:
 - `exec_command` runs a pipe or PTY command and yields a session id when it remains active.
 - `write_stdin` writes input or polls an existing session.
 - `kill_session` terminates a process tree.
-- `list_sessions` reports live sessions and recent exited-session tombstones.
+- `list_sessions` reports live sessions.
 
 ## Product shape
 
-Background processes remain available across Agent turns and `/tree` navigation. Better TUI Chrome shows the active count near the editor, while `/processes` provides a live, height-aware management view with process details, interrupt, and kill actions.
+Background processes remain available across Agent turns and `/tree` navigation. Better TUI Chrome shows the active count near the editor, while `/processes` provides a live, height-aware management view with process details, interrupt, and kill actions. Each `/processes` invocation hides sessions that had already exited when it opened; processes that exit while the view is open remain visible.
 
-Processes that finish before becoming background sessions are removed immediately. Once a session id has been returned, exit produces a retained tombstone regardless of whether the process exits naturally or is ended by the user or Agent. Tombstones use a bounded FIFO.
+Processes that finish before becoming background sessions are removed immediately. Once a session id has been returned, exit produces a retained tombstone regardless of whether the process exits naturally or is ended by the user or Agent. Tombstones use a bounded FIFO. They are omitted from `list_sessions` but remain addressable by known session id, allowing `write_stdin` to collect the final result.
 
 ## Lifetime
 

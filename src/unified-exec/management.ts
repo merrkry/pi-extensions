@@ -22,37 +22,60 @@ type ManagementAction =
   | { readonly type: "interrupt"; readonly sessionId: number }
   | { readonly type: "kill"; readonly sessionId: number };
 
+type ProcessInventoryFilter = (sessions: readonly SessionSnapshot[]) => readonly SessionSnapshot[];
+
+export function hideSessionsExitedAtOpen(
+  initial: readonly SessionSnapshot[],
+): ProcessInventoryFilter {
+  const hiddenSessionIds = new Set(
+    initial.filter((session) => session.phase === "exited").map((session) => session.sessionId),
+  );
+  return (sessions) => sessions.filter((session) => !hiddenSessionIds.has(session.sessionId));
+}
+
 export async function manageProcesses(
   manager: UnifiedExecApi,
   context: ExtensionCommandContext,
 ): Promise<void> {
   if (!context.hasUI) return;
+  const initial = await Effect.runPromise(manager.inventory);
+  const filterInventory = hideSessionsExitedAtOpen(initial);
   if (context.mode !== "tui") {
-    await manageProcessesWithDialogs(manager, context);
+    await manageProcessesWithDialogs(manager, context, filterInventory(initial));
     return;
   }
 
-  await manageProcessesInTui(manager, context);
+  await manageProcessesInTui(manager, context, filterInventory, undefined, initial);
 }
 
 async function manageProcessesInTui(
   manager: UnifiedExecApi,
   context: ExtensionCommandContext,
+  filterInventory: ProcessInventoryFilter,
   selectedSessionId?: number,
+  inventory?: readonly SessionSnapshot[],
 ): Promise<void> {
-  const initial = await Effect.runPromise(manager.inventory);
-  const action = await showProcessManager(manager, context, initial, selectedSessionId);
+  const initial = filterInventory(inventory ?? (await Effect.runPromise(manager.inventory)));
+  const action = await showProcessManager(
+    manager,
+    context,
+    initial,
+    selectedSessionId,
+    filterInventory,
+  );
   if (!action) return;
   const session = (await Effect.runPromise(manager.inventory)).find(
     (candidate) => candidate.sessionId === action.sessionId,
   );
-  if (!session) return manageProcessesInTui(manager, context, action.sessionId);
+  if (!session) {
+    return manageProcessesInTui(manager, context, filterInventory, action.sessionId);
+  }
   if (action.type === "details") {
     context.ui.notify(renderDetails(session), "info");
-    return manageProcessesInTui(manager, context, action.sessionId);
+    return manageProcessesInTui(manager, context, filterInventory, action.sessionId);
   }
   if (session.phase === "exited") {
-    return manageProcessesInTui(manager, context, action.sessionId);
+    return manageProcessesInTui(manager, context, filterInventory, action.sessionId);
   }
   try {
     if (action.type === "interrupt") {
@@ -71,7 +94,7 @@ async function manageProcessesInTui(
   } catch (cause) {
     if (!isSessionNotFound(cause)) context.ui.notify(managementError(cause), "error");
   }
-  return manageProcessesInTui(manager, context, action.sessionId);
+  return manageProcessesInTui(manager, context, filterInventory, action.sessionId);
 }
 
 class ProcessManagerComponent implements Component {
@@ -215,13 +238,14 @@ async function showProcessManager(
   context: ExtensionCommandContext,
   initial: readonly SessionSnapshot[],
   selectedSessionId: number | undefined,
+  filterInventory: ProcessInventoryFilter,
 ): Promise<ManagementAction | undefined> {
   return context.ui.custom<ManagementAction | undefined>((tui, theme, keybindings, done) => {
     let component: ProcessManagerComponent;
     const refresh = () => {
       void Effect.runPromise(manager.inventory).then(
         (sessions) => {
-          component.update(sessions);
+          component.update(filterInventory(sessions));
           tui.requestRender();
         },
         (cause) => context.ui.notify(managementError(cause), "error"),
@@ -238,7 +262,7 @@ async function showProcessManager(
     );
     const unsubscribe = Effect.runSync(
       manager.subscribe((sessions) => {
-        component.update(sessions);
+        component.update(filterInventory(sessions));
         tui.requestRender();
       }),
     );
@@ -264,8 +288,8 @@ async function showProcessManager(
 async function manageProcessesWithDialogs(
   manager: UnifiedExecApi,
   context: ExtensionCommandContext,
+  sessions: readonly SessionSnapshot[],
 ): Promise<void> {
-  const sessions = await Effect.runPromise(manager.inventory);
   if (sessions.length === 0) {
     context.ui.notify("No owned processes.", "info");
     return;

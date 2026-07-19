@@ -196,6 +196,24 @@ describe("UnifiedExec service", () => {
     expect(inventory).toMatchObject([{ phase: "exited", requestedSignal: "SIGTERM" }]);
   });
 
+  it("lists only live sessions while known tombstones remain readable", async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const manager = yield* UnifiedExec;
+        const { session } = yield* manager.launch(spawnOptions("printf completed"));
+        expect(yield* session.awaitExit(2_000)).toBe(true);
+        const listed = yield* manager.list();
+        const retained = yield* manager.get(session.id);
+        const output = yield* retained.operationSemaphore.withPermit(
+          retained.collectUntil(Date.now() + 200),
+        );
+        return { listed, output: decode(output), exitCode: retained.exitCode };
+      }),
+    );
+
+    expect(result).toEqual({ listed: [], output: "completed", exitCode: 0 });
+  });
+
   it("retains exited background sessions in a bounded FIFO", async () => {
     const inventory = await run(
       Effect.gen(function* () {
