@@ -1,9 +1,11 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import { describe, expect, it } from "vitest";
 
+import { RUNTIME_LOG_MAX_BYTES_ENV_VAR } from "./log.js";
 import { decode } from "./protocol.js";
 import { MAX_TOMBSTONES, UnifiedExec, UnifiedExecLive } from "./service.js";
 
@@ -28,7 +30,7 @@ describe("UnifiedExec service", () => {
         const output = yield* session.operationSemaphore.withPermit(
           session.collectUntil(Date.now() + 200),
         );
-        return { output: decode(output), state: session.snapshotState() };
+        return { output: decode(output.bytes), state: session.snapshotState() };
       }),
     );
 
@@ -50,7 +52,7 @@ describe("UnifiedExec service", () => {
         const output = yield* session.operationSemaphore.withPermit(
           session.collectUntil(Date.now() + 200),
         );
-        return { output: decode(output), state: session.snapshotState() };
+        return { output: decode(output.bytes), state: session.snapshotState() };
       }),
     );
 
@@ -87,7 +89,7 @@ describe("UnifiedExec service", () => {
         const output = yield* session.operationSemaphore.withPermit(
           session.collectUntil(Date.now() + 200),
         );
-        return decode(output);
+        return decode(output.bytes);
       }),
     );
 
@@ -109,12 +111,32 @@ describe("UnifiedExec service", () => {
           ],
           { concurrency: "unbounded" },
         );
-        return chunks.map(decode).join("");
+        return chunks.map((chunk) => decode(chunk.bytes)).join("");
       }),
     );
 
     expect(output).toContain("first:one");
     expect(output).toContain("second:two");
+  });
+
+  it("finishes reporting input accepted just before the permit deadline", async () => {
+    const output = await run(
+      Effect.gen(function* () {
+        const manager = yield* UnifiedExec;
+        const { session } = yield* manager.launch(spawnOptions("cat"));
+        yield* session.operationSemaphore.take(1);
+        const poll = yield* Effect.forkChild(
+          session.poll(Date.now() + 200, new TextEncoder().encode("near-deadline\n")),
+        );
+        yield* Effect.sleep(150);
+        yield* session.operationSemaphore.release(1);
+        const collected = yield* Fiber.join(poll);
+        yield* manager.terminate(session.id, "SIGTERM");
+        return decode(collected.bytes);
+      }),
+    );
+
+    expect(output).toBe("near-deadline\n");
   });
 
   it("reports unknown sessions through the typed error channel", async () => {
@@ -183,6 +205,30 @@ describe("UnifiedExec service", () => {
     },
   );
 
+  it("refreshes tombstone log state after delayed stream finalization", async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const manager = yield* UnifiedExec;
+        const { session } = yield* manager.launch(spawnOptions("true"));
+        expect(yield* session.awaitExit(2_000)).toBe(true);
+        const before = (yield* manager.inventory)[0]!;
+
+        const internals = session as unknown as {
+          readonly log: { readonly stream: { emit(event: string, cause: Error): boolean } };
+        };
+        internals.log.stream.emit("error", new Error("delayed log failure"));
+        const after = (yield* manager.inventory)[0]!;
+        return { before, after };
+      }),
+    );
+
+    expect(result.before.logStatus).toBe("complete");
+    expect(result.after).toMatchObject({
+      logStatus: "write_error",
+      logErrorMessage: "delayed log failure",
+    });
+  });
+
   it("keeps a tombstone after an Agent termination", async () => {
     const inventory = await run(
       Effect.gen(function* () {
@@ -207,7 +253,7 @@ describe("UnifiedExec service", () => {
         const output = yield* retained.operationSemaphore.withPermit(
           retained.collectUntil(Date.now() + 200),
         );
-        return { listed, output: decode(output), exitCode: retained.exitCode };
+        return { listed, output: decode(output.bytes), exitCode: retained.exitCode };
       }),
     );
 
@@ -232,6 +278,65 @@ describe("UnifiedExec service", () => {
       sessionId: MAX_TOMBSTONES + 1,
       phase: "exited",
     });
+  });
+
+  it("caps each session log without affecting captured process output", async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const manager = yield* UnifiedExec;
+        const { session } = yield* manager.launch({
+          ...spawnOptions("printf 0123456789abcdefghijklmnopqrstuvwxyz"),
+          logMaxBytes: 10,
+        });
+        expect(yield* session.awaitExit(2_000)).toBe(true);
+        expect(yield* session.awaitOutputClosed(2_000)).toBe(true);
+        const output = yield* session.operationSemaphore.withPermit(
+          session.collectUntil(Date.now() + 200),
+        );
+        return {
+          output: decode(output.bytes),
+          log: readFileSync(session.logPath, "utf8"),
+          status: session.logSnapshot,
+        };
+      }),
+    );
+
+    expect(result.output).toBe("0123456789abcdefghijklmnopqrstuvwxyz");
+    expect(result.log).toBe("0123456789");
+    expect(result.status).toMatchObject({
+      status: "capped",
+      bytesWritten: 10,
+      bytesDropped: 26,
+    });
+  });
+
+  it("enforces one payload budget across all runtime logs", async () => {
+    const previous = process.env[RUNTIME_LOG_MAX_BYTES_ENV_VAR];
+    process.env[RUNTIME_LOG_MAX_BYTES_ENV_VAR] = "10";
+    try {
+      const result = await run(
+        Effect.gen(function* () {
+          const manager = yield* UnifiedExec;
+          const sessions = [];
+          for (const command of ["printf 12345678", "printf abcdefgh"]) {
+            const { session } = yield* manager.launch(spawnOptions(command));
+            expect(yield* session.awaitExit(2_000)).toBe(true);
+            expect(yield* session.awaitOutputClosed(2_000)).toBe(true);
+            sessions.push(session);
+          }
+          return sessions.map((session) => ({
+            log: readFileSync(session.logPath, "utf8"),
+            status: session.logSnapshot,
+          }));
+        }),
+      );
+
+      expect(result.map((entry) => entry.log).join("")).toHaveLength(10);
+      expect(result[1]!.status).toMatchObject({ status: "capped", bytesDropped: 6 });
+    } finally {
+      if (previous === undefined) delete process.env[RUNTIME_LOG_MAX_BYTES_ENV_VAR];
+      else process.env[RUNTIME_LOG_MAX_BYTES_ENV_VAR] = previous;
+    }
   });
 
   it("removes its runtime log directory during scoped shutdown", async () => {

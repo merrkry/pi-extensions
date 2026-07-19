@@ -10,7 +10,9 @@ import {
 import * as Effect from "effect/Effect";
 
 import { sanitizeTerminalOutput, type TerminalSafeText } from "../shared/sanitize-terminal.js";
+import type { CollectedOutput } from "./buffer.js";
 import { InvalidInputError } from "./errors.js";
+import type { LogStatus } from "./log.js";
 import { unescapeChars } from "./unescape.js";
 
 export const MIN_YIELD_TIME_MS = 1_000;
@@ -38,6 +40,12 @@ export interface WriteStdinArgs {
 
 export type TruncationMetadata = Omit<TruncationResult, "content">;
 
+export interface CaptureTruncationMetadata {
+  readonly totalBytes: number;
+  readonly retainedBytes: number;
+  readonly omittedBytes: number;
+}
+
 interface ResponseBase {
   readonly chunk_id: string;
   readonly wall_time_seconds: number;
@@ -46,10 +54,15 @@ interface ResponseBase {
   readonly tty: boolean;
   readonly failure_message?: TerminalSafeText;
   readonly log_path?: TerminalSafeText;
+  readonly log_status?: LogStatus;
+  readonly log_bytes_written?: number;
+  readonly log_bytes_dropped?: number;
+  readonly log_error_message?: TerminalSafeText;
   readonly cwd?: TerminalSafeText;
   readonly command?: TerminalSafeText;
   readonly yield_time_ms?: number;
   readonly truncation?: TruncationMetadata;
+  readonly capture_truncation?: CaptureTruncationMetadata;
 }
 
 export interface StreamingResponseShape extends ResponseBase {
@@ -77,13 +90,17 @@ export type ResponseShape = StreamingResponseShape | YieldedResponseShape | Exit
 
 export interface FinalizeInput {
   readonly startedAt: number;
-  readonly collected: Uint8Array;
+  readonly collected: CollectedOutput;
   readonly sessionId?: number;
   readonly exitCode?: number | null;
   readonly signal?: NodeJS.Signals | null;
   readonly failure?: string | null;
   readonly tty: boolean;
   readonly logPath?: string;
+  readonly logStatus?: LogStatus;
+  readonly logBytesWritten?: number;
+  readonly logBytesDropped?: number;
+  readonly logErrorMessage?: string;
   readonly cwd?: string;
   readonly command?: string;
   readonly yieldTimeMs?: number;
@@ -153,7 +170,7 @@ export function normalizeSignal(
 }
 
 export function finalizeResponse(input: FinalizeInput): ResponseShape {
-  const rawText = decode(input.collected);
+  const rawText = decode(input.collected.bytes);
   const truncation = truncateTail(rawText, {
     maxBytes: DEFAULT_MAX_BYTES,
     maxLines: DEFAULT_MAX_LINES,
@@ -163,14 +180,29 @@ export function finalizeResponse(input: FinalizeInput): ResponseShape {
     chunk_id: randomBytes(3).toString("hex"),
     wall_time_seconds: (Date.now() - input.startedAt) / 1000,
     output: sanitizeTerminalOutput(truncation.content),
-    original_token_count: Math.ceil(input.collected.length / 4),
+    original_token_count: Math.ceil(input.collected.totalBytes / 4),
     tty: input.tty,
     ...(input.failure ? { failure_message: sanitizeTerminalOutput(input.failure) } : {}),
     ...(input.logPath ? { log_path: sanitizeTerminalOutput(input.logPath) } : {}),
+    ...(input.logStatus ? { log_status: input.logStatus } : {}),
+    ...(input.logBytesWritten === undefined ? {} : { log_bytes_written: input.logBytesWritten }),
+    ...(input.logBytesDropped === undefined ? {} : { log_bytes_dropped: input.logBytesDropped }),
+    ...(input.logErrorMessage
+      ? { log_error_message: sanitizeTerminalOutput(input.logErrorMessage) }
+      : {}),
     ...(input.cwd ? { cwd: sanitizeTerminalOutput(input.cwd) } : {}),
     ...(input.command ? { command: sanitizeTerminalOutput(input.command) } : {}),
     ...(input.yieldTimeMs ? { yield_time_ms: input.yieldTimeMs } : {}),
     ...(truncation.truncated ? { truncation: truncationMetadata } : {}),
+    ...(input.collected.omittedBytes > 0
+      ? {
+          capture_truncation: {
+            totalBytes: input.collected.totalBytes,
+            retainedBytes: input.collected.bytes.length,
+            omittedBytes: input.collected.omittedBytes,
+          },
+        }
+      : {}),
   };
   if (input.sessionId !== undefined) {
     return { ...base, phase: "yielded", session_id: input.sessionId };
@@ -192,17 +224,35 @@ export function renderResponseText(shape: ResponseShape): string {
   if (shape.signal) lines.push(`signal: ${shape.signal}`);
   if (shape.failure_message) lines.push(`failure: ${shape.failure_message}`);
   if (shape.log_path) lines.push(`log_path: ${shape.log_path}`);
+  if (shape.log_status && shape.log_status !== "complete") {
+    lines.push(
+      `log_status: ${shape.log_status} (${shape.log_bytes_written ?? 0} written, ${shape.log_bytes_dropped ?? 0} dropped)`,
+    );
+  }
   if (shape.cwd) lines.push(`cwd: ${shape.cwd}`);
   lines.push(`wall_time_seconds: ${shape.wall_time_seconds.toFixed(3)}`);
   lines.push(`chunk_id: ${shape.chunk_id}`);
   lines.push(`original_token_count: ${shape.original_token_count}`);
   lines.push(`tty: ${shape.tty}`);
-  const marker = shape.truncation ? truncationMarker(shape.truncation, shape.log_path) : undefined;
-  return `${lines.join("\n")}\n---\n${shape.output || "(no output)"}${marker ? `\n\n${marker}` : ""}`;
+  const markers = [
+    shape.capture_truncation
+      ? captureTruncationMarker(shape.capture_truncation, shape.log_path)
+      : undefined,
+    shape.truncation ? truncationMarker(shape.truncation, shape.log_path) : undefined,
+  ].filter((marker): marker is string => marker !== undefined);
+  return `${lines.join("\n")}\n---\n${shape.output || "(no output)"}${markers.length > 0 ? `\n\n${markers.join("\n")}` : ""}`;
+}
+
+function captureTruncationMarker(
+  capture: CaptureTruncationMetadata,
+  logPath: string | undefined,
+): string {
+  const log = logPath ? `. Bounded output log: ${logPath}` : "";
+  return `[In-memory capture retained the final ${formatSize(capture.retainedBytes)} of ${formatSize(capture.totalBytes)}; ${formatSize(capture.omittedBytes)} omitted${log}]`;
 }
 
 function truncationMarker(truncation: TruncationMetadata, logPath: string | undefined): string {
-  const full = logPath ? `. Full output: ${logPath}` : "";
+  const full = logPath ? `. Bounded output log: ${logPath}` : "";
   if (truncation.lastLinePartial) {
     return `[Showing last ${formatSize(truncation.outputBytes)} of final line (line ${truncation.totalLines} is larger than the ${formatSize(DEFAULT_MAX_BYTES)} limit)${full}]`;
   }

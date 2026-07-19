@@ -157,6 +157,23 @@ describe("unified-exec Pi adapter", () => {
     expect(result.content[0]).toMatchObject({ type: "text" });
   });
 
+  it("bounds one high-volume tool result and reports omitted capture bytes", async () => {
+    const harness = await makeHarness();
+    await harness.emit("session_start");
+    const result = await harness.call("exec_command", {
+      cmd: `node -e "process.stdout.write('x'.repeat(200000))"`,
+    });
+    const details = result.details as ResponseShape;
+
+    expect(details.phase).toBe("exited");
+    expect(details.output.length).toBeLessThanOrEqual(50 * 1024);
+    expect(details.original_token_count).toBe(50_000);
+    expect(details.capture_truncation).toMatchObject({
+      totalBytes: 200_000,
+      omittedBytes: 200_000 - 64 * 1024,
+    });
+  });
+
   it("removes terminal control sequences from pipe output", async () => {
     const harness = await makeHarness();
     await harness.emit("session_start");
@@ -270,13 +287,50 @@ describe("unified-exec Pi adapter", () => {
     }
   });
 
+  it("times out behind another poll without sending stale input", async () => {
+    const harness = await makeHarness();
+    await harness.emit("session_start");
+    const started = await harness.call("exec_command", {
+      cmd: "cat",
+      yield_time_ms: 1_000,
+    });
+    const sessionId = (started.details as ResponseShape).session_id!;
+
+    try {
+      const blockingPoll = harness.call("write_stdin", {
+        session_id: sessionId,
+        yield_time_ms: 2_000,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const staleStartedAt = Date.now();
+      const stale = await harness.call("write_stdin", {
+        session_id: sessionId,
+        chars: "stale\\n",
+        yield_time_ms: 1_000,
+      });
+      expect(Date.now() - staleStartedAt).toBeLessThan(1_600);
+      expect(stale.details).toMatchObject({ output: "" });
+
+      await blockingPoll;
+      const fresh = await harness.call("write_stdin", {
+        session_id: sessionId,
+        chars: "fresh\\n",
+        yield_time_ms: 1_000,
+      });
+      expect(fresh.details).toMatchObject({ output: "fresh\n" });
+    } finally {
+      await harness.call("kill_session", { session_id: sessionId });
+    }
+  });
+
   it("interrupts the tool wait without terminating the owned process", async () => {
     const harness = await makeHarness();
     await harness.emit("session_start");
     const abort = new AbortController();
     const pending = harness.call(
       "exec_command",
-      { cmd: "sleep 30", yield_time_ms: 5_000 },
+      { cmd: "printf important; sleep 30", yield_time_ms: 5_000 },
       abort.signal,
     );
     await new Promise((resolve) => setTimeout(resolve, 200));
@@ -295,6 +349,11 @@ describe("unified-exec Pi adapter", () => {
     };
     expect(details.active_count).toBe(1);
     const sessionId = details.sessions[0]!.session_id;
+    const recovered = await harness.call("write_stdin", {
+      session_id: sessionId,
+      yield_time_ms: 1_000,
+    });
+    expect(recovered.details).toMatchObject({ output: "important" });
     await harness.call("kill_session", { session_id: sessionId });
 
     const afterExit = await harness.call("list_sessions", {});

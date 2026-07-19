@@ -400,6 +400,8 @@ function renderDetails(session: SessionSnapshot): string {
       `command: ${singleLine(session.command, 1_024)}`,
       `output bytes: ${session.outputBytesTotal}`,
       `log: ${session.logPath}`,
+      `log status: ${session.logStatus} (${session.logBytesWritten} written, ${session.logBytesDropped} dropped)`,
+      ...(session.logErrorMessage ? [`log error: ${session.logErrorMessage}`] : []),
     ].join("\n"),
   );
 }

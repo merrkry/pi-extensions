@@ -27,6 +27,8 @@ export interface SpawnedChild {
   end(data: Uint8Array): boolean;
   onData(handler: (chunk: Uint8Array) => void): () => void;
   onExit(handler: ExitCallback): void;
+  pauseOutput(): void;
+  resumeOutput(): void;
   interrupt(): boolean;
   kill(signal?: NodeJS.Signals): void;
   resize(cols: number, rows: number): void;
@@ -37,6 +39,8 @@ interface PtyProcess {
   onData(callback: (data: string | Buffer) => void): { dispose(): void };
   onExit(callback: (event: { exitCode: number; signal?: number }) => void): { dispose(): void };
   write(data: string | Buffer): void;
+  pause(): void;
+  resume(): void;
   resize(cols: number, rows: number): void;
   kill(signal?: string): void;
 }
@@ -252,6 +256,22 @@ function spawnPty(module: PtyModule, options: SpawnOptions): SpawnedChild {
     onExit(handler) {
       if (!exited) exitHandlers.add(handler);
     },
+    pauseOutput() {
+      if (exited) return;
+      try {
+        child.pause();
+      } catch {
+        // Output can race process exit.
+      }
+    },
+    resumeOutput() {
+      if (exited) return;
+      try {
+        child.resume();
+      } catch {
+        // Output can race process exit.
+      }
+    },
     interrupt() {
       if (exited) return false;
       if (IS_WINDOWS) {
@@ -357,6 +377,14 @@ function spawnPipes(options: SpawnOptions): SpawnedChild {
     },
     onExit(handler) {
       if (!exited) exitHandlers.add(handler);
+    },
+    pauseOutput() {
+      child.stdout?.pause();
+      child.stderr?.pause();
+    },
+    resumeOutput() {
+      child.stdout?.resume();
+      child.stderr?.resume();
     },
     interrupt() {
       if (exited || !child.pid || IS_WINDOWS) return false;

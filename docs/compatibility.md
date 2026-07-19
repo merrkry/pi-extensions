@@ -16,6 +16,8 @@ The bundle registers `exec_command`, `write_stdin`, `kill_session`, and `list_se
 
 `exec_command` uses Pi's public default-shell resolver and does not accept a per-call shell override. On Windows it requires a Bash installation discoverable by Pi and does not fall back to PowerShell.
 
+Tool output retains a bounded unread tail and reports `capture_truncation` when older bytes were omitted. Runtime logs are also bounded; response and inventory details expose log status and byte counts. The default limits are 32 MiB per session and 256 MiB per runtime, configurable with `PI_UNIFIED_EXEC_SESSION_LOG_MAX_BYTES` and `PI_UNIFIED_EXEC_RUNTIME_LOG_MAX_BYTES`.
+
 ## RTK CLI
 
 [`rtk`](https://github.com/rtk-ai/rtk) exposes `rtk rewrite` for converting supported commands to lower-output equivalents. The bundle requires `rtk >= 0.23.0` in `PATH` and disables only the RTK feature when the executable is missing, too old, or its version check fails.

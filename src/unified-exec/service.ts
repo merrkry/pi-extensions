@@ -1,12 +1,13 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Semaphore from "effect/Semaphore";
 
+import type { CollectedOutput } from "./buffer.js";
 import {
   SessionCapacityError,
   SessionNotFoundError,
@@ -15,12 +16,24 @@ import {
   type SpawnError,
   type UnifiedExecUnavailableError,
 } from "./errors.js";
+import {
+  DEFAULT_RUNTIME_LOG_MAX_BYTES,
+  DEFAULT_SESSION_LOG_MAX_BYTES,
+  LogBudget,
+  type LogStatus,
+  RUNTIME_LOG_MAX_BYTES_ENV_VAR,
+  resolveLogMaxBytes,
+  SESSION_LOG_MAX_BYTES_ENV_VAR,
+} from "./log.js";
 import { ExecSession, type SessionSpawnOptions } from "./session.js";
 import { IS_WINDOWS } from "./shell.js";
 
 export const MAX_SESSIONS = 64;
 export const MAX_TOMBSTONES = 64;
 const MAX_CONCURRENT_SPAWNS = 8;
+const LOG_DIRECTORY_PREFIX = "pi-unified-exec-";
+const STALE_LOG_DIRECTORY_AGE_MS = 24 * 60 * 60 * 1_000;
+let cleanupWarningEmitted = false;
 
 export interface LaunchOutcome {
   readonly session: ExecSession;
@@ -34,7 +47,7 @@ export interface InterruptOutcome {
 export interface TerminateOutcome {
   readonly session: ExecSession;
   readonly escalated: boolean;
-  readonly finalOutput: Uint8Array;
+  readonly finalOutput: CollectedOutput;
 }
 
 export type SessionPhase = "running" | "stopping" | "exited";
@@ -54,11 +67,14 @@ export interface SessionSnapshot {
   readonly failureMessage: string | null;
   readonly outputBytesTotal: number;
   readonly logPath: string;
+  readonly logStatus: LogStatus;
+  readonly logBytesWritten: number;
+  readonly logBytesDropped: number;
+  readonly logErrorMessage: string | undefined;
 }
 
 interface SessionTombstone {
   readonly session: ExecSession;
-  readonly snapshot: SessionSnapshot;
 }
 
 export type InventoryListener = (sessions: readonly SessionSnapshot[]) => void;
@@ -104,16 +120,121 @@ function notifyInventoryListener(
 }
 
 function makeLogDirectory(): Effect.Effect<string> {
-  return Effect.promise(() => mkdtemp(join(tmpdir(), "pi-unified-exec-")));
+  return Effect.promise(async () => {
+    await removeStaleLogDirectories();
+    const directory = await mkdtemp(join(tmpdir(), `${LOG_DIRECTORY_PREFIX}${process.pid}-`));
+    try {
+      await writeFile(
+        join(directory, ".owner.json"),
+        JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
+        { mode: 0o600 },
+      );
+      await chmod(directory, 0o700);
+      return directory;
+    } catch (cause) {
+      try {
+        await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch (cleanupCause) {
+        warnCleanupFailure(`could not roll back ${directory}: ${String(cleanupCause)}`);
+      }
+      throw cause;
+    }
+  });
 }
 
 function removeLogDirectory(directory: string | undefined): Effect.Effect<void> {
   if (!directory) return Effect.void;
-  return Effect.promise(() =>
-    rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }).catch(
-      () => undefined,
-    ),
+  return Effect.promise(async () => {
+    try {
+      await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    } catch (cause) {
+      warnCleanupFailure(`could not remove ${directory}: ${String(cause)}`);
+    }
+  });
+}
+
+async function removeStaleLogDirectories(): Promise<void> {
+  const root = tmpdir();
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch (cause) {
+    warnCleanupFailure(`could not inspect ${root}: ${String(cause)}`);
+    return;
+  }
+
+  const cutoff = Date.now() - STALE_LOG_DIRECTORY_AGE_MS;
+  await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith(LOG_DIRECTORY_PREFIX))
+      .map((entry) => removeStaleLogDirectory(join(root, entry.name), cutoff)),
   );
+}
+
+async function removeStaleLogDirectory(directory: string, cutoff: number): Promise<void> {
+  try {
+    const metadata = await lstat(directory);
+    const currentUid = process.getuid?.();
+    if (!metadata.isDirectory() || (currentUid !== undefined && metadata.uid !== currentUid))
+      return;
+    const owner = await readLogDirectoryOwner(directory, metadata.birthtimeMs);
+    if (!owner) return;
+    if (
+      typeof owner.pid !== "number" ||
+      !Number.isSafeInteger(owner.pid) ||
+      owner.pid <= 0 ||
+      typeof owner.createdAt !== "number" ||
+      !Number.isFinite(owner.createdAt) ||
+      owner.createdAt > cutoff ||
+      processIsAlive(owner.pid)
+    ) {
+      return;
+    }
+    await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  } catch (cause) {
+    const code =
+      cause && typeof cause === "object" && "code" in cause ? String(cause.code) : undefined;
+    if (code !== "ENOENT") warnCleanupFailure(`could not clean ${directory}: ${String(cause)}`);
+  }
+}
+
+async function readLogDirectoryOwner(
+  directory: string,
+  fallbackCreatedAt: number,
+): Promise<{ readonly pid?: unknown; readonly createdAt?: unknown } | undefined> {
+  try {
+    return JSON.parse(await readFile(join(directory, ".owner.json"), "utf8")) as {
+      readonly pid?: unknown;
+      readonly createdAt?: unknown;
+    };
+  } catch (cause) {
+    const code =
+      cause && typeof cause === "object" && "code" in cause ? String(cause.code) : undefined;
+    if (code !== "ENOENT") throw cause;
+    const match = new RegExp(`^${LOG_DIRECTORY_PREFIX}(\\d+)-`).exec(basename(directory));
+    if (!match) return undefined;
+    return { pid: Number(match[1]), createdAt: fallbackCreatedAt };
+  }
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (cause) {
+    return !(
+      cause &&
+      typeof cause === "object" &&
+      "code" in cause &&
+      String(cause.code) === "ESRCH"
+    );
+  }
+}
+
+function warnCleanupFailure(message: string): void {
+  if (cleanupWarningEmitted) return;
+  cleanupWarningEmitted = true;
+  process.emitWarning(`unified-exec log cleanup: ${message}`);
 }
 
 function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
@@ -126,16 +247,24 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
     const inventoryListeners = new Set<InventoryListener>();
     let nextId = 1;
     let shuttingDown = false;
-    let logDirectory: string | undefined = yield* makeLogDirectory();
+    let logDirectory: string | undefined;
+    let logBudget = new LogBudget(
+      resolveLogMaxBytes(RUNTIME_LOG_MAX_BYTES_ENV_VAR, DEFAULT_RUNTIME_LOG_MAX_BYTES),
+    );
+
+    const ensureLogDirectory = stateSemaphore.withPermit(
+      Effect.gen(function* () {
+        if (shuttingDown) return yield* Effect.fail(new SessionShuttingDownError());
+        logDirectory ??= yield* makeLogDirectory();
+        return logDirectory;
+      }),
+    );
 
     const reconcileExitedUnsafe = (): void => {
       for (const [id, session] of sessions) {
         if (!session.hasExited) continue;
         sessions.delete(id);
-        tombstones.push({
-          session,
-          snapshot: sessionSnapshot(session),
-        });
+        tombstones.push({ session });
       }
       while (tombstones.length > MAX_TOMBSTONES) tombstones.shift();
     };
@@ -145,7 +274,7 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
       return Object.freeze(
         [
           ...[...sessions.values()].map(sessionSnapshot),
-          ...tombstones.map((tombstone) => tombstone.snapshot),
+          ...tombstones.map((tombstone) => sessionSnapshot(tombstone.session)),
         ].toSorted((a, b) => a.sessionId - b.sessionId),
       );
     };
@@ -203,9 +332,21 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
                       shuttingDown ? Effect.fail(new SessionShuttingDownError()) : Effect.void,
                     ),
                   );
-                  const directory = logDirectory;
-                  if (!directory) return yield* Effect.fail(new SessionShuttingDownError());
-                  const session = yield* ExecSession.spawn(id, options, directory);
+                  const directory = yield* ensureLogDirectory;
+                  const session = yield* ExecSession.spawn(
+                    id,
+                    {
+                      ...options,
+                      logMaxBytes:
+                        options.logMaxBytes ??
+                        resolveLogMaxBytes(
+                          SESSION_LOG_MAX_BYTES_ENV_VAR,
+                          DEFAULT_SESSION_LOG_MAX_BYTES,
+                        ),
+                    },
+                    directory,
+                    logBudget,
+                  );
                   session.onStateChange(publishInventory);
                   const accepted = yield* stateSemaphore.withPermit(
                     Effect.sync(() => {
@@ -307,22 +448,25 @@ function makeUnifiedExec(): Effect.Effect<UnifiedExecApi> {
             ),
           ),
         ),
-      resume: Effect.gen(function* () {
-        const directory = logDirectory ?? (yield* makeLogDirectory());
-        yield* stateSemaphore.withPermit(
+      resume: stateSemaphore
+        .withPermit(
           Effect.sync(() => {
-            logDirectory = directory;
+            if (shuttingDown) {
+              logBudget = new LogBudget(
+                resolveLogMaxBytes(RUNTIME_LOG_MAX_BYTES_ENV_VAR, DEFAULT_RUNTIME_LOG_MAX_BYTES),
+              );
+            }
             shuttingDown = false;
           }),
-        );
-        yield* Effect.sync(publishInventory);
-      }),
+        )
+        .pipe(Effect.tap(() => Effect.sync(publishInventory))),
     };
     return api;
   });
 }
 
 function sessionSnapshot(session: ExecSession): SessionSnapshot {
+  const log = session.logSnapshot;
   return Object.freeze({
     sessionId: session.id,
     phase: session.hasExited ? "exited" : session.isStopping ? "stopping" : "running",
@@ -338,6 +482,10 @@ function sessionSnapshot(session: ExecSession): SessionSnapshot {
     failureMessage: session.failureMessage,
     outputBytesTotal: session.totalBytesSeen,
     logPath: session.logPath,
+    logStatus: log.status,
+    logBytesWritten: log.bytesWritten,
+    logBytesDropped: log.bytesDropped,
+    logErrorMessage: log.errorMessage,
   });
 }
 

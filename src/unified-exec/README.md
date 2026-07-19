@@ -22,7 +22,9 @@ Processes that finish before becoming background sessions are removed immediatel
 
 Processes belong to the current Pi session runtime, not to a turn or conversation branch. Turn cancellation does not terminate them. Session replacement, reload, normal shutdown, and Effect Layer disposal terminate all owned process trees.
 
-Each runtime owns a temporary log directory containing complete process output. Normal shutdown closes process streams and removes the directory; abrupt host termination leaves cleanup to the operating system.
+Each runtime lazily creates a private temporary log directory. Process logs are bounded rather than guaranteed complete: the default limit is 32 MiB per session and 256 MiB across one runtime. `PI_UNIFIED_EXEC_SESSION_LOG_MAX_BYTES` and `PI_UNIFIED_EXEC_RUNTIME_LOG_MAX_BYTES` accept byte limits, including zero to disable payload logging. Responses and process inventory report whether a log was capped, lost bytes to backpressure, or encountered a write error.
+
+Normal shutdown closes process streams and removes the directory. Each directory has an owner marker; a later runtime removes marked directories older than 24 hours only when their recorded process is no longer alive. Cleanup failures produce one controlled process warning.
 
 ## Internal decisions
 
@@ -32,8 +34,8 @@ Live capacity and exited history are bounded independently: up to 64 live or pen
 
 Pipe mode uses Node child processes. PTY mode uses the optional `@homebridge/node-pty-prebuilt-multiarch` package and fails explicitly when its native module is unavailable. Pi warns at session start when the PTY provider cannot load or the runtime is Bun; pipe mode remains available. Interrupt maps to `SIGINT` on POSIX and terminal Ctrl-C input for Windows PTY sessions; Windows pipe sessions do not expose a reliable graceful interrupt.
 
-Tool and management rendering is always bounded. Full output remains available through the runtime log while in-memory buffers stay capped.
+Tool and management rendering is always bounded. Unread output is retained in a fixed 64 KiB tail ring with absolute cursors, so one long poll cannot accumulate unbounded memory and an interrupted wait does not commit consumption. Streaming uses a separate fixed 32 KiB tail ring. If either the in-memory capture or bounded log omits data, the response reports that explicitly.
 
 TTY output is never streamed into Pi's update renderer. Pipe updates are output-driven,
 coalesced to at most four updates per second, and deduplicated after terminal sanitization;
-silent processes therefore cause no periodic TUI work.
+silent processes therefore cause no periodic TUI work. Log writes honor Node stream backpressure by pausing and resuming both pipe and PTY output; any output that still arrives while the sink is blocked is dropped from the log and counted instead of entering an unbounded queue.

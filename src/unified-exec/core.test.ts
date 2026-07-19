@@ -2,7 +2,7 @@ import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vitest";
 
 import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
-import { HeadTailBuffer } from "./buffer.js";
+import { TailByteRing } from "./buffer.js";
 import { childProcessEnvironment, ptyRuntimeFailure } from "./child.js";
 import {
   clampYield,
@@ -24,25 +24,36 @@ const resolveStdinShell = () => ({
   commandTransport: "stdin" as const,
 });
 
-describe("HeadTailBuffer", () => {
-  it("retains a stable head and the newest tail", () => {
-    const buffer = new HeadTailBuffer(10);
-    buffer.pushChunk(encode("0123456789"));
-    buffer.pushChunk(encode("abcdef"));
+describe("TailByteRing", () => {
+  it("retains the newest bytes and reports overwritten output", () => {
+    const buffer = new TailByteRing(10);
+    buffer.append(encode("0123456789"));
+    buffer.append(encode("abcdef"));
 
-    expect(decode(buffer.toBytes())).toBe("01234bcdef");
-    expect(buffer.omittedBytes).toBe(6);
+    const snapshot = buffer.snapshotFrom(0);
+    expect(decode(snapshot.bytes)).toBe("6789abcdef");
+    expect(snapshot).toMatchObject({ totalBytes: 16, omittedBytes: 6, endOffset: 16 });
   });
 
-  it("owns input chunks and resets after draining", () => {
+  it("uses non-destructive absolute cursors and owns retained bytes", () => {
     const source = encode("hello");
-    const buffer = new HeadTailBuffer(10);
-    buffer.pushChunk(source);
+    const buffer = new TailByteRing(10);
+    buffer.append(source);
     source.fill(0);
 
-    expect(decode(buffer.toBytes())).toBe("hello");
-    expect(decode(buffer.drainChunks()[0]!)).toBe("hello");
-    expect(buffer.retainedBytes).toBe(0);
+    const first = buffer.snapshotFrom(0);
+    expect(decode(first.bytes)).toBe("hello");
+    buffer.append(encode(" world"));
+    expect(decode(buffer.snapshotFrom(first.endOffset).bytes)).toBe(" world");
+  });
+
+  it("keeps fixed storage under many tiny chunks", () => {
+    const buffer = new TailByteRing(32);
+    for (let index = 0; index < 100_000; index += 1) buffer.append(encode("x"));
+
+    const snapshot = buffer.snapshotFrom(0);
+    expect(snapshot.bytes).toHaveLength(32);
+    expect(snapshot.omittedBytes).toBe(100_000 - 32);
   });
 });
 
@@ -155,10 +166,30 @@ describe("terminal output sanitization", () => {
     expect(sanitizeTerminalOutput(undefined as unknown as string)).toBe("");
   });
 
+  it("reports bytes omitted by the bounded capture", () => {
+    const response = finalizeResponse({
+      startedAt: Date.now(),
+      collected: { bytes: encode("tail"), totalBytes: 100, omittedBytes: 96 },
+      tty: false,
+    });
+
+    expect(response.output).toBe("tail");
+    expect(response.original_token_count).toBe(25);
+    expect(response.capture_truncation).toEqual({
+      totalBytes: 100,
+      retainedBytes: 4,
+      omittedBytes: 96,
+    });
+  });
+
   it("does not retain raw output in truncation metadata", () => {
     const response = finalizeResponse({
       startedAt: Date.now(),
-      collected: encode(`\u001b[31m${"x\n".repeat(2_000)}\u001b[0m`),
+      collected: {
+        bytes: encode(`\u001b[31m${"x\n".repeat(2_000)}\u001b[0m`),
+        totalBytes: encode(`\u001b[31m${"x\n".repeat(2_000)}\u001b[0m`).length,
+        omittedBytes: 0,
+      },
       tty: false,
     });
 

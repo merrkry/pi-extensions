@@ -19,6 +19,10 @@ function snapshot(sessionId: number, phase: SessionPhase): SessionSnapshot {
     failureMessage: null,
     outputBytesTotal: 0,
     logPath: `/tmp/${sessionId}.log`,
+    logStatus: "complete",
+    logBytesWritten: 0,
+    logBytesDropped: 0,
+    logErrorMessage: undefined,
   };
 }
 

@@ -179,6 +179,34 @@ describe("unified-exec rendering", () => {
     expect(rendered).not.toContain("owned");
   });
 
+  it("combines capture and response truncation warnings", () => {
+    const result = {
+      content: [{ type: "text", text: "retained output" }],
+      details: {
+        ...response("retained output"),
+        capture_truncation: { omittedBytes: 65_536 },
+        truncation: {
+          truncated: true,
+          truncatedBy: "bytes",
+          outputLines: 100,
+          maxBytes: 50 * 1024,
+        },
+      },
+    } as unknown as AgentToolResult<ResponseShape>;
+
+    const rendered = renderResult(result, { expanded: true, isPartial: false }, theme, {
+      args: {},
+      cwd: "/workspace/project",
+      expanded: true,
+      lastComponent: undefined,
+    })
+      .render(240)
+      .join("\n");
+
+    expect(rendered).toContain("Output capture omitted 64.0KB");
+    expect(rendered).toContain("Response then truncated to 100 retained lines");
+  });
+
   it("tolerates partial results with incomplete or malformed details", () => {
     const result = {
       content: [{ type: "text", text: "content fallback" }],

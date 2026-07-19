@@ -4,10 +4,10 @@ import type {
   ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import * as Effect from "effect/Effect";
-import * as Option from "effect/Option";
 import { Type } from "typebox";
 
 import { sanitizeTerminalOutput } from "../shared/sanitize-terminal.js";
+import type { CollectedOutput } from "./buffer.js";
 import { loadPty } from "./child.js";
 import { manageProcesses } from "./management.js";
 import {
@@ -188,7 +188,7 @@ export default function installUnifiedExec(
           }).pipe(Effect.mapError(toBoundaryError)),
           signal,
         );
-        const output = sanitizeTerminalOutput(new TextDecoder().decode(outcome.finalOutput));
+        const output = sanitizeTerminalOutput(new TextDecoder().decode(outcome.finalOutput.bytes));
         return {
           content: [
             {
@@ -205,6 +205,9 @@ export default function installUnifiedExec(
             escalated: outcome.escalated,
             log_path: outcome.session.logPath,
             final_output: output,
+            output_bytes_total: outcome.finalOutput.totalBytes,
+            output_bytes_omitted: outcome.finalOutput.omittedBytes,
+            log_status: outcome.session.logSnapshot.status,
           },
         };
       },
@@ -308,7 +311,7 @@ function runWriteStdin(
     ).pipe(
       Effect.catchTag("StdinWriteError", (error: StdinWriteError) => {
         failure = error.message;
-        return session.operationSemaphore.withPermit(session.collectUntil(Date.now() + 50));
+        return session.poll(Date.now() + 50);
       }),
     );
     if (session.hasExited) {
@@ -329,8 +332,8 @@ function withStreaming<E>(
   session: ExecSession,
   deadline: number,
   onUpdate: AgentToolUpdateCallback<ResponseShape> | undefined,
-  operation: Effect.Effect<Uint8Array, E>,
-): Effect.Effect<Uint8Array, E> {
+  operation: Effect.Effect<CollectedOutput, E>,
+): Effect.Effect<CollectedOutput, E> {
   if (!onUpdate || session.tty) return operation;
   return Effect.scoped(
     Effect.gen(function* () {
@@ -343,9 +346,7 @@ function withStreaming<E>(
           onUpdate(result);
         }),
       );
-      const remaining = Math.max(1, deadline - Date.now());
-      const result = yield* operation.pipe(Effect.timeoutOption(remaining));
-      return Option.getOrElse(result, () => new Uint8Array());
+      return yield* operation;
     }),
   );
 }
@@ -383,11 +384,12 @@ function finalToolResult(response: ResponseShape): AgentToolResult<ResponseShape
 function finalizeForSession(
   session: ExecSession,
   startedAt: number,
-  collected: Uint8Array,
+  collected: CollectedOutput,
   sessionId: number | undefined,
   yieldTimeMs: number,
   failure = session.failureMessage,
 ): ResponseShape {
+  const log = session.logSnapshot;
   return finalizeResponse({
     startedAt,
     collected,
@@ -397,6 +399,10 @@ function finalizeForSession(
     failure,
     tty: session.tty,
     logPath: session.logPath,
+    logStatus: log.status,
+    logBytesWritten: log.bytesWritten,
+    logBytesDropped: log.bytesDropped,
+    ...(log.errorMessage === undefined ? {} : { logErrorMessage: log.errorMessage }),
     cwd: session.cwd,
     command: session.displayCommand,
     yieldTimeMs,
@@ -420,5 +426,12 @@ function sessionSummary(session: ExecSession, now: number) {
       session.failureMessage === null ? null : sanitizeTerminalOutput(session.failureMessage),
     output_bytes_total: session.totalBytesSeen,
     log_path: sanitizeTerminalOutput(session.logPath),
+    log_status: session.logSnapshot.status,
+    log_bytes_written: session.logSnapshot.bytesWritten,
+    log_bytes_dropped: session.logSnapshot.bytesDropped,
+    log_error_message:
+      session.logSnapshot.errorMessage === undefined
+        ? null
+        : sanitizeTerminalOutput(session.logSnapshot.errorMessage),
   };
 }

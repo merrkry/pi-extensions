@@ -1,5 +1,4 @@
 import { randomBytes } from "node:crypto";
-import { closeSync, createWriteStream, openSync, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as Deferred from "effect/Deferred";
@@ -8,11 +7,12 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Semaphore from "effect/Semaphore";
 
-import { HeadTailBuffer } from "./buffer.js";
+import { type CollectedOutput, TailByteRing } from "./buffer.js";
 import { loadPty, spawnChild, type SpawnedChild } from "./child.js";
 import { SpawnError, StdinWriteError, type UnifiedExecUnavailableError } from "./errors.js";
+import { DEFAULT_SESSION_LOG_MAX_BYTES, LogBudget, type LogSnapshot, SessionLog } from "./log.js";
 
-export const DEFAULT_HEAD_TAIL_MAX_BYTES = 1024 * 1024;
+export const DEFAULT_OUTPUT_TAIL_BYTES = 64 * 1024;
 const DEFAULT_STREAM_TAIL_BYTES = 32 * 1024;
 const STREAM_UPDATE_INTERVAL_MS = 250;
 const POST_EXIT_CLOSE_WAIT_MS = 50;
@@ -25,8 +25,9 @@ export interface SessionSpawnOptions {
   readonly tty: boolean;
   readonly displayCommand: string;
   readonly initialStdin?: Uint8Array;
-  readonly headTailMaxBytes?: number;
+  readonly outputTailBytes?: number;
   readonly streamTailBytes?: number;
+  readonly logMaxBytes?: number;
 }
 
 export interface SessionState {
@@ -52,23 +53,20 @@ const decoder = new TextDecoder("utf-8", { fatal: false });
 
 export class ExecSession {
   readonly startedAt = Date.now();
-  readonly outputBuffer: HeadTailBuffer;
   readonly logPath: string;
   readonly operationSemaphore = Semaphore.makeUnsafe(1);
   readonly exited = Deferred.makeUnsafe<void>();
   readonly outputClosed = Deferred.makeUnsafe<void>();
 
-  private readonly streamTailCap: number;
-  private streamTail: Uint8Array[] = [];
-  private streamTailBytes = 0;
-  private totalOutputBytes = 0;
+  private readonly outputTail: TailByteRing;
+  private readonly streamTail: TailByteRing;
+  private committedOutputOffset = 0;
   private state: SessionState = {
     hasExited: false,
     exitCode: null,
     signal: null,
     failureMessage: null,
   };
-  private logStream: WriteStream | undefined;
   private requestedSignalValue: NodeJS.Signals | undefined;
   private requestedSignalVisibleAt = 0;
   private endedAtValue: number | undefined;
@@ -81,16 +79,14 @@ export class ExecSession {
     readonly displayCommand: string,
     readonly cwd: string,
     readonly tty: boolean,
-    logPath: string,
-    outputBuffer: HeadTailBuffer,
-    streamTailCap: number,
-    logStream: WriteStream,
+    private readonly log: SessionLog,
+    outputTail: TailByteRing,
+    streamTail: TailByteRing,
     private readonly outputSignal: Queue.Queue<void>,
   ) {
-    this.logPath = logPath;
-    this.outputBuffer = outputBuffer;
-    this.streamTailCap = streamTailCap;
-    this.logStream = logStream;
+    this.logPath = log.path;
+    this.outputTail = outputTail;
+    this.streamTail = streamTail;
     this.attachChild();
   }
 
@@ -98,6 +94,7 @@ export class ExecSession {
     id: number,
     options: SessionSpawnOptions,
     logDirectory = tmpdir(),
+    logBudget = new LogBudget(DEFAULT_SESSION_LOG_MAX_BYTES),
   ): Effect.Effect<ExecSession, SpawnError | UnifiedExecUnavailableError> {
     return Effect.gen(function* () {
       const pty = options.tty ? yield* loadPty : undefined;
@@ -105,13 +102,16 @@ export class ExecSession {
       const logPath = join(logDirectory, `${id}-${randomBytes(4).toString("hex")}.log`);
       return yield* Effect.try({
         try: () => {
-          closeSync(openSync(logPath, "w"));
-          const logStream = createWriteStream(logPath, { flags: "a" });
+          const log = SessionLog.open(
+            logPath,
+            logBudget,
+            options.logMaxBytes ?? DEFAULT_SESSION_LOG_MAX_BYTES,
+          );
           let child: SpawnedChild;
           try {
             child = spawnChild(options, pty);
           } catch (cause) {
-            logStream.end();
+            log.end();
             throw cause;
           }
           const session = new ExecSession(
@@ -120,10 +120,9 @@ export class ExecSession {
             options.displayCommand,
             options.cwd,
             options.tty,
-            logPath,
-            new HeadTailBuffer(options.headTailMaxBytes ?? DEFAULT_HEAD_TAIL_MAX_BYTES),
-            options.streamTailBytes ?? DEFAULT_STREAM_TAIL_BYTES,
-            logStream,
+            log,
+            new TailByteRing(options.outputTailBytes ?? DEFAULT_OUTPUT_TAIL_BYTES),
+            new TailByteRing(options.streamTailBytes ?? DEFAULT_STREAM_TAIL_BYTES),
             outputSignal,
           );
           if (options.initialStdin && !child.end(options.initialStdin)) {
@@ -142,15 +141,18 @@ export class ExecSession {
   }
 
   private attachChild(): void {
-    this.logStream?.on("error", (cause) => {
-      this.recordFailure(`log stream error: ${cause.message}`);
-      this.logStream = undefined;
-    });
+    this.log.onWritable(() => this.child.resumeOutput());
+    this.log.onStatusChange(() => this.notifyStateChange());
+    const closeOutput = () => {
+      Deferred.doneUnsafe(this.outputClosed, Effect.void);
+      Queue.offerUnsafe(this.outputSignal, undefined);
+      this.notifyStateChange();
+    };
+    this.log.onClose(closeOutput);
     this.child.onData((chunk) => {
-      this.totalOutputBytes += chunk.length;
-      this.outputBuffer.pushChunk(chunk);
-      this.appendStreamTail(chunk);
-      this.logStream?.write(Buffer.from(chunk));
+      this.outputTail.append(chunk);
+      this.streamTail.append(chunk);
+      if (this.log.append(chunk) === "backpressured") this.child.pauseOutput();
       Queue.offerUnsafe(this.outputSignal, undefined);
       this.notifyOutputChange();
     });
@@ -160,44 +162,13 @@ export class ExecSession {
         hasExited: true,
         exitCode,
         signal,
-        failureMessage: this.state.failureMessage ?? failureMessage ?? null,
+        failureMessage: failureMessage ?? null,
       };
       this.notifyStateChange();
       Deferred.doneUnsafe(this.exited, Effect.void);
       Queue.offerUnsafe(this.outputSignal, undefined);
-      setImmediate(() => {
-        const stream = this.logStream;
-        this.logStream = undefined;
-        const close = () => {
-          Deferred.doneUnsafe(this.outputClosed, Effect.void);
-          Queue.offerUnsafe(this.outputSignal, undefined);
-        };
-        if (!stream) return close();
-        stream.once("close", close);
-        stream.end();
-      });
+      setImmediate(() => this.log.end());
     });
-  }
-
-  private appendStreamTail(chunk: Uint8Array): void {
-    this.streamTail.push(chunk.slice());
-    this.streamTailBytes += chunk.length;
-    while (this.streamTailBytes > this.streamTailCap && this.streamTail.length > 0) {
-      const first = this.streamTail[0]!;
-      const excess = this.streamTailBytes - this.streamTailCap;
-      if (first.length <= excess) {
-        this.streamTail.shift();
-        this.streamTailBytes -= first.length;
-      } else {
-        this.streamTail[0] = first.slice(excess);
-        this.streamTailBytes -= excess;
-      }
-    }
-  }
-
-  private recordFailure(message: string): void {
-    this.state = { ...this.state, failureMessage: this.state.failureMessage ?? message };
-    this.notifyStateChange();
   }
 
   private notifyStateChange(): void {
@@ -230,11 +201,11 @@ export class ExecSession {
     return () => this.outputListeners.delete(listener);
   }
 
-  collectUntil(deadlineMs: number): Effect.Effect<Uint8Array> {
+  collectUntil(deadlineMs: number): Effect.Effect<CollectedOutput> {
     return collectSessionUntil(this, deadlineMs);
   }
 
-  poll(deadlineMs: number, input?: Uint8Array): Effect.Effect<Uint8Array, StdinWriteError> {
+  poll(deadlineMs: number, input?: Uint8Array): Effect.Effect<CollectedOutput, StdinWriteError> {
     return pollSession(this, deadlineMs, input);
   }
 
@@ -294,7 +265,17 @@ export class ExecSession {
   }
 
   snapshotStreamTail(): Uint8Array {
-    return concat(this.streamTail);
+    return this.streamTail.snapshotTail();
+  }
+
+  takePendingOutput(): CollectedOutput {
+    const snapshot = this.outputTail.snapshotFrom(this.committedOutputOffset);
+    this.committedOutputOffset = snapshot.endOffset;
+    return {
+      bytes: snapshot.bytes,
+      totalBytes: snapshot.totalBytes,
+      omittedBytes: snapshot.omittedBytes,
+    };
   }
 
   snapshotState(): SessionState {
@@ -334,26 +315,24 @@ export class ExecSession {
   }
 
   get totalBytesSeen(): number {
-    return this.totalOutputBytes;
+    return this.outputTail.totalBytes;
+  }
+
+  get logSnapshot(): LogSnapshot {
+    return this.log.snapshot();
   }
 }
 
-function collectSessionUntil(session: ExecSession, deadlineMs: number): Effect.Effect<Uint8Array> {
+function collectSessionUntil(
+  session: ExecSession,
+  deadlineMs: number,
+): Effect.Effect<CollectedOutput> {
   return Effect.gen(function* () {
-    const chunks: Uint8Array[] = [];
     let postExitDeadline: number | undefined;
     for (;;) {
       yield* session.clearOutputSignal();
-      const drained = session.outputBuffer.drainChunks();
-      chunks.push(...drained);
       const now = Date.now();
-      if (
-        session.hasExited &&
-        Deferred.isDoneUnsafe(session.outputClosed) &&
-        drained.length === 0
-      ) {
-        break;
-      }
+      if (session.hasExited && Deferred.isDoneUnsafe(session.outputClosed)) break;
       if (now >= deadlineMs) break;
       if (session.hasExited) {
         postExitDeadline ??= Math.min(deadlineMs, now + POST_EXIT_CLOSE_WAIT_MS);
@@ -363,7 +342,7 @@ function collectSessionUntil(session: ExecSession, deadlineMs: number): Effect.E
       const notified = yield* session.awaitOutputSignal(waitUntil - now);
       if (Option.isNone(notified)) break;
     }
-    return concat(chunks);
+    return session.takePendingOutput();
   });
 }
 
@@ -371,23 +350,49 @@ function pollSession(
   session: ExecSession,
   deadlineMs: number,
   input?: Uint8Array,
-): Effect.Effect<Uint8Array, StdinWriteError> {
-  return session.operationSemaphore.withPermit(
-    Effect.gen(function* () {
-      if (input && input.length > 0) {
-        if (!session.writeNow(input)) {
-          return yield* new StdinWriteError({
-            sessionId: session.id,
-            message: session.hasExited
-              ? "the process has already exited"
-              : "stdin write failed: the child closed its stdin; bytes were not delivered",
-          });
-        }
-        yield* Effect.sleep(100);
-      }
-      return yield* session.collectUntil(deadlineMs);
-    }),
+): Effect.Effect<CollectedOutput, StdinWriteError> {
+  const remaining = deadlineMs - Date.now();
+  if (remaining <= 0) return Effect.succeed(emptyCollectedOutput());
+
+  return Effect.acquireUseRelease(
+    session.operationSemaphore.take(1).pipe(Effect.timeoutOption(remaining)),
+    (permit) =>
+      Option.isNone(permit)
+        ? Effect.succeed(emptyCollectedOutput())
+        : pollSessionWithPermit(session, deadlineMs, input),
+    (permit) =>
+      Option.isSome(permit)
+        ? session.operationSemaphore.release(1).pipe(Effect.asVoid)
+        : Effect.void,
   );
+}
+
+function pollSessionWithPermit(
+  session: ExecSession,
+  deadlineMs: number,
+  input?: Uint8Array,
+): Effect.Effect<CollectedOutput, StdinWriteError> {
+  return Effect.gen(function* () {
+    if (Date.now() >= deadlineMs) return emptyCollectedOutput();
+    if (input && input.length > 0) {
+      if (!session.writeNow(input)) {
+        return yield* new StdinWriteError({
+          sessionId: session.id,
+          message: session.hasExited
+            ? "the process has already exited"
+            : "stdin write failed: the child closed its stdin; bytes were not delivered",
+        });
+      }
+      // Once stdin has been accepted, finish the short delivery grace period
+      // rather than converting the side effect into an ambiguous deadline timeout.
+      yield* Effect.sleep(100).pipe(Effect.uninterruptible);
+    }
+    return yield* session.collectUntil(deadlineMs);
+  });
+}
+
+function emptyCollectedOutput(): CollectedOutput {
+  return { bytes: new Uint8Array(), totalBytes: 0, omittedBytes: 0 };
 }
 
 function streamSessionUpdates(
@@ -442,15 +447,4 @@ function streamSessionUpdates(
       }
     }),
   );
-}
-
-function concat(chunks: readonly Uint8Array[]): Uint8Array {
-  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const output = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return output;
 }

@@ -32,6 +32,8 @@ interface ResultRenderModel {
   readonly signal: TerminalSafeText | undefined;
   readonly failure: TerminalSafeText | undefined;
   readonly logPath: TerminalSafeText | undefined;
+  readonly logStatus: TerminalSafeText | undefined;
+  readonly captureOmittedBytes: number | undefined;
   readonly truncation?: {
     readonly truncatedBy?: unknown;
     readonly outputLines: number | undefined;
@@ -87,6 +89,8 @@ class ResultComponent implements Component {
     signal: undefined,
     failure: undefined,
     logPath: undefined,
+    logStatus: undefined,
+    captureOmittedBytes: undefined,
   };
   private options: ToolRenderResultOptions = { expanded: false, isPartial: false };
   private theme!: Theme;
@@ -261,23 +265,42 @@ function statusLine(
     fields.push(theme.fg("error", model.failure));
   }
   if (model.logPath) {
-    fields.push(`log ${formatHomePath(model.logPath)}`);
+    const status = model.logStatus && model.logStatus !== "complete" ? ` (${model.logStatus})` : "";
+    fields.push(`log ${formatHomePath(model.logPath)}${status}`);
   }
   return fields.length > 0 ? theme.fg("muted", fields.join(" · ")) : undefined;
 }
 
 function truncationWarning(model: ResultRenderModel): string | undefined {
-  const { truncation } = model;
-  if (!truncation) return undefined;
-  const log = model.logPath ? `. Full output: ${model.logPath}` : "";
-  const { outputLines, totalLines } = truncation;
-  if (truncation.truncatedBy === "lines" && outputLines !== undefined && totalLines !== undefined) {
-    return `[Truncated: showing ${outputLines} of ${totalLines} lines${log}]`;
+  const warnings: string[] = [];
+  if (model.captureOmittedBytes !== undefined && model.captureOmittedBytes > 0) {
+    warnings.push(
+      `Output capture omitted ${formatSize(model.captureOmittedBytes)} before its retained tail`,
+    );
   }
-  const maximum = truncation.maxBytes ?? DEFAULT_MAX_BYTES;
-  const shown =
-    outputLines === undefined ? "Output truncated" : `Truncated: ${outputLines} lines shown`;
-  return `[${shown} (${formatSize(maximum)} limit)${log}]`;
+
+  const { truncation } = model;
+  if (truncation) {
+    const { outputLines, totalLines } = truncation;
+    if (
+      truncation.truncatedBy === "lines" &&
+      outputLines !== undefined &&
+      totalLines !== undefined
+    ) {
+      warnings.push(`Response then shows ${outputLines} of ${totalLines} retained lines`);
+    } else {
+      const maximum = truncation.maxBytes ?? DEFAULT_MAX_BYTES;
+      const shown =
+        outputLines === undefined
+          ? "Output truncated"
+          : `Response then truncated to ${outputLines} retained lines`;
+      warnings.push(`${shown} (${formatSize(maximum)} limit)`);
+    }
+  }
+
+  if (warnings.length === 0) return undefined;
+  const log = model.logPath ? `. Bounded output log: ${model.logPath}` : "";
+  return `[${warnings.join("; ")}${log}]`;
 }
 
 function describeWrite(args: WriteStdinArgs): string | undefined {
@@ -314,6 +337,7 @@ function parseResultRenderModel(value: unknown): ResultRenderModel {
   const result = asRecord(value);
   const details = asRecord(result?.["details"]);
   const truncation = asRecord(details?.["truncation"]);
+  const captureTruncation = asRecord(details?.["capture_truncation"]);
   const rawOutput = stringField(details, "output") ?? textContent(result);
   return {
     output: sanitizeTerminalOutput(rawOutput),
@@ -323,6 +347,8 @@ function parseResultRenderModel(value: unknown): ResultRenderModel {
     signal: safeStringField(details, "signal"),
     failure: safeStringField(details, "failure_message"),
     logPath: safeStringField(details, "log_path"),
+    logStatus: safeStringField(details, "log_status"),
+    captureOmittedBytes: finiteNumberField(captureTruncation, "omittedBytes"),
     ...(truncation?.["truncated"] === true
       ? {
           truncation: {
