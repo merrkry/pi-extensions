@@ -6,7 +6,6 @@ import installBetterTuiChrome from "../better-tui-chrome/install.js";
 import installCodexFastMode from "../codex-fast-mode/install.js";
 import installRtk from "../rtk/install.js";
 import { FastMode } from "../shared/fast-mode.js";
-import installThinkingFilter from "../thinking-filter/install.js";
 import installToolTweaks from "../tool-tweaks/install.js";
 import installUnifiedExec from "../unified-exec/install.js";
 import { UnifiedExec } from "../unified-exec/service.js";
@@ -18,7 +17,6 @@ export function installApp(pi: ExtensionAPI): Effect.Effect<void, never, FastMod
     yield* Effect.sync(() => installEarlyEnv(pi));
     yield* installCodexFastMode(pi);
     yield* installBetterTuiChrome(pi);
-    yield* Effect.sync(() => installThinkingFilter(pi));
     yield* installUnifiedExec(pi);
     yield* Effect.sync(() => installToolTweaks(pi));
     yield* installRtk(pi);
