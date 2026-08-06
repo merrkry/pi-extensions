@@ -188,6 +188,7 @@ type FooterContext = {
   cwd: string;
   getContextUsage(): ContextUsage | undefined;
   getModel(): FooterModel;
+  getThinkingLevel(): unknown;
 };
 
 class InsetEditor extends CustomEditor {
@@ -245,7 +246,6 @@ class ChromeFooter implements Component {
     private readonly ctx: FooterContext,
     private readonly footerData: ReadonlyFooterDataProvider,
     private readonly theme: Theme,
-    private readonly getThinkingLevel: () => unknown,
     private readonly getFastModeEnabled: () => boolean,
     private readonly onDispose: (footer: ChromeFooter) => void,
   ) {
@@ -279,7 +279,7 @@ class ChromeFooter implements Component {
 
   render(width: number): string[] {
     const usage = this.getContextUsage();
-    const thinkingLevel = this.getThinkingLevel();
+    const thinkingLevel = this.ctx.getThinkingLevel();
     const fastModeEnabled = this.getFastModeEnabled();
     const model = this.ctx.getModel();
     const branch = this.footerData.getGitBranch();
@@ -333,7 +333,6 @@ export default function installBetterTuiChrome(
     const processes = yield* UnifiedExec;
     let currentEditor: InsetEditor | undefined;
     let currentFooter: ChromeFooter | undefined;
-    let currentModel: FooterModel;
     let fastModeEnabled = fastMode.enabled;
     let unsubscribeFastMode: (() => void) | undefined;
     let unsubscribeProcesses: (() => void) | undefined;
@@ -386,8 +385,7 @@ export default function installBetterTuiChrome(
       requestChromeRender();
     });
 
-    pi.on("model_select", (event) => {
-      currentModel = event.model;
+    pi.on("model_select", () => {
       invalidateFooterContextUsage();
       requestChromeRender();
     });
@@ -440,14 +438,11 @@ export default function installBetterTuiChrome(
       currentContext = undefined;
       currentEditor = undefined;
       currentFooter = undefined;
-      currentModel = undefined;
       activeProcessCount = 0;
       agentRunning = false;
     });
 
     pi.on("session_start", (_event, ctx) => {
-      currentModel = ctx.model;
-
       if (ctx.mode !== "tui") return;
 
       currentContext = ctx;
@@ -471,12 +466,13 @@ export default function installBetterTuiChrome(
       const footerContext: FooterContext = {
         cwd: ctx.cwd,
         getContextUsage: () => ctx.getContextUsage(),
-        getModel: () => currentModel,
+        getModel: () => ctx.model,
+        getThinkingLevel: () => ctx.thinkingLevel ?? "off",
       };
 
       ctx.ui.setEditorComponent((tui, theme, keybindings) => {
         currentEditor = new InsetEditor(tui, theme, keybindings, (text) =>
-          editorBorderColor(ctx.ui.theme, pi.getThinkingLevel(), text),
+          editorBorderColor(ctx.ui.theme, ctx.thinkingLevel, text),
         );
         return currentEditor;
       });
@@ -487,7 +483,6 @@ export default function installBetterTuiChrome(
           footerContext,
           footerData,
           theme,
-          () => pi.getThinkingLevel(),
           () => fastModeEnabled,
           (disposed) => {
             if (currentFooter === disposed) currentFooter = undefined;
