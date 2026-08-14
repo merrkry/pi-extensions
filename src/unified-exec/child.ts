@@ -1,4 +1,5 @@
 import { spawn as cpSpawn, type ChildProcess } from "node:child_process";
+import { createRequire } from "node:module";
 import { constants as osConstants } from "node:os";
 import * as Effect from "effect/Effect";
 
@@ -61,6 +62,7 @@ interface PtyModule {
 }
 
 const PTY_PACKAGE = "@homebridge/node-pty-prebuilt-multiarch";
+const requireFromExtension = createRequire(import.meta.url);
 
 let ptyModule: PtyModule | undefined;
 let ptyLoadFailure: UnifiedExecUnavailableError | undefined;
@@ -81,8 +83,12 @@ export function ptyRuntimeFailure(versions?: {
 function loadPtyModule(): Effect.Effect<PtyModule, UnifiedExecUnavailableError> {
   const runtimeFailure = ptyRuntimeFailure();
   if (runtimeFailure) return Effect.fail(runtimeFailure);
-  return Effect.tryPromise({
-    try: () => import("@homebridge/node-pty-prebuilt-multiarch"),
+  return Effect.try({
+    // Pi evaluates extensions through jiti's VM-backed CommonJS loader. A dynamic
+    // import left in the bundle can therefore run without Node's VM import hook
+    // and reject with ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING. node-pty is CommonJS,
+    // so resolve it synchronously from the installed extension instead.
+    try: () => requireFromExtension(PTY_PACKAGE) as unknown,
     catch: (cause) =>
       new UnifiedExecUnavailableError({
         message: `tty: true requires ${PTY_PACKAGE}, but it failed to load: ${
@@ -91,8 +97,8 @@ function loadPtyModule(): Effect.Effect<PtyModule, UnifiedExecUnavailableError> 
         cause,
       }),
   }).pipe(
-    Effect.flatMap((imported) => {
-      const candidate = imported as unknown as Partial<PtyModule> & { default?: PtyModule };
+    Effect.flatMap((required) => {
+      const candidate = required as Partial<PtyModule> & { default?: PtyModule };
       const loaded =
         typeof candidate.spawn === "function" ? (candidate as PtyModule) : candidate.default;
       return loaded

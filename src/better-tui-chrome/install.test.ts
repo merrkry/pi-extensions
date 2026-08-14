@@ -33,7 +33,7 @@ describe("better-tui-chrome fast-mode coordination", () => {
     });
   });
 
-  it("subscribes only for TUI sessions and disposes on shutdown", () => {
+  it("subscribes only for TUI sessions and defers inventory chrome behind tool completion", async () => {
     const handlers = new Map<string, Handler[]>();
     const unsubscribe = vi.fn();
     const subscribe = vi.fn(() => unsubscribe);
@@ -83,13 +83,25 @@ describe("better-tui-chrome fast-mode coordination", () => {
     expect(subscribe).toHaveBeenCalledOnce();
 
     inventoryListener?.([{ phase: "running" } as SessionSnapshot]);
+    expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith(undefined);
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(ctx.ui.setWorkingMessage).toHaveBeenLastCalledWith("Working... · 1 process running");
     expect(ctx.ui.setWidget).not.toHaveBeenLastCalledWith("better-tui-chrome-processes", undefined);
+
+    const workingMessageCalls = ctx.ui.setWorkingMessage.mock.calls.length;
+    const widgetCalls = ctx.ui.setWidget.mock.calls.length;
+    inventoryListener?.([{ phase: "stopping" } as SessionSnapshot]);
+    expect(ctx.ui.setWorkingMessage).toHaveBeenCalledTimes(workingMessageCalls);
+    expect(ctx.ui.setWidget).toHaveBeenCalledTimes(widgetCalls);
 
     handlers.get("agent_start")?.[0]?.({});
     expect(ctx.ui.setWidget).toHaveBeenLastCalledWith("better-tui-chrome-processes", undefined);
 
+    inventoryListener?.([{ phase: "exited" } as SessionSnapshot]);
     handlers.get("session_shutdown")?.[0]?.({}, ctx);
+    const callsAfterShutdown = ctx.ui.setWorkingMessage.mock.calls.length;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(ctx.ui.setWorkingMessage).toHaveBeenCalledTimes(callsAfterShutdown);
     expect(unsubscribe).toHaveBeenCalledOnce();
     expect(processUnsubscribe).toHaveBeenCalledOnce();
   });

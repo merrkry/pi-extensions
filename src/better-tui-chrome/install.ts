@@ -339,6 +339,7 @@ export default function installBetterTuiChrome(
     let currentContext: ExtensionContext | undefined;
     let activeProcessCount = 0;
     let agentRunning = false;
+    let scheduledProcessChromeUpdate: NodeJS.Immediate | undefined;
 
     function processLabel(): string {
       const noun = activeProcessCount === 1 ? "process" : "processes";
@@ -368,6 +369,24 @@ export default function installBetterTuiChrome(
       }));
     }
 
+    function scheduleProcessChromeUpdate(): void {
+      if (scheduledProcessChromeUpdate) return;
+      // Process exit callbacks run before Pi emits the final tool result. Updating
+      // the working row synchronously forces regular-mode TUI to commit one last
+      // pending tool frame, which can remain in terminal scrollback beside the
+      // completed tool. Let Pi finish that lifecycle transition first.
+      scheduledProcessChromeUpdate = setImmediate(() => {
+        scheduledProcessChromeUpdate = undefined;
+        updateProcessChrome();
+      });
+    }
+
+    function cancelScheduledProcessChromeUpdate(): void {
+      if (!scheduledProcessChromeUpdate) return;
+      clearImmediate(scheduledProcessChromeUpdate);
+      scheduledProcessChromeUpdate = undefined;
+    }
+
     function invalidateFooterContextUsage(): void {
       currentFooter?.invalidateContextUsage();
     }
@@ -392,6 +411,7 @@ export default function installBetterTuiChrome(
 
     pi.on("agent_start", () => {
       agentRunning = true;
+      cancelScheduledProcessChromeUpdate();
       updateProcessChrome();
       invalidateFooterContextUsage();
       requestChromeRender();
@@ -399,6 +419,7 @@ export default function installBetterTuiChrome(
 
     pi.on("agent_end", () => {
       agentRunning = false;
+      cancelScheduledProcessChromeUpdate();
       updateProcessChrome();
     });
 
@@ -423,6 +444,7 @@ export default function installBetterTuiChrome(
     });
 
     pi.on("session_shutdown", (_event, ctx) => {
+      cancelScheduledProcessChromeUpdate();
       unsubscribeFastMode?.();
       unsubscribeFastMode = undefined;
       unsubscribeProcesses?.();
@@ -445,13 +467,21 @@ export default function installBetterTuiChrome(
     pi.on("session_start", (_event, ctx) => {
       if (ctx.mode !== "tui") return;
 
+      cancelScheduledProcessChromeUpdate();
       currentContext = ctx;
       agentRunning = false;
       unsubscribeProcesses?.();
       unsubscribeProcesses = Effect.runSync(
         processes.subscribe((sessions) => {
-          activeProcessCount = sessions.filter((session) => session.phase !== "exited").length;
-          updateProcessChrome();
+          const nextActiveProcessCount = sessions.filter(
+            (session) => session.phase !== "exited",
+          ).length;
+          // Inventory snapshots also change for signals, log state, and exit details.
+          // None of those should schedule a full TUI render while the displayed count
+          // is unchanged.
+          if (nextActiveProcessCount === activeProcessCount) return;
+          activeProcessCount = nextActiveProcessCount;
+          scheduleProcessChromeUpdate();
         }),
       );
       fastModeEnabled = fastMode.enabled;
