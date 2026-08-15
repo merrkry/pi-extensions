@@ -1,6 +1,17 @@
+import type { Skill } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 
 import { transformActiveTools } from "./policy.js";
+import { injectShellSkillsPrompt } from "./skills-prompt.js";
+
+const TEST_SKILL = {
+  name: "test-skill",
+  description: "A test skill",
+  filePath: "/skills/test-skill/SKILL.md",
+  baseDir: "/skills/test-skill",
+  sourceInfo: {},
+  disableModelInvocation: false,
+} as Skill;
 
 describe("transformActiveTools", () => {
   it("replaces shell-redundant tools and adds image viewing when bash is active", () => {
@@ -63,5 +74,39 @@ describe("transformActiveTools", () => {
       "bash",
       "view_image",
     ]);
+  });
+});
+
+describe("injectShellSkillsPrompt", () => {
+  it("restores skill metadata with exec_command guidance when read was replaced", () => {
+    const prompt = injectShellSkillsPrompt("base", ["exec_command"], [TEST_SKILL]);
+
+    expect(prompt).toContain("base\n\nThe following skills");
+    expect(prompt).toContain(
+      "Use exec_command to load a skill's file when the task matches its description.",
+    );
+    expect(prompt).toContain("<name>test-skill</name>");
+    expect(prompt).not.toContain("read tool");
+  });
+
+  it("does not inject when read is already active", () => {
+    expect(injectShellSkillsPrompt("base", ["read", "exec_command"], [TEST_SKILL])).toBeUndefined();
+  });
+
+  it("does not duplicate an existing skills section", () => {
+    expect(
+      injectShellSkillsPrompt("base\n<available_skills>", ["exec_command"], [TEST_SKILL]),
+    ).toBeUndefined();
+  });
+
+  it("does not inject without a shell tool or visible skills", () => {
+    expect(injectShellSkillsPrompt("base", ["edit"], [TEST_SKILL])).toBeUndefined();
+    expect(
+      injectShellSkillsPrompt(
+        "base",
+        ["exec_command"],
+        [{ ...TEST_SKILL, disableModelInvocation: true }],
+      ),
+    ).toBeUndefined();
   });
 });

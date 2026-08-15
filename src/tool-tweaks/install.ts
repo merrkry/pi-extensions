@@ -2,6 +2,7 @@ import { createReadToolDefinition, type ExtensionAPI } from "@earendil-works/pi-
 import { Type } from "typebox";
 
 import { transformActiveTools } from "./policy.js";
+import { injectShellSkillsPrompt } from "./skills-prompt.js";
 
 const VIEW_IMAGE_PARAMETERS = Type.Object({
   path: Type.String({ description: "Path to the image to view (relative or absolute)" }),
@@ -29,5 +30,14 @@ export default function installToolTweaks(pi: ExtensionAPI): void {
     // their original tools, while agents with bash or exec_command use it in place of
     // redundant file tools.
     pi.setActiveTools(transformActiveTools(initiallyActive));
+  });
+
+  pi.on("before_agent_start", (event) => {
+    const systemPrompt = injectShellSkillsPrompt(
+      event.systemPrompt,
+      event.systemPromptOptions.selectedTools ?? pi.getActiveTools(),
+      event.systemPromptOptions.skills ?? [],
+    );
+    return systemPrompt === undefined ? undefined : { systemPrompt };
   });
 }
