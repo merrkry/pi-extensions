@@ -10,6 +10,14 @@ The `"*"` peer range is a loading convention, not a compatibility guarantee. Pi 
 
 Development uses Pi-compatible TypeBox because runtime schemas are created and validated with the host-provided TypeBox implementation.
 
+## Web access
+
+The bundle installs the exactly pinned `pi-web-access` extension and registers its `web_search`, `fetch_content`, and `get_search_content` tools. Its ordinary runtime dependencies are bundled, while Pi host packages remain external. The bundled `librarian` skill is exposed from the installed extension directory through Pi's `resources_discover` event.
+
+Do not also install `npm:pi-web-access` through Pi settings. Pi treats that package and this bundle as separate extensions, which would register duplicate tools, commands, shortcuts, and lifecycle handlers.
+
+`pi-web-access` resolves `web-search.json` from `PI_CODING_AGENT_DIR`, then `XDG_CONFIG_HOME/pi`, and finally `~/.pi`. External programs used by individual features, including Git, GitHub CLI, FFmpeg, ffprobe, yt-dlp, browser launchers, and browser credential helpers, remain host runtime requirements.
+
 ## Unified Exec tools
 
 The bundle registers `exec_command`, `write_stdin`, `kill_session`, and `list_sessions`. A command that outlives `exec_command`'s bounded wait becomes a background session. `list_sessions` reports only live sessions. After a background session exits, its bounded FIFO tombstone remains addressable by known session id until runtime shutdown or tombstone eviction, so `write_stdin` can still collect the final result.

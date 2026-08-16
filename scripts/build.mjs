@@ -1,12 +1,18 @@
-import { join } from "node:path";
+import { cp, rm } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
+const require = createRequire(import.meta.url);
+const outputDirectory = join(root, "dist");
+const webAccessRoot = dirname(require.resolve("pi-web-access/package.json"));
 
+await rm(outputDirectory, { recursive: true, force: true });
 await build({
   entryPoints: [join(root, "src", "index.ts")],
-  outfile: join(root, "dist", "index.js"),
+  outfile: join(outputDirectory, "index.js"),
   bundle: true,
   platform: "node",
   format: "esm",
@@ -20,3 +26,5 @@ await build({
     "typebox",
   ],
 });
+
+await cp(join(webAccessRoot, "skills"), join(outputDirectory, "skills"), { recursive: true });

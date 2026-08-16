@@ -5,10 +5,12 @@ A private bundle of personal extensions for Pi Coding Agent, including an Effect
 ## Modules
 
 - [Better TUI Chrome](src/better-tui-chrome/README.md)
+- [Codex Compaction](src/codex-compaction/README.md)
 - [Codex Fast Mode](src/codex-fast-mode/README.md)
 - [Early Env](src/early-env/README.md)
 - [RTK](src/rtk/README.md)
 - [Tool Tweaks](src/tool-tweaks/README.md)
 - [Unified Exec](src/unified-exec/README.md)
+- [Web Access](src/web-access/README.md)
 
 For shared capabilities, see [Shared capabilities](src/shared/README.md).

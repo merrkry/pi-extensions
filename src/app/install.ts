@@ -10,6 +10,7 @@ import { FastMode } from "../shared/fast-mode.js";
 import installToolTweaks from "../tool-tweaks/install.js";
 import installUnifiedExec from "../unified-exec/install.js";
 import { UnifiedExec } from "../unified-exec/service.js";
+import installWebAccess from "../web-access/install.js";
 
 /** Register modules in deterministic order while services remain explicit requirements. */
 export function installApp(pi: ExtensionAPI): Effect.Effect<void, never, FastMode | UnifiedExec> {
@@ -19,6 +20,7 @@ export function installApp(pi: ExtensionAPI): Effect.Effect<void, never, FastMod
     yield* installCodexFastMode(pi);
     yield* installCodexCompaction(pi);
     yield* installBetterTuiChrome(pi);
+    yield* installWebAccess(pi);
     yield* installUnifiedExec(pi);
     yield* Effect.sync(() => installToolTweaks(pi));
     yield* installRtk(pi);

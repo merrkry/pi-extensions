@@ -15,6 +15,9 @@ const targetDirectory = join(agentDir, "extensions", "pi-extensions");
 const source = join(root, "dist", "index.js");
 const target = join(targetDirectory, "index.js");
 const temporary = join(targetDirectory, `.index.js.tmp-${process.pid}`);
+const resourcesSource = join(root, "dist", "skills");
+const resourcesTarget = join(targetDirectory, "skills");
+const temporaryResources = join(targetDirectory, `.skills.tmp-${process.pid}`);
 const ptyPackage = "@homebridge/node-pty-prebuilt-multiarch";
 const runtimeSource = dirname(require.resolve(`${ptyPackage}/package.json`));
 const runtimeTarget = join(targetDirectory, "node_modules", ...ptyPackage.split("/"));
@@ -24,15 +27,21 @@ const legacyRuntime = join(targetDirectory, "node_modules", "node-pty");
 
 await mkdir(runtimeParent, { recursive: true });
 try {
-  await copyPtyRuntime(runtimeSource, temporaryRuntime);
+  await Promise.all([
+    copyPtyRuntime(runtimeSource, temporaryRuntime),
+    cp(resourcesSource, temporaryResources, { recursive: true }),
+  ]);
   await rm(runtimeTarget, { recursive: true, force: true });
   await rename(temporaryRuntime, runtimeTarget);
   await rm(legacyRuntime, { recursive: true, force: true });
+  await rm(resourcesTarget, { recursive: true, force: true });
+  await rename(temporaryResources, resourcesTarget);
   await copyFile(source, temporary);
   await rename(temporary, target);
 } finally {
   await rm(temporary, { force: true });
   await rm(temporaryRuntime, { recursive: true, force: true });
+  await rm(temporaryResources, { recursive: true, force: true });
 }
 
 console.log(`Applied pi-extensions -> ${target}`);
