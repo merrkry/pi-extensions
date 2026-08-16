@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 
 import installEarlyEnv from "../early-env/install.js";
 import installBetterTuiChrome from "../better-tui-chrome/install.js";
+import installCodexCompaction from "../codex-compaction/install.js";
 import installCodexFastMode from "../codex-fast-mode/install.js";
 import installRtk from "../rtk/install.js";
 import { FastMode } from "../shared/fast-mode.js";
@@ -16,6 +17,7 @@ export function installApp(pi: ExtensionAPI): Effect.Effect<void, never, FastMod
     // This is the intentional second early-env load; the first remains at module evaluation.
     yield* Effect.sync(() => installEarlyEnv(pi));
     yield* installCodexFastMode(pi);
+    yield* installCodexCompaction(pi);
     yield* installBetterTuiChrome(pi);
     yield* installUnifiedExec(pi);
     yield* Effect.sync(() => installToolTweaks(pi));
