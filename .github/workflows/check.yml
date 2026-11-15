@@ -39,6 +39,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      # Authenticate GitHub fetches; the shared runner IPs exhaust the anonymous API limit.
+      NIX_CONFIG: access-tokens = github.com=${{ github.token }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
