@@ -1,21 +1,15 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import * as ManagedRuntime from "effect/ManagedRuntime";
+import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { Effect } from "effect";
+import deepseekSearch from "./deepseek-search/index.ts";
+import asyncBash from "./async-bash/index.ts";
 
-import { installApp } from "./app/install.js";
-import { AppLayer } from "./app/layer.js";
+const extensions: readonly ExtensionFactory[] = [deepseekSearch, asyncBash];
 
-export default async function piExtensions(pi: ExtensionAPI): Promise<void> {
-  const runtime = ManagedRuntime.make(AppLayer);
-  let disposal: Promise<void> | undefined;
-  const dispose = () => (disposal ??= runtime.dispose());
-
-  try {
-    await runtime.runPromise(installApp(pi));
-
-    // Registered last so module shutdown handlers release their session state first.
-    pi.on("session_shutdown", () => dispose());
-  } catch (error) {
-    await dispose();
-    throw error;
-  }
+export default async function (pi: ExtensionAPI): Promise<void> {
+  await Effect.runPromise(
+    Effect.forEach(extensions, (extension) => Effect.tryPromise(async () => extension(pi)), {
+      concurrency: 1,
+      discard: true,
+    }),
+  );
 }

@@ -1,0 +1,3 @@
+[pi-extensions]
+attribute = "pi-extensions.pnpmDeps"
+filename = "nix/package.nix"

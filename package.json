@@ -1,47 +1,30 @@
 {
-  "name": "pi-extensions",
-  "version": "0.0.0",
+  "name": "@merrkry/pi-extensions",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node scripts/build.mjs",
-    "apply": "node scripts/apply.mjs",
-    "check": "node scripts/check.mjs",
-    "dev": "pnpm run build && PI_CODING_AGENT_DIR=.local pi --no-extensions --extension .",
-    "format": "oxfmt .",
-    "format:check": "oxfmt --check .",
-    "lint": "oxlint . --deny-warnings",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "typecheck": "tsc -p tsconfig.json"
+    "build": "vp pack",
+    "dev": "vp pack && node dev.ts",
+    "check": "vp check && pnpm run test",
+    "test": "vp run test:node && vp run test:bun"
   },
   "dependencies": {
-    "@ogulcancelik/pi-codex-compaction": "0.1.3",
-    "effect": "~4.0.0-beta.97",
-    "pi-web-access": "0.13.0"
+    "@effect/platform-node": "4.1.2",
+    "effect": "4.1.2",
+    "proper-lockfile": "^4.1.2"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "~0.84.0",
-    "@earendil-works/pi-coding-agent": "~0.84.0",
-    "@earendil-works/pi-tui": "~0.84.0",
-    "@types/node": "^26.1.1",
-    "esbuild": "~0.28.1",
-    "oxfmt": "~0.58.0",
-    "oxlint": "^1.73.0",
-    "typebox": "~1.3.7",
-    "typescript": "^7.0.2",
-    "vitest": "^4.1.10"
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@tsconfig/strictest": "^2.0.8",
+    "@types/node": "^24.19.1",
+    "@types/proper-lockfile": "^4.1.4",
+    "typebox": "^1.3.37",
+    "vite-plus": "catalog:"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
-  "optionalDependencies": {
-    "@homebridge/node-pty-prebuilt-multiarch": "0.13.1"
-  },
-  "packageManager": "pnpm@11.8.0",
   "pi": {
     "extensions": [
       "./dist/index.js"

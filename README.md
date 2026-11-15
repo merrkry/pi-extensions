@@ -1,16 +1,27 @@
-# Pi Extensions
+# pi-extensions
 
-A private bundle of personal extensions for Pi Coding Agent, including an Effect-based internal port of `pi-unified-exec` for persistent pipe and PTY sessions.
+Extensions for the [Pi coding agent](https://pi.dev), loaded in a fixed order
+from one entry point:
 
-## Modules
+- [DeepSeek Search](src/deepseek-search/README.md)
+- [Async Bash](src/async-bash/README.md)
 
-- [Better TUI Chrome](src/better-tui-chrome/README.md)
-- [Codex Compaction](src/codex-compaction/README.md)
-- [Codex Fast Mode](src/codex-fast-mode/README.md)
-- [Early Env](src/early-env/README.md)
-- [RTK](src/rtk/README.md)
-- [Tool Tweaks](src/tool-tweaks/README.md)
-- [Unified Exec](src/unified-exec/README.md)
-- [Web Access](src/web-access/README.md)
+The build produces `index.js`, the extension entry point, and `settings.js`,
+which applies settings overrides.
 
-For shared capabilities, see [Shared capabilities](src/shared/README.md).
+## Install
+
+The Nix flake provides the build as `packages.<system>.pi-extensions`, and
+as `pi-extensions` through `overlays.default`. Pi loads the extensions from a
+directory containing `index.js`, such as `~/.pi/agent/extensions/<name>`.
+
+Pi supplies its SDK packages and TypeBox at runtime, so the build leaves them
+external.
+
+## Develop
+
+`mise run dev` builds the current sources and starts Pi with only these
+extensions. Settings, provider logins, and sessions persist in `.dev/agent`.
+
+`mise run check` runs formatting, lint, and type checks, and the tests under
+Node and Bun.

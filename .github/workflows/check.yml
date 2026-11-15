@@ -1,0 +1,59 @@
+name: Check
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mise-checks:
+    name: Mise checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install toolchain with mise
+        uses: jdx/mise-action@v5
+
+      - name: Cache pnpm downloads
+        uses: actions/setup-node@v7
+        with:
+          # Node and pnpm are already installed and versioned by mise.
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Run checks
+        run: mise run check
+
+  nix-build:
+    name: Nix build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: NixOS/nix-installer-action@v1
+
+      - name: Use the niks3 cache
+        uses: Mic92/niks3-action@v1
+        with:
+          server-url: https://niks3-api.tsubasa.moe
+          skip-push: true
+
+      - name: Build and cache outputs
+        uses: merrkry/niks3-build-action@0a9ea9faad7933de3d7237b940a9421bff541abb # v0.1.0
+        with:
+          server-url: https://niks3-api.tsubasa.moe
+          flake: .#checks.x86_64-linux

@@ -1,3 +1,48 @@
+[settings]
+# NixOS hosts use nix-ld to run precompiled tools.
+all_compile = false
+
 [tools]
-node = "24.18.0"
-pnpm = "11.12.0"
+bun = "1.4.4"
+node = "24.22.2"
+pnpm = "12.18.0"
+vp = "1.5.0"
+
+[env]
+NODE_OPTIONS = '{% if os() == "linux" %}--use-openssl-ca{% else %}{{ env.NODE_OPTIONS | default(value="") }}{% endif %}'
+
+[tasks.init]
+description = "Install locked dependencies"
+run = "pnpm install --frozen-lockfile"
+
+[tasks.check]
+description = "Run formatting and lint checks, type checks, and tests under Node and Bun"
+depends = ["init"]
+run = "pnpm run check"
+
+[tasks.format]
+description = "Format source files"
+depends = ["init"]
+run = "pnpm exec vp fmt"
+
+[tasks.build]
+description = "Build the extension entry points"
+depends = ["init"]
+run = "pnpm run build"
+
+[tasks.dev]
+description = "Build current extensions and start Pi with persistent development settings"
+depends = ["init"]
+raw = true
+raw_args = true
+run = "pnpm run dev"
+
+[tasks."nix:hash:check"]
+description = "Rebuild fixed-output dependencies to verify their hashes"
+raw_args = true
+run = "nix run github:merrkry/nur-packages#nix-hash -- check"
+
+[tasks."nix:hash:update"]
+description = "Recalculate fixed-output dependency hashes after changing the lockfile"
+raw_args = true
+run = "nix run github:merrkry/nur-packages#nix-hash -- update"

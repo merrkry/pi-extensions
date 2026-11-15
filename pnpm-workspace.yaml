@@ -1,18 +1,19 @@
-packages: []
+minimumReleaseAge: 10080 # 7 days in minutes
+
+overrides:
+  # Route Vite consumers, including Vitest, to the Vite+ core.
+  "vite@*": "catalog:"
+
+peerDependencyRules:
+  # The Vite+ core follows Vite+ versions rather than Vite's.
+  allowedVersions:
+    vite: "*"
 
 allowBuilds:
   "@google/genai": false
   esbuild: true
-  msgpackr-extract: false
-  "@homebridge/node-pty-prebuilt-multiarch": true
-  protobufjs: false
+  protobufjs: true
 
-minimumReleaseAgeExclude:
-  - "@earendil-works/pi-agent-core@0.84.0"
-  - "@earendil-works/pi-ai@0.84.0"
-  - "@earendil-works/pi-client@0.84.0"
-  - "@earendil-works/pi-coding-agent@0.84.0"
-  - "@earendil-works/pi-protocol@0.84.0"
-  - "@earendil-works/pi-telemetry@0.84.0"
-  - "@earendil-works/pi-tui@0.84.0"
-  - "grok-mermaid@0.2.2"
+catalog:
+  vite: npm:@voidzero-dev/vite-plus-core@1.5.0
+  vite-plus: 1.5.0
