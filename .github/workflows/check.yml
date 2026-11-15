@@ -47,10 +47,30 @@ jobs:
         uses: NixOS/nix-installer-action@v1
 
       - name: Use the niks3 cache
-        uses: Mic92/niks3-action@v1
+        uses: Mic92/niks3-action@01820a2b97ac01531ad9fb859db94af63ffcbd83 # v1.10.0
         with:
           server-url: https://niks3-api.tsubasa.moe
           skip-push: true
+
+      # Cached outputs of a stale fixed-output hash still build, so rebuild
+      # them whenever their derivations or the checker change.
+      - name: Compute Nix hash verification key
+        id: nix-hash-key
+        run: echo "key=$(nix run github:merrkry/nur-packages#nix-hash -- key)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache successful Nix hash verification
+        id: nix-hash-cache
+        uses: actions/cache@v6
+        with:
+          path: .ci-cache/nix-hash-verified
+          key: nix-hash-v1-${{ steps.nix-hash-key.outputs.key }}
+
+      - name: Check Nix dependency hashes
+        if: steps.nix-hash-cache.outputs.cache-hit != 'true'
+        run: |
+          nix run github:merrkry/nur-packages#nix-hash -- check
+          mkdir -p .ci-cache/nix-hash-verified
+          touch .ci-cache/nix-hash-verified/success
 
       - name: Build and cache outputs
         uses: merrkry/niks3-build-action@0a9ea9faad7933de3d7237b940a9421bff541abb # v0.1.0

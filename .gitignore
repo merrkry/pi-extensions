@@ -3,3 +3,4 @@
 /.dev/
 /result
 .vitest/
+/.ci-cache/
