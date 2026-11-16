@@ -599,27 +599,6 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     },
   );
 
-  test.skipIf(process.platform !== "linux")(
-    "runs tty commands in a terminal that receives typed Ctrl-C",
-    async () => {
-      const program = javascript(
-        "process.stdout.write(`tty:${process.stdin.isTTY} cols:${process.stdout.columns}\\n`); process.on('SIGINT',()=>{process.stdout.write('interrupted\\n');process.exit(0)}); setInterval(()=>{},1000)",
-      );
-      const response = await execute("bash", { command: program, yield_time_ms: 1000, tty: true });
-      const started = response.structuredContent as ProcessResult;
-      assert.match(started.output, /tty:true cols:200/u);
-      const stopped = await processAction({
-        action: "write",
-        session_id: started.session_id,
-        chars: "\u0003",
-        yield_time_ms: 5000,
-      });
-      assert.equal(stopped.state, "exited");
-      assert.equal(stopped.exit_code, 0);
-      assert.match(stopped.output, /interrupted/u);
-    },
-  );
-
   test("shows only the last frame of lines redrawn with carriage returns", async () => {
     const response = await execute("bash", {
       command: "printf 'step 1\\rstep 2\\rdone\\nnext\\r'",

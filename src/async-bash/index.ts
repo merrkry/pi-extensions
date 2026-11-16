@@ -14,8 +14,6 @@ import {
   type Member,
   makeProcesses,
   TERMINATION_GRACE_MS,
-  TTY_COLUMNS,
-  TTY_ROWS,
   type ProcessResult,
   type Processes,
   type TaskSummary,
@@ -399,7 +397,7 @@ export default function (pi: ExtensionAPI): void {
       "Python output is unbuffered in sessions. Other programs may hold output written to a pipe until they exit; use stdbuf -oL or their flush option to follow their progress.",
       "Output reads never consume output. poll, write, and kill continue after the output earlier results showed; pass cursor_bytes=0 to see it again.",
       `Only the ${MAX_REPORTED_SESSIONS} finished sessions whose final state was returned most recently keep their logs; save output needed later instead of relying on older sessions.`,
-      'For programs that need a terminal, such as full-screen tools, single-key prompts, or Ctrl-C, set tty: true. process write then types into the terminal: "\\u0003" sends Ctrl-C and "\\u0004" Ctrl-D, and typed input is echoed in the output.',
+      "Commands have no terminal: stdin is a pipe. Run a program that requires a terminal under a pseudo-terminal, e.g. with script(1) or a terminal multiplexer. To interrupt a program as Ctrl-C would, send SIGINT to its pid with kill -INT.",
     ],
     parameters: Type.Object({
       command: piBash.parameters.properties.command,
@@ -415,11 +413,6 @@ export default function (pi: ExtensionAPI): void {
           maximum: MAX_TIMER_DELAY_MS,
           description:
             "Stop the command and its process group once it has run this long, also after this call has returned. No limit by default.",
-        }),
-      ),
-      tty: Type.Optional(
-        Type.Boolean({
-          description: `Run the command in a pseudo-terminal of ${TTY_COLUMNS} columns and ${TTY_ROWS} rows. Linux only. Defaults to false: stdin is a pipe.`,
         }),
       ),
     }),
@@ -444,7 +437,6 @@ export default function (pi: ExtensionAPI): void {
             ...(shellPath ? { shellPath } : {}),
             ...(shellCommandPrefix ? { shellCommandPrefix } : {}),
             ...(timeoutMs === undefined ? {} : { timeoutMs }),
-            ...(params.tty ? { tty: true } : {}),
           }),
           (task) =>
             manager.poll(

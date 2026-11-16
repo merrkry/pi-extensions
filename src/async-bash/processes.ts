@@ -55,8 +55,6 @@ export interface Command {
   shellCommandPrefix?: string;
   /** Stops the process group once the session has run this long. */
   timeoutMs?: number;
-  /** Runs the command in a pseudo-terminal, so input such as Ctrl-C reaches it as typed. */
-  tty?: boolean;
 }
 
 /** Why the session's process group was stopped. */
@@ -206,29 +204,26 @@ type ProcStat = {
   state: string;
   ppid: number;
   pgrp: number;
-  session: number;
 };
 
 function parseStat(pid: number, text: string): ProcStat {
-  // The fields after the parenthesized command name start with state, ppid, pgrp, and session.
-  const [state = "", ppid, pgrp, session] = text.slice(text.lastIndexOf(")") + 2).split(" ");
+  // The fields after the parenthesized command name start with state, ppid, and pgrp.
+  const [state = "", ppid, pgrp] = text.slice(text.lastIndexOf(")") + 2).split(" ");
   return {
     pid,
     name: text.slice(text.indexOf("(") + 1, text.lastIndexOf(")")),
     state,
     ppid: Number(ppid),
     pgrp: Number(pgrp),
-    session: Number(session),
   };
 }
 
 /**
- * Processes still running a session's command, so a result can show what it waits on. A tty
- * command runs in the terminal's own session under `script`, the group leader; otherwise the
- * command's process group holds them. The shell running the command is left out, and subshells it
- * forked are named as such rather than by the launcher's argv. Linux only.
+ * Processes still running in a session's process group, so a result can show what it waits on. The
+ * shell running the command, the group leader, is left out, and subshells it forked are named as
+ * such rather than by the launcher's argv. Linux only.
  */
-function groupMembers(fs: FileSystem.FileSystem, pgid: number, tty: boolean) {
+function groupMembers(fs: FileSystem.FileSystem, pgid: number) {
   if (process.platform !== "linux") return Effect.succeed([] as Member[]);
   return Effect.gen(function* () {
     const entries = yield* fs.readDirectory("/proc").pipe(Effect.orElseSucceed(() => []));
@@ -238,15 +233,10 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number, tty: boolean) {
       const text = yield* fs.readFileString(`/proc/${entry}/stat`).pipe(Effect.option);
       if (Option.isSome(text)) stats.push(parseStat(Number(entry), text.value));
     }
-    const terminal = tty ? stats.find((stat) => stat.ppid === pgid)?.pid : undefined;
-    const shellPid = tty ? terminal : pgid;
-    const selected = stats.filter((stat) =>
-      tty ? stat.session === terminal && terminal !== undefined : stat.pgrp === pgid,
-    );
     const members: Member[] = [];
-    for (const stat of selected) {
+    for (const stat of stats) {
       if (members.length === MAX_LISTED_MEMBERS) break;
-      if (stat.pid === shellPid) continue;
+      if (stat.pgrp !== pgid || stat.pid === pgid) continue;
       const cmdline = yield* fs
         .readFileString(`/proc/${stat.pid}/cmdline`)
         .pipe(Effect.orElseSucceed(() => ""));
@@ -431,9 +421,7 @@ class Task {
       const pgid = this.child.pid;
       const live = summary.state === "running" || summary.state === "draining";
       const processes =
-        withProcesses && live && pgid !== undefined
-          ? yield* groupMembers(this.fs, pgid, this.command.tty ?? false)
-          : [];
+        withProcesses && live && pgid !== undefined ? yield* groupMembers(this.fs, pgid) : [];
       const result: ProcessResult = { ...summary, ...page };
       return processes.length ? { ...result, processes } : result;
     });
@@ -612,15 +600,11 @@ class Task {
 
 // The shell reads the command from here, then removes it from the command's environment.
 const COMMAND_VARIABLE = "PI_BASH_COMMAND";
-const SHELL_VARIABLE = "PI_BASH_SHELL";
-export const TTY_COLUMNS = 200;
-export const TTY_ROWS = 50;
 
 /**
  * How to start a command. The shell evaluates the command from the environment, so the command's
  * text stays out of every argv: `pgrep -f` and `pkill -f` patterns written in a command would
- * otherwise match the shell running it. A tty command runs under util-linux `script`, which runs
- * this through $SHELL; the script restores the caller's SHELL before evaluating the command.
+ * otherwise match the shell running it.
  */
 function launcher(shell: { shell: string; args: string[] }, command: Command) {
   const text = command.shellCommandPrefix
@@ -636,20 +620,7 @@ function launcher(shell: { shell: string; args: string[] }, command: Command) {
     PYTHONUNBUFFERED: "1",
     [COMMAND_VARIABLE]: text,
   };
-  if (!command.tty) return { file: shell.shell, args: [...shell.args, evaluate], env };
-  if (process.platform !== "linux") throw new Error("tty requires Linux and util-linux script");
-  const restoreShell = `if [ -n "\${${SHELL_VARIABLE}+set}" ]; then export SHELL="$${SHELL_VARIABLE}"; else unset SHELL; fi; unset ${SHELL_VARIABLE}`;
-  const sized = `stty cols ${TTY_COLUMNS} rows ${TTY_ROWS} 2>/dev/null`;
-  const { SHELL: callerShell, ...rest } = env;
-  return {
-    file: "script",
-    args: ["-qfec", `${restoreShell}; ${sized}; ${evaluate}`, "/dev/null"],
-    env: {
-      ...rest,
-      SHELL: shell.shell,
-      ...(callerShell === undefined ? {} : { [SHELL_VARIABLE]: callerShell }),
-    },
-  };
+  return { file: shell.shell, args: [...shell.args, evaluate], env };
 }
 
 export const makeProcesses = Effect.gen(function* () {

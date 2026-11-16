@@ -75,12 +75,11 @@ stopped.
 - **Input results report what was observed, not a delivery guarantee.**
   Refused input was not written. Input followed by a stdin failure may have
   been partly read.
-- **Stdin is a pipe unless `tty` is set.** With `tty`, the command runs in a
-  pseudo-terminal under util-linux `script`, so programs that need a terminal
-  run, and written input arrives as typed, including Ctrl-C. Codex offers the
-  same, and models chose it unprompted; without it they wrote their own pty
-  drivers or hunted for pids to signal. The command then runs in the
-  terminal's own session, which ends with the command's shell.
+- **Stdin is a pipe, not a terminal.** Terminal emulation needs a native
+  pseudo-terminal binding, which is hard to distribute and to get right across
+  runtimes. Programs that need a terminal run under one the model starts, such
+  as `script` or a terminal multiplexer, and Ctrl-C is sent as SIGINT. In the
+  eval, models handled the terminal cases this way.
 - **Retention is bounded, not managed.** Sessions last until Pi's session ends.
   Only the 64 finished sessions whose outcome the model saw most recently
   are kept, and the prompt states this bound.
@@ -92,6 +91,3 @@ stopped.
   ([oven-sh/bun#45882](https://github.com/oven-sh/bun/issues/45882)).
 - Windows has no process groups: a session ends with its shell, and `kill`
   stops the process tree with `taskkill`.
-- `tty` needs Linux with util-linux `script`. Background processes a tty
-  command leaves in its terminal session are not tracked once its shell
-  exits.
