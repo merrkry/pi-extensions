@@ -6,29 +6,38 @@ import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { type Agent, codex, type Invocation, pi } from "./agents.ts";
 import {
   type Case,
   cases,
   type Check,
   registered,
   type Run,
-  type ToolCall,
+  SESSION_TOOLS,
+  SHELL_TOOLS,
   unrequestedSignalExits,
 } from "./cases.ts";
 
 const repository = fileURLToPath(new URL("../../../", import.meta.url));
-// Pi gets this long after TERM to stop its bash sessions before it is killed.
-const PI_TERMINATION_GRACE = Duration.seconds(10);
+// The agent gets this long after TERM to stop its own commands before it is killed.
+const AGENT_TERMINATION_GRACE = Duration.seconds(10);
+const DEBRIEF_BUDGET = Duration.minutes(5);
+const DEBRIEF_PROMPT =
+  "The task is over; do not run any more tools. Give a short retrospective on how you used the shell tools in this task: (1) where a tool result confused you or left you unsure what state a command was in, (2) where a tool behaved differently from what you expected, and (3) what tool behavior or wording would have let you finish with fewer calls or less waiting. Cite the specific calls. If nothing applies, say so.";
 
 const { values: options, positionals: selected } = parseArgs({
   allowPositionals: true,
   options: {
+    agent: { type: "string", default: "pi" },
     extension: { type: "string", default: join(repository, "dist/index.js") },
     provider: { type: "string", default: "deepseek" },
     model: { type: "string", default: "deepseek-flash" },
     thinking: { type: "string", default: "max" },
     auth: { type: "string", default: join(repository, ".dev/agent/auth.json") },
+    "base-url": { type: "string", default: "https://api.deepseek.com/v1" },
+    "codex-template": { type: "string", default: "gpt-5.5" },
     repeat: { type: "string", default: "1" },
+    debrief: { type: "boolean", default: false },
     out: { type: "string" },
   },
 });
@@ -39,7 +48,8 @@ interface Result {
   passed: boolean;
   checks: Check[];
   metrics: Record<string, number>;
-  session?: string;
+  transcript: string;
+  debrief?: string;
 }
 
 const freePort = Effect.callback<number, Error>((resume) => {
@@ -55,77 +65,27 @@ const freePort = Effect.callback<number, Error>((resume) => {
   });
 });
 
-type Entry = {
-  type: string;
-  timestamp?: string;
-  message?: {
-    role: string;
-    content?: Array<Record<string, unknown>> | string;
-    toolCallId?: string;
-    toolName?: string;
-    isError?: boolean;
-    durationMs?: number;
-  };
-};
-
-const textOf = (content: Array<Record<string, unknown>>) =>
-  content
-    .filter((part) => part["type"] === "text")
-    .map((part) => String(part["text"]))
-    .join("");
-
-/** Tool calls and the final answer, read from Pi's session file. */
-function readSession(lines: string[]) {
-  const calls = new Map<string, ToolCall>();
-  let finalText = "";
-  let finalAt: number | undefined;
-  for (const line of lines) {
-    const entry = JSON.parse(line) as Entry;
-    const message = entry.message;
-    if (entry.type !== "message" || !message || !Array.isArray(message.content)) continue;
-    if (message.role === "assistant") {
-      for (const part of message.content) {
-        if (part["type"] !== "toolCall") continue;
-        calls.set(String(part["id"]), {
-          name: String(part["name"]),
-          args: (part["arguments"] ?? {}) as Record<string, unknown>,
-          text: "",
-          isError: false,
-          seconds: 0,
-        });
-      }
-      const text = textOf(message.content);
-      if (text.trim()) {
-        finalText = text;
-        finalAt = entry.timestamp ? Date.parse(entry.timestamp) : undefined;
-      }
-    } else if (message.role === "toolResult") {
-      const call = calls.get(message.toolCallId ?? "");
-      if (!call) continue;
-      call.text = textOf(message.content);
-      call.isError = message.isError ?? false;
-      call.seconds = (message.durationMs ?? 0) / 1000;
-    }
-  }
-  return { calls: [...calls.values()], finalText, finalAt };
-}
-
 function metrics(run: Run): Record<string, number> {
-  const bash = run.calls.filter((call) => call.name === "bash");
-  const commands = bash.map((call) => {
-    const command = call.args["command"];
+  const shell = run.calls.filter((call) => SHELL_TOOLS.has(call.name));
+  const commands = shell.map((call) => {
+    const command = call.args["command"] ?? call.args["cmd"];
     return typeof command === "string" ? command : "";
   });
   return {
     wall_seconds: Math.round(run.wallSeconds),
     tool_calls: run.calls.length,
-    bash_calls: bash.length,
-    process_calls: run.calls.filter((call) => call.name === "process").length,
+    shell_calls: shell.length,
+    session_calls: run.calls.filter((call) => SESSION_TOOLS.has(call.name)).length,
     slowest_call_seconds: Math.round(Math.max(0, ...run.calls.map((call) => call.seconds))),
+    result_kilobytes: Math.round(run.calls.reduce((sum, call) => sum + call.text.length, 0) / 1024),
     timeout_utility_uses: commands.filter((command) => /\btimeout\s+(?:-\S+\s+)*\d/u.test(command))
       .length,
-    timeout_ms_uses: bash.filter((call) => call.args["timeout_ms"] !== undefined).length,
     unrequested_signal_exits: unrequestedSignalExits(run.calls),
+    // Calls that looked into the eval's own bookkeeping rather than the task.
+    state_reads: run.calls.filter((call) => {
+      const args = JSON.stringify(call.args);
+      return args.includes("EVAL_STATE") || args.includes(run.stateDirectory);
+    }).length,
   };
 }
 
@@ -140,19 +100,55 @@ const killAll = (pids: number[]) =>
     }
   });
 
-function attempt(testCase: Case, index: number, out: string) {
+/** Runs one agent turn within `budget`; the result says whether it exited on its own. */
+const invoke = (
+  invocation: Invocation,
+  cwd: string,
+  env: Record<string, string>,
+  budget: Duration.Duration,
+) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const child = yield* ChildProcess.make(invocation.command, invocation.args, {
+        cwd,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, ...env, ...invocation.env },
+        extendEnv: false,
+      });
+      const stdout = yield* Stream.mkString(Stream.decodeText(child.stdout)).pipe(
+        Effect.forkScoped,
+      );
+      const stderr = yield* Stream.mkString(Stream.decodeText(child.stderr)).pipe(
+        Effect.forkScoped,
+      );
+      const exit = yield* child.exitCode.pipe(Effect.timeoutOption(budget));
+      if (Option.isNone(exit)) {
+        yield* child.kill({ killSignal: "SIGTERM", forceKillAfter: AGENT_TERMINATION_GRACE });
+      }
+      return {
+        finished: Option.isSome(exit),
+        stdout: yield* Fiber.join(stdout),
+        stderr: yield* Fiber.join(stderr),
+      };
+    }),
+  );
+
+function attempt(agent: Agent, testCase: Case, index: number, out: string) {
   return Effect.scoped(
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "async-bash-eval-" });
       const workdir = join(root, "work");
-      const pidDirectory = join(root, "pids");
-      const agentDirectory = join(root, "agent");
-      const sessionDirectory = join(root, "sessions");
-      for (const directory of [workdir, pidDirectory, agentDirectory, sessionDirectory]) {
+      const stateDirectory = join(root, "state");
+      const home = join(root, "home");
+      for (const directory of [workdir, stateDirectory, home]) {
         yield* fs.makeDirectory(directory, { mode: 0o700 });
       }
-      yield* fs.copyFile(resolve(options.auth), join(agentDirectory, "auth.json"));
+      yield* fs.makeDirectory(join(stateDirectory, "pids"));
+      yield* fs.makeDirectory(join(stateDirectory, "secrets"));
+      yield* agent.prepare(home);
       for (const [name, content] of Object.entries(testCase.files)) {
         yield* fs.makeDirectory(dirname(join(workdir, name)), { recursive: true });
         yield* fs.writeFileString(join(workdir, name), content);
@@ -161,17 +157,29 @@ function attempt(testCase: Case, index: number, out: string) {
         yield* Effect.sync(() => execFileSync("mkfifo", [join(workdir, name)]));
       }
       const port = yield* freePort;
-      const env = { ...process.env, EVAL_PIDS: pidDirectory };
+      const env = { EVAL_STATE: stateDirectory };
+      if (testCase.prepare) {
+        const script = testCase.prepare;
+        yield* Effect.sync(() =>
+          execFileSync("python3", ["-c", script], {
+            cwd: workdir,
+            env: { ...process.env, ...env },
+          }),
+        );
+      }
 
       // Fixtures are stopped even when the attempt fails or is interrupted.
       yield* Effect.addFinalizer(() =>
-        Effect.promise(() => registered(pidDirectory)).pipe(Effect.flatMap(killAll), Effect.ignore),
+        Effect.promise(() => registered(stateDirectory)).pipe(
+          Effect.flatMap(killAll),
+          Effect.ignore,
+        ),
       );
       for (const script of testCase.setup ?? []) {
         yield* Effect.sync(() =>
           spawn("python3", [script], {
             cwd: workdir,
-            env,
+            env: { ...process.env, ...env },
             detached: true,
             stdio: "ignore",
           }).unref(),
@@ -180,98 +188,62 @@ function attempt(testCase: Case, index: number, out: string) {
       const setupPids = yield* Effect.promise(async () => {
         const expected = testCase.setup?.length ?? 0;
         for (let tries = 0; tries < 50; tries++) {
-          const pids = await registered(pidDirectory);
+          const pids = await registered(stateDirectory);
           if (pids.length >= expected) return pids;
           await new Promise((wake) => setTimeout(wake, 100));
         }
         throw new Error(`${testCase.name}: setup fixtures did not start`);
       });
 
-      const cli = fileURLToPath(
-        new URL("./bundle/cli.js", import.meta.resolve("@earendil-works/pi-coding-agent")),
-      );
       const started = performance.now();
-      const pi = yield* ChildProcess.make(
-        process.execPath,
-        [
-          cli,
-          "--no-extensions",
-          "--no-skills",
-          "--no-prompt-templates",
-          "--no-themes",
-          "--no-context-files",
-          "--no-mcp",
-          "--no-approve",
-          "--extension",
-          resolve(options.extension),
-          "--provider",
-          options.provider,
-          "--model",
-          options.model,
-          "--thinking",
-          options.thinking,
-          "--session-dir",
-          sessionDirectory,
-          "--print",
-          "--mode",
-          "json",
-          "--",
-          testCase.prompt(port),
-        ],
-        {
-          cwd: workdir,
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "pipe",
-          env: {
-            ...env,
-            PI_CODING_AGENT_DIR: agentDirectory,
-            PI_OFFLINE: "1",
-            PI_TELEMETRY: "0",
-          },
-          extendEnv: false,
-        },
+      const turn = yield* invoke(
+        agent.start(home, workdir, testCase.prompt(port)),
+        workdir,
+        env,
+        Duration.seconds(testCase.budgetSeconds),
       );
-      const stderr = yield* Stream.mkString(Stream.decodeText(pi.stderr)).pipe(Effect.forkScoped);
-      const exit = yield* pi.exitCode.pipe(
-        Effect.timeoutOption(Duration.seconds(testCase.budgetSeconds)),
-      );
-      const finished = Option.isSome(exit);
-      if (!finished) {
-        yield* pi.kill({ killSignal: "SIGTERM", forceKillAfter: PI_TERMINATION_GRACE });
-      }
       const wallSeconds = (performance.now() - started) / 1000;
 
       const name = `${testCase.name}-${index}`;
-      const sessions = yield* fs.readDirectory(sessionDirectory);
-      const sessionFile = sessions[0];
-      if (sessionFile === undefined) {
-        const log = yield* Fiber.join(stderr);
-        return yield* Effect.fail(new Error(`${name}: Pi wrote no session\n${log}`));
-      }
-      yield* fs.copyFile(join(sessionDirectory, sessionFile), join(out, `${name}.jsonl`));
-      const content = yield* fs.readFileString(join(sessionDirectory, sessionFile));
-      const session = readSession(content.split("\n").filter(Boolean));
-
+      const transcript = yield* agent
+        .transcript(home)
+        .pipe(
+          Effect.mapError(
+            (error) => new Error(`${name}: no transcript (${String(error)})\n${turn.stderr}`),
+          ),
+        );
+      yield* fs.copyFile(transcript.file, join(out, `${name}.jsonl`));
       const run: Run = {
         workdir,
-        pidDirectory,
+        stateDirectory,
         port,
-        finished,
+        finished: turn.finished,
         wallSeconds,
         setupPids,
-        ...session,
+        calls: transcript.calls,
+        finalText: transcript.finalText,
+        finalAt: transcript.finalAt,
       };
-      // Let processes Pi stopped on exit finish dying before checks look at them.
+      // Let processes the agent stopped on exit finish dying before checks look at them.
       yield* Effect.sleep(Duration.seconds(1));
       const checks = yield* Effect.promise(() => testCase.check(run));
+
+      let debrief: string | undefined;
+      if (options.debrief) {
+        const invocation = agent.debrief(home, transcript, DEBRIEF_PROMPT);
+        const reply = yield* invoke(invocation, workdir, env, DEBRIEF_BUDGET);
+        debrief = invocation.answerFile
+          ? yield* fs.readFileString(invocation.answerFile).pipe(Effect.orElseSucceed(() => ""))
+          : reply.stdout.trim();
+      }
       return {
         case: testCase.name,
         attempt: index,
         passed: checks.every((item) => item.ok),
         checks,
         metrics: metrics(run),
-        session: `${name}.jsonl`,
+        transcript: `${name}.jsonl`,
+        ...(debrief === undefined ? {} : { debrief }),
       } satisfies Result;
     }),
   );
@@ -300,6 +272,23 @@ const main = Effect.gen(function* () {
   if (unknown.length) {
     return yield* Effect.fail(new Error(`Unknown cases: ${unknown.join(", ")}`));
   }
+  const agentOptions = {
+    provider: options.provider,
+    model: options.model,
+    thinking: options.thinking,
+    auth: resolve(options.auth),
+    extension: resolve(options.extension),
+    baseUrl: options["base-url"],
+    codexTemplate: options["codex-template"],
+  };
+  const agents: Record<string, () => Agent> = {
+    pi: () => pi(agentOptions),
+    codex: () => codex(agentOptions),
+  };
+  const makeAgent = agents[options.agent];
+  if (!makeAgent) return yield* Effect.fail(new Error(`Unknown agent: ${options.agent}`));
+  const agent = makeAgent();
+
   const chosen = selected.length ? cases.filter((item) => selected.includes(item.name)) : cases;
   const stamp = new Date().toISOString().replaceAll(/[:.]/gu, "-");
   const out = resolve(options.out ?? join(repository, ".eval/async-bash", stamp));
@@ -311,7 +300,7 @@ const main = Effect.gen(function* () {
   const results = yield* Effect.forEach(
     attempts,
     ({ testCase, index }) =>
-      attempt(testCase, index, out).pipe(
+      attempt(agent, testCase, index, out).pipe(
         Effect.tap((result) =>
           Effect.sync(() => console.error(summarize([result]).split("\n")[0])),
         ),
@@ -319,13 +308,8 @@ const main = Effect.gen(function* () {
     // Attempts share the process table, e.g. pkill in one would stop another's fixtures.
     { concurrency: 1 },
   );
-  const report = {
-    extension: resolve(options.extension),
-    provider: options.provider,
-    model: options.model,
-    thinking: options.thinking,
-    results,
-  };
+  const { auth: _auth, ...recorded } = agentOptions;
+  const report = { agent: options.agent, ...recorded, results };
   yield* fs.writeFileString(join(out, "results.json"), `${JSON.stringify(report, null, 2)}\n`);
   yield* Effect.sync(() => console.log(`${summarize(results)}\nResults: ${out}`));
 });
