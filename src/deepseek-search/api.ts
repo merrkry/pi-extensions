@@ -1,5 +1,5 @@
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
-import { Context, Data, Effect, Layer, Schema } from "effect";
+import { Clock, Context, Data, Effect, Layer, Schema } from "effect";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 
 // Consumed response fields: https://api-docs.deepseek.com/api/search/
@@ -46,6 +46,25 @@ function errorDetail(data: unknown): string | undefined {
   return typeof detail === "string" && detail.length > 0 ? detail : undefined;
 }
 
+/**
+ * Wait until fewer than `limit` requests started within the last second, inclusive of its first
+ * millisecond, then record this start. One instance paces every request that runs it.
+ */
+export function requestSlot(limit: number): Effect.Effect<void> {
+  const starts: number[] = [];
+  return Effect.gen(function* () {
+    while (true) {
+      const now = Number(yield* Clock.monotonicTimeNanos) / 1_000_000;
+      while (starts.length > 0 && starts[0]! < now - 1000) starts.shift();
+      if (starts.length < limit) {
+        starts.push(now);
+        return;
+      }
+      yield* Effect.sleep(starts[0]! + 1001 - now);
+    }
+  });
+}
+
 export class DeepSeekApi extends Context.Service<
   DeepSeekApi,
   {
@@ -57,7 +76,7 @@ export class DeepSeekApi extends Context.Service<
     fetch: (url: string) => Effect.Effect<typeof fetchResponse.Type, WebError>;
   }
 >()("@merrkry/pi-extensions/DeepSeekApi") {
-  static layer(ctx: ExtensionToolContext) {
+  static layer(ctx: ExtensionToolContext, searchSlot: Effect.Effect<void>) {
     return Layer.effect(
       DeepSeekApi,
       Effect.gen(function* () {
@@ -66,6 +85,7 @@ export class DeepSeekApi extends Context.Service<
           endpoint: "search" | "fetch",
           body: object,
           schema: Schema.Decoder<A>,
+          waitToSend: Effect.Effect<void> = Effect.void,
         ) => {
           const url = `https://api.deepseek.com/v1/tools/${endpoint}`;
           return Effect.gen(function* () {
@@ -80,6 +100,7 @@ export class DeepSeekApi extends Context.Service<
                 "Set DEEPSEEK_API_KEY or configure DeepSeek in Pi's auth.json.",
               );
             }
+            yield* waitToSend;
             const response = yield* client.execute(
               HttpClientRequest.post(url).pipe(
                 HttpClientRequest.bearerToken(apiKey),
@@ -121,6 +142,7 @@ export class DeepSeekApi extends Context.Service<
                 ...(question === undefined ? {} : { ori_question: question }),
               },
               searchResponse,
+              searchSlot,
             ),
           fetch: (url) => request("fetch", { url }, fetchResponse),
         };

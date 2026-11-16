@@ -26,7 +26,7 @@
 import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Cause, Effect, Exit } from "effect";
-import { DeepSeekApi, WebError } from "./api.ts";
+import { DeepSeekApi, requestSlot, WebError } from "./api.ts";
 import {
   boundSummary,
   fetchOutput,
@@ -38,6 +38,8 @@ import {
 
 const maxQueries = 10;
 const maxResults = 10;
+// DSH paces Search to the account-wide 5 QPS limit it assumes; the wait counts against the tool budget.
+const searchRequestsPerSecond = 5;
 
 function invalidArgs(violation: string): WebError {
   return new WebError("INVALID_ARGS", `invalid arguments: ${violation}`);
@@ -119,6 +121,7 @@ const searchQueries = Effect.fn("DeepSeek.searchQueries")(function* (
 });
 
 export default function (pi: ExtensionAPI): void {
+  const searchSlot = requestSlot(searchRequestsPerSecond);
   pi.registerTool({
     name: "web_search",
     label: "Web Search",
@@ -136,7 +139,7 @@ export default function (pi: ExtensionAPI): void {
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const result = await runWeb(
-        searchQueries(params.queries, ctx).pipe(Effect.provide(DeepSeekApi.layer(ctx))),
+        searchQueries(params.queries, ctx).pipe(Effect.provide(DeepSeekApi.layer(ctx, searchSlot))),
         signal,
       );
       return {
@@ -170,7 +173,7 @@ export default function (pi: ExtensionAPI): void {
       if (url.username || url.password) throw invalidArgs("url must not contain credentials");
       const page = await runWeb(
         Effect.flatMap(DeepSeekApi, (api) => api.fetch(params.url)).pipe(
-          Effect.provide(DeepSeekApi.layer(ctx)),
+          Effect.provide(DeepSeekApi.layer(ctx, searchSlot)),
         ),
         signal,
       );
