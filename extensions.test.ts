@@ -31,11 +31,12 @@ beforeAll(() => {
   expect(loaded.errors).toEqual([]);
 });
 
-beforeEach(() => {
+beforeEach(async () => {
   session = SessionManager.inMemory(directory);
   runner = new ExtensionRunner(loaded.extensions, loaded.runtime, directory, session, registry);
   vi.stubEnv("DEEPSEEK_API_KEY", "test-deepseek-key");
   vi.stubGlobal("fetch", fetchMock);
+  await runner.emit({ type: "session_start", reason: "startup" });
 });
 
 afterEach(() => {
@@ -134,8 +135,6 @@ test("Pi discovers the managed extension directory without creating settings.jso
   const discovered = await discoverAndLoadExtensions([], directory, agentDirectory);
   expect(discovered.errors).toEqual([]);
   expect(discovered.extensions.flatMap((extension) => [...extension.tools.keys()])).toEqual([
-    "web_search",
-    "web_fetch",
     "bash",
     "process",
   ]);
@@ -356,7 +355,32 @@ test("a non-JSON error body retains its HTTP status without returning the raw ga
   });
 });
 
-test("missing DeepSeek credentials leave the tools registered and fail before dispatch", async () => {
+test("the web tools register at the first session start with a DeepSeek credential", async () => {
+  vi.stubEnv("DEEPSEEK_API_KEY", "");
+  const fresh = await discoverAndLoadExtensions(
+    [fileURLToPath(new URL("./dist/index.js", import.meta.url))],
+    directory,
+    directory,
+  );
+  const freshRunner = new ExtensionRunner(
+    fresh.extensions,
+    fresh.runtime,
+    directory,
+    session,
+    registry,
+  );
+  const webTools = () =>
+    ["web_search", "web_fetch"].filter((name) => freshRunner.getToolDefinition(name));
+  await freshRunner.emit({ type: "session_start", reason: "startup" });
+  expect(webTools()).toEqual([]);
+  vi.stubEnv("DEEPSEEK_API_KEY", "test-deepseek-key");
+  await freshRunner.emit({ type: "session_start", reason: "new" });
+  expect(webTools()).toEqual(["web_search", "web_fetch"]);
+  await freshRunner.emit({ type: "session_start", reason: "resume" });
+  expect(webTools()).toEqual(["web_search", "web_fetch"]);
+});
+
+test("credentials removed after registration fail before dispatch", async () => {
   vi.stubEnv("DEEPSEEK_API_KEY", "");
   await expect(execute("web_search", { queries: ["Pi"] })).rejects.toMatchObject({
     code: "WEB_PROVIDER_CREDENTIAL_MISSING",

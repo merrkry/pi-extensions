@@ -10,3 +10,5 @@ Last checked against DSH
 [commit 39163dd](https://github.com/deepseek-ai/deepseek-harness/tree/39163dd30f703a79079e2d2446545cff3c453738/packages/web).
 
 Set `DEEPSEEK_API_KEY` or configure the `deepseek` provider in Pi's `auth.json`.
+The tools register at session start only when this credential is available.
+After adding it, start a new session or run `/reload`.

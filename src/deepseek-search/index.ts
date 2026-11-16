@@ -120,7 +120,19 @@ const searchQueries = Effect.fn("DeepSeek.searchQueries")(function* (
   return mergeSearchResults(results, maxResults);
 });
 
+// Without a DeepSeek credential the tools stay unregistered; each session start checks again.
 export default function (pi: ExtensionAPI): void {
+  let registered = false;
+  pi.on("session_start", async (_event, ctx) => {
+    if (registered) return;
+    const auth = await ctx.modelRegistry.getProviderAuth("deepseek");
+    if (!auth?.auth.apiKey) return;
+    registered = true;
+    registerTools(pi);
+  });
+}
+
+function registerTools(pi: ExtensionAPI): void {
   const searchSlot = requestSlot(searchRequestsPerSecond);
   pi.registerTool({
     name: "web_search",
