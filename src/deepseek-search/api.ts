@@ -9,6 +9,7 @@ const searchResponse = Schema.Struct({
       url: Schema.String.check(Schema.isMinLength(1)),
       title: Schema.String,
       snippet: Schema.String,
+      summary: Schema.optional(Schema.String),
       date: Schema.NullOr(Schema.String),
     }),
   ),
@@ -18,7 +19,12 @@ const searchResponse = Schema.Struct({
 const fetchResponse = Schema.Struct({ content: Schema.String });
 
 export class WebError extends Data.TaggedError("WebError")<{
-  code: "WEB_PROVIDER_CREDENTIAL_MISSING" | "WEB_ABORTED" | "WEB_PROVIDER_ERROR" | "TOOL_TIMEOUT";
+  code:
+    | "INVALID_ARGS"
+    | "WEB_PROVIDER_CREDENTIAL_MISSING"
+    | "WEB_ABORTED"
+    | "WEB_PROVIDER_ERROR"
+    | "TOOL_TIMEOUT";
   message: string;
   cause?: unknown;
 }> {
@@ -43,10 +49,11 @@ function errorDetail(data: unknown): string | undefined {
 export class DeepSeekApi extends Context.Service<
   DeepSeekApi,
   {
-    search: (
-      query: string,
-      question?: string,
-    ) => Effect.Effect<typeof searchResponse.Type, WebError>;
+    search: (request: {
+      query: string;
+      count: number;
+      question: string | undefined;
+    }) => Effect.Effect<typeof searchResponse.Type, WebError>;
     fetch: (url: string) => Effect.Effect<typeof fetchResponse.Type, WebError>;
   }
 >()("@merrkry/pi-extensions/DeepSeekApi") {
@@ -104,12 +111,12 @@ export class DeepSeekApi extends Context.Service<
           );
         };
         return {
-          search: (query, question) =>
+          search: ({ query, count, question }) =>
             request(
               "search",
               {
                 query,
-                count: 8,
+                count,
                 need_content: false,
                 ...(question === undefined ? {} : { ori_question: question }),
               },

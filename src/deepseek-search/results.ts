@@ -9,6 +9,7 @@ export const searchOutput = Type.Object({
       url: Type.String(),
       title: Type.Optional(Type.String()),
       snippet: Type.Optional(Type.String()),
+      summary: Type.Optional(Type.String()),
       publishedAt: Type.Optional(Type.String()),
     }),
   ),
@@ -22,6 +23,19 @@ export const fetchOutput = Type.Object({
   body: Type.Object({ kind: Type.Literal("text"), content: Type.String() }),
   truncated: Type.Boolean(),
 });
+
+// The upper end of the 600–800 characters the Search API documents for model-facing summaries.
+const summaryLimit = 800;
+
+/** Collapse a summary onto one line and cap it, marking a cut with an ellipsis. */
+export function boundSummary(summary: string): string | undefined {
+  const collapsed = summary.replace(/\s+/gu, " ").trim();
+  if (!collapsed) return undefined;
+  if (collapsed.length <= summaryLimit) return collapsed;
+  let cut = collapsed.slice(0, summaryLimit - 1);
+  if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+  return `${cut}…`;
+}
 
 export function mergeSearchResults(results: SearchResult[], limit: number): SearchResult {
   if (results.length === 1) return results[0]!;
@@ -56,7 +70,8 @@ export function formatSearch(result: SearchResult): string {
   } else {
     const lines = result.sources.map((source) => {
       const metadata = [];
-      if (source.snippet) metadata.push(source.snippet);
+      const excerpt = source.summary || source.snippet;
+      if (excerpt) metadata.push(excerpt);
       if (source.publishedAt) metadata.push(`(${source.publishedAt})`);
       const suffix = metadata.length > 0 ? ` — ${metadata.join(" ")}` : "";
       return `- [${sourceLabel(source.url, source.title)}](${source.url})${suffix}`;

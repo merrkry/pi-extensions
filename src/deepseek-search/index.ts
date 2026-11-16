@@ -28,6 +28,7 @@ import { Type } from "typebox";
 import { Cause, Effect, Exit } from "effect";
 import { DeepSeekApi, WebError } from "./api.ts";
 import {
+  boundSummary,
   fetchOutput,
   formatFetch,
   formatSearch,
@@ -35,8 +36,12 @@ import {
   searchOutput,
 } from "./results.ts";
 
-const maxQueries = 4;
-const maxResults = 8;
+const maxQueries = 10;
+const maxResults = 10;
+
+function invalidArgs(violation: string): WebError {
+  return new WebError("INVALID_ARGS", `invalid arguments: ${violation}`);
+}
 
 async function runWeb<A, E>(effect: Effect.Effect<A, E>, signal?: AbortSignal): Promise<A> {
   if (signal?.aborted) throw new WebError("WEB_ABORTED", "DeepSeek web request aborted");
@@ -80,13 +85,17 @@ const search = Effect.fn("DeepSeek.search")(function* (
   question: string | undefined,
 ) {
   const api = yield* DeepSeekApi;
-  const data = yield* api.search(query, question);
-  const sources = data.results.slice(0, maxResults).map((item) => ({
-    url: item.url,
-    ...(item.title ? { title: item.title } : {}),
-    ...(item.snippet ? { snippet: item.snippet } : {}),
-    ...(item.date ? { publishedAt: item.date } : {}),
-  }));
+  const data = yield* api.search({ query, count: maxResults, question });
+  const sources = data.results.slice(0, maxResults).map((item) => {
+    const summary = item.summary === undefined ? undefined : boundSummary(item.summary);
+    return {
+      url: item.url,
+      ...(item.title ? { title: item.title } : {}),
+      ...(item.snippet ? { snippet: item.snippet } : {}),
+      ...(summary ? { summary } : {}),
+      ...(item.date ? { publishedAt: item.date } : {}),
+    };
+  });
   return { sources, truncated: data.results.length > maxResults };
 });
 
@@ -94,14 +103,13 @@ const searchQueries = Effect.fn("DeepSeek.searchQueries")(function* (
   queries: string[],
   ctx: ExtensionToolContext,
 ) {
-  if (queries.length === 0)
-    return yield* Effect.fail(new Error("queries must contain at least one query"));
+  if (queries.length === 0) return yield* invalidArgs("queries must contain at least one query");
   if (queries.length > maxQueries)
-    return yield* Effect.fail(new Error(`queries must contain at most ${maxQueries} queries`));
+    return yield* invalidArgs(`queries must contain at most ${maxQueries} queries`);
   if (queries.some((query) => !query.trim()))
-    return yield* Effect.fail(new Error("each query must be a non-empty string"));
+    return yield* invalidArgs("each query must be a non-empty string");
   if (queries.some((query) => Array.from(query).length > 128))
-    return yield* Effect.fail(new Error("each query must contain at most 128 Unicode characters"));
+    return yield* invalidArgs("each query must contain at most 128 Unicode characters");
   const unique = [...new Set(queries)];
   const question = originalQuestion(ctx);
   const results = yield* Effect.forEach(unique, (query) => search(query, question), {
@@ -118,8 +126,7 @@ export default function (pi: ExtensionAPI): void {
       "Search the web for current information. Returns an optional summary answer and a list of source URLs.",
     parameters: Type.Object({
       queries: Type.Array(Type.String(), {
-        description:
-          "1–4 search queries; their results are merged. Each query accepts 1–128 Unicode characters.",
+        description: `1–${maxQueries} search queries; their results are merged. Each query accepts 1–128 Unicode characters.`,
       }),
     }),
     outputSchema: searchOutput,
@@ -154,13 +161,13 @@ export default function (pi: ExtensionAPI): void {
     ],
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      if (!params.url.trim()) throw new Error("url must be a non-empty string");
+      if (!params.url.trim()) throw invalidArgs("url must be a non-empty string");
       if (Array.from(params.url).length > 8192)
-        throw new Error("url must contain at most 8192 characters");
+        throw invalidArgs("url must contain at most 8192 characters");
       const url = URL.parse(params.url);
       if (!url || !["http:", "https:"].includes(url.protocol) || !url.hostname)
-        throw new Error("url must be an HTTP(S) URL with a host");
-      if (url.username || url.password) throw new Error("url must not contain credentials");
+        throw invalidArgs("url must be an HTTP(S) URL with a host");
+      if (url.username || url.password) throw invalidArgs("url must not contain credentials");
       const page = await runWeb(
         Effect.flatMap(DeepSeekApi, (api) => api.fetch(params.url)).pipe(
           Effect.provide(DeepSeekApi.layer(ctx)),
