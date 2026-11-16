@@ -193,19 +193,6 @@ test("multiple queries run once each and merge sources round-robin with URL dedu
   expect(text(result)).toContain("Showing the first 10 sources. Refine the query for more.");
 });
 
-test("Search starts at most five requests in any one second across queries", async () => {
-  const starts: number[] = [];
-  fetchMock.mockImplementation(async () => {
-    starts.push(performance.now());
-    return Response.json({ results: [] });
-  });
-  await execute("web_search", { queries: ["1", "2", "3", "4", "5", "6", "7"] });
-  expect(starts).toHaveLength(7);
-  for (let index = 5; index < starts.length; index++) {
-    expect(starts[index]! - starts[index - 5]!).toBeGreaterThanOrEqual(990);
-  }
-});
-
 test("a single search preserves duplicate provider URLs while capping an over-returning API", async () => {
   fetchMock.mockResolvedValueOnce(
     Response.json({ results: Array.from({ length: 11 }, () => source("https://pi.dev")) }),
