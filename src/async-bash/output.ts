@@ -28,6 +28,7 @@ export class Output {
     stderr: new TextDecoder("utf-8", { ignoreBOM: true }),
   };
   private bytes = 0;
+  private lastAppend: number | undefined;
 
   private constructor(
     private readonly fs: FileSystem.FileSystem,
@@ -44,6 +45,11 @@ export class Output {
 
   get totalBytes() {
     return this.bytes;
+  }
+
+  /** When output was last logged, from `performance.now()`. */
+  get lastAppendAt() {
+    return this.lastAppend;
   }
 
   append(data: Uint8Array, channel: "stdout" | "stderr") {
@@ -65,6 +71,7 @@ export class Output {
       yield* this.file.writeAll(data);
       // Count bytes only once written, so readers never see a range beyond the log.
       this.bytes += data.length;
+      this.lastAppend = performance.now();
     });
   }
 

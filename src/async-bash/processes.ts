@@ -16,8 +16,16 @@ const OUTPUT_IDLE_AFTER_EXIT_MS = 100;
  * and stream buffers, which drain in milliseconds, so the deadline never cuts off group output.
  */
 const MAX_CAPTURE_AFTER_TREE_EXIT_MS = 1_000;
-const TERMINATION_GRACE_MS = 5_000;
+export const TERMINATION_GRACE_MS = 5_000;
 const TERMINATION_POLL_INTERVAL_MS = 100;
+/**
+ * How long a wait that saw the command running continues after its shell exits, so that a command
+ * whose descendants are about to exit, or whose capture is ending, still returns its final state.
+ * Background processes that outlive it, such as a server, then end the wait as `draining` instead
+ * of holding it to its limit.
+ */
+const SHELL_EXIT_GRACE_MS = MAX_CAPTURE_AFTER_TREE_EXIT_MS + 1_000;
+
 /**
  * Finished sessions kept once their final state has been returned; starting a command removes
  * those seen longest ago with their logs, even when the model never paged their omitted output. Retention is
@@ -45,7 +53,12 @@ export interface Command {
   env: NodeJS.ProcessEnv;
   shellPath?: string;
   shellCommandPrefix?: string;
+  /** Stops the process group once the session has run this long. */
+  timeoutMs?: number;
 }
+
+/** Why the session's process group was stopped. */
+export type StopReason = "kill" | "timeout";
 
 /** `draining`: the shell has exited, but its process group or output capture has not finished. */
 export type TaskState = "running" | "draining" | "exited" | "failed";
@@ -61,10 +74,21 @@ export type TaskSummary = {
   error?: string;
   /** A pipe failure after stdin accepted input; part of that input may have been delivered. */
   input_error?: string;
+  /** Set once a kill or the timeout started stopping the process group. */
+  stopped_by?: StopReason;
   stdin: "open" | "closed";
   total_bytes: number;
+  /** Since the command started, until it finished. */
+  runtime_seconds: number;
+  /** Since the last output, or since the start when there was none. */
+  idle_seconds: number;
   full_output_path: string;
 };
+
+/** What a result returned to the caller showed. */
+type Shown = Pick<TaskSummary, "state" | "input_error"> & { cursor_bytes?: number };
+
+const seconds = (milliseconds: number) => Math.round(milliseconds / 1000);
 
 export type ProcessResult = TaskSummary &
   Page & {
@@ -161,15 +185,25 @@ function groupAlive(fs: FileSystem.FileSystem, pgid: number) {
 type Phase =
   | { tag: "running" }
   | { tag: "draining"; outcome: Outcome }
-  | { tag: "finished"; outcome: Outcome; captureError?: string; seenAt?: number };
+  | {
+      tag: "finished";
+      outcome: Outcome;
+      finishedAt: number;
+      captureError?: string;
+      seenAt?: number;
+    };
 
 class Task {
   private phase: Phase = { tag: "running" };
   private readonly exited = Deferred.makeUnsafe<Outcome>();
   private readonly finished = Deferred.makeUnsafe<void>();
   private readonly killRequested = Deferred.makeUnsafe<void>();
+  private stopReason: StopReason | undefined;
+  private readonly startedAt = performance.now();
   /** A stdin failure after a write call accepted input, until a returned result shows it. */
   private inputError: string | undefined;
+  /** End of the output that returned results showed, where reads continue by default. */
+  private shown = 0;
   /** Bytes written to stdin and not yet flushed; Bun leaves `writableLength` at zero. */
   queuedInput = 0;
 
@@ -222,6 +256,8 @@ class Task {
 
   summary(): TaskSummary {
     const phase = this.phase;
+    const now = phase.tag === "finished" ? phase.finishedAt : performance.now();
+    const lastOutput = this.output.lastAppendAt ?? this.startedAt;
     const outcome = phase.tag === "running" ? undefined : phase.outcome;
     const error =
       outcome?.state === "failed"
@@ -243,8 +279,11 @@ class Task {
         : {}),
       ...(error ? { error } : {}),
       ...(this.inputError ? { input_error: this.inputError } : {}),
+      ...(this.stopReason ? { stopped_by: this.stopReason } : {}),
       stdin: this.stdinOpen ? "open" : "closed",
       total_bytes: this.output.totalBytes,
+      runtime_seconds: seconds(now - this.startedAt),
+      idle_seconds: seconds(Math.max(0, now - lastOutput)),
       full_output_path: this.output.path,
     };
   }
@@ -253,13 +292,19 @@ class Task {
    * Marks what a result returned to the caller showed. Only the caller knows whether a result
    * reaches it: streaming updates, cancelled calls, and cleanup observe without returning.
    */
-  acknowledge(shown: Pick<TaskSummary, "state" | "input_error">) {
+  acknowledge(shown: Shown) {
+    if (shown.cursor_bytes !== undefined) this.shown = Math.max(this.shown, shown.cursor_bytes);
     if (this.phase.tag === "finished" && (shown.state === "exited" || shown.state === "failed")) {
       this.phase.seenAt ??= performance.now();
     }
     if (shown.input_error !== undefined && this.inputError === shown.input_error) {
       this.inputError = undefined;
     }
+  }
+
+  /** Where output continues after what returned results showed. */
+  get shownCursor() {
+    return this.shown;
   }
 
   stdinFailed(message: string) {
@@ -290,7 +335,11 @@ class Task {
     });
   }
 
-  /** Waits until the command finishes, `until` completes, or `waitMs` elapses. */
+  /**
+   * Waits until the command finishes, `until` completes, or `waitMs` elapses. A wait that starts
+   * while the shell runs also ends shortly after the shell exits, leaving any background processes
+   * draining; a wait that starts while they drain lasts until they exit.
+   */
   wait(
     waitMs: number,
     cursor: number,
@@ -298,7 +347,11 @@ class Task {
     until: Effect.Effect<unknown> = Effect.never,
   ) {
     return Effect.gen({ self: this }, function* () {
-      const finished = Effect.raceFirst(Deferred.await(this.finished), until).pipe(
+      const shellExit =
+        this.phase.tag === "running"
+          ? Deferred.await(this.exited).pipe(Effect.andThen(Effect.sleep(SHELL_EXIT_GRACE_MS)))
+          : Effect.never;
+      const finished = Effect.raceAllFirst([Deferred.await(this.finished), shellExit, until]).pipe(
         Effect.timeoutOption(waitMs),
       );
       if (!onUpdate) {
@@ -326,9 +379,15 @@ class Task {
    * termination out, so cancelling this wait never stops a TERM from escalating to KILL.
    */
   kill() {
-    return Deferred.succeed(this.killRequested, undefined).pipe(
-      Effect.andThen(Deferred.await(this.finished)),
-    );
+    return this.requestStop("kill").pipe(Effect.andThen(Deferred.await(this.finished)));
+  }
+
+  /** The first request decides the reason; a finished session has nothing left to stop. */
+  private requestStop(reason: StopReason) {
+    return Effect.suspend(() => {
+      if (this.stopReason === undefined && this.phase.tag !== "finished") this.stopReason = reason;
+      return Deferred.succeed(this.killRequested, undefined);
+    });
   }
 
   /**
@@ -358,6 +417,12 @@ class Task {
       const treeExited = Deferred.makeUnsafe<void>();
       const captureDeadline = Deferred.makeUnsafe<void>();
 
+      const timeoutMs = this.command.timeoutMs;
+      if (timeoutMs !== undefined) {
+        yield* Effect.forkChild(
+          Effect.sleep(timeoutMs).pipe(Effect.andThen(this.requestStop("timeout"))),
+        );
+      }
       yield* Effect.forkChild(
         Deferred.await(this.killRequested).pipe(
           Effect.andThen(terminateTree(child, "SIGTERM")),
@@ -432,6 +497,7 @@ class Task {
       this.phase = {
         tag: "finished",
         outcome,
+        finishedAt: performance.now(),
         ...(captureError ? { captureError } : {}),
       };
       yield* Deferred.succeed(this.finished, undefined);
@@ -548,7 +614,14 @@ export const makeProcesses = Effect.gen(function* () {
                 : command.command;
               const child = spawn(shell.shell, [...shell.args, shellCommand], {
                 cwd: command.cwd,
-                env: { ...command.env, TERM: "dumb", NO_COLOR: "1", FORCE_COLOR: "0" },
+                // Python output reaches the log as it is written, so sessions show progress.
+                env: {
+                  ...command.env,
+                  TERM: "dumb",
+                  NO_COLOR: "1",
+                  FORCE_COLOR: "0",
+                  PYTHONUNBUFFERED: "1",
+                },
                 detached: process.platform !== "win32",
                 windowsHide: true,
                 stdio: ["pipe", "pipe", "pipe"],
@@ -663,8 +736,11 @@ export const makeProcesses = Effect.gen(function* () {
     list: Effect.sync(() => [...tasks.values()].map((task) => task.summary())),
 
     /** Records what a result returned to the caller showed; the session may be gone by then. */
-    acknowledge: (shown: Pick<TaskSummary, "session_id" | "state" | "input_error">) =>
+    acknowledge: (shown: Shown & Pick<TaskSummary, "session_id">) =>
       Effect.sync(() => tasks.get(shown.session_id)?.acknowledge(shown)),
+
+    /** Where output continues after what returned results showed. */
+    shownCursor: (id: string) => get(id).pipe(Effect.map((task) => task.shownCursor)),
 
     /** Sessions that still need the caller's attention. */
     pending: Effect.sync(() => {

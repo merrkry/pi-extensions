@@ -158,16 +158,19 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
       const response = await execute("bash", { command: "sleep 5.2; printf default-yield" });
       const background = response.structuredContent as ProcessResult;
       assert.equal(background.state, "running");
-      assert.match(text(response), new RegExp(`\\[Session ${background.session_id} running`, "u"));
+      assert.match(
+        text(response),
+        new RegExp(`\\[Session ${background.session_id} running for 5 s;`, "u"),
+      );
       assert.equal((await poll(background)).output, "default-yield");
     },
     LONG_TEST_TIMEOUT_MS,
   );
 
   test("uses Pi shell settings, session environment, and working directory", async () => {
-    const command = 'printf \'%s:%s\' "$BASH_CHECK_PREFIX" "$PI_SESSION_ID"';
+    const command = 'printf \'%s:%s:%s\' "$BASH_CHECK_PREFIX" "$PI_SESSION_ID" "$PYTHONUNBUFFERED"';
     const env = await bash(command, 1000);
-    assert.equal(env.output, `present:${session.sessionId}`, JSON.stringify(env));
+    assert.equal(env.output, `present:${session.sessionId}:1`, JSON.stringify(env));
     assert.equal(env.command, command);
     const cwd = await bash(javascript("process.stdout.write(process.cwd())"), 1000);
     assert.equal(cwd.output, directory);
@@ -175,24 +178,23 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     assert.equal(path.output.split(delimiter)[0], join(getAgentDir(), "bin"));
   });
 
-  test("repeats reads and reports new output only after a cursor", async () => {
+  test("continues after shown output by default and repeats reads from a cursor", async () => {
     const task = await start("printf first; IFS= read -r line; printf second");
-    await processAction({ action: "write", session_id: task.session_id, chars: "go\n" });
-    const finished = await poll(task);
-    assert.equal(finished.state, "exited");
-    assert.equal(finished.output, "firstsecond");
-    const repeated = await poll(task);
-    assert.equal(repeated.output, finished.output);
-    assert.equal(repeated.cursor_bytes, finished.cursor_bytes);
-
-    const after = await execute("process", {
-      action: "poll",
+    const written = await processAction({
+      action: "write",
       session_id: task.session_id,
-      cursor_bytes: finished.cursor_bytes,
+      chars: "go\n",
     });
+    assert.equal(written.state, "exited");
+    assert.equal(written.output, "firstsecond");
+
+    const after = await execute("process", { action: "poll", session_id: task.session_id });
     assert.equal((after.structuredContent as ProcessResult).output, "");
     assert.match(text(after), /^\(no output after byte 11\)/u);
+    assert.equal((await poll(task, { cursor_bytes: 0 })).output, "firstsecond");
     assert.equal((await poll(task, { cursor_bytes: 5 })).output, "second");
+    const read = await processAction({ action: "read", session_id: task.session_id });
+    assert.equal(read.output, "firstsecond");
   });
 
   test("writes stdin, waits for completion, and preserves results after stdin closes", async () => {
@@ -227,7 +229,8 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     assert.equal(late.input_refused, "stdin is closed");
     assert.match(text(rejected), /Input not written: stdin is closed/u);
     assert.equal(late.exit_code, 0);
-    assert.equal(late.output, "ready\nreceived:hello\nremaining\n");
+    assert.equal(late.output, "");
+    assert.equal(late.cursor_bytes, Buffer.byteLength("ready\nreceived:hello\nremaining\n"));
   });
 
   // Bun reports writes to a pipe with no reader as successful: oven-sh/bun#45882.
@@ -409,7 +412,7 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     );
     await processAction({ action: "write", session_id: started.session_id, chars: "go\n" });
     assert.equal((await poll(started, { cursor_bytes: started.cursor_bytes })).output, last);
-    assert.equal((await poll(started)).output, raw);
+    assert.equal((await poll(started, { cursor_bytes: 0 })).output, raw);
   });
 
   test("returns the tail of large output and pages the full log through read", async () => {
@@ -471,10 +474,14 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     // Each process starts its successor in the same group, then exits.
     const source =
       "const n=Number(process.env.HOPS); if (n>0) require('node:child_process').spawn(process.execPath,['-e',process.env.SRC],{stdio:'inherit',env:{...process.env,HOPS:String(n-1)}}).unref(); else process.stdout.write('DONE')";
-    const result = await bash(
+    const started = await bash(
       `export SRC=${quote(source)}; HOPS=40 ${quote(process.execPath)} -e "$SRC"`,
       15_000,
     );
+    // The chain may outlast the wait that follows the shell's exit.
+    const result = started.session_id
+      ? await poll(started as ProcessResult, { yield_time_ms: 15_000 })
+      : started;
     assert.equal(result.state, "exited");
     assert.equal(result.output, "DONE");
   }, 20_000);
@@ -495,11 +502,56 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     assert.equal(piped.output, "started");
     const finished = await poll(piped as ProcessResult);
     assert.equal(finished.state, "exited");
-    assert.equal(finished.output, "startedchild-result");
+    assert.equal(finished.output, "child-result");
 
-    const silent = await bash("sleep 0.4 >/dev/null 2>&1 &", 200);
-    assert.equal(silent.state, "draining");
-    assert.equal((await poll(silent as ProcessResult)).state, "exited");
+    const brief = await bash("(sleep 0.4; printf child-result) & printf started", 5000);
+    assert.equal(brief.state, "exited");
+    assert.equal(brief.output, "startedchild-result");
+  });
+
+  test(
+    "returns shortly after the shell exits and waits for background processes when polled",
+    async () => {
+      const started = performance.now();
+      const server = await bash("sleep 4 >/dev/null 2>&1 & printf started", 20_000);
+      assert.equal(server.state, "draining");
+      assert.ok(performance.now() - started < 3000);
+      const finished = await poll(server as ProcessResult, { yield_time_ms: 20_000 });
+      assert.equal(finished.state, "exited");
+      assert.ok(performance.now() - started >= 4000);
+    },
+    LONG_TEST_TIMEOUT_MS,
+  );
+
+  test("stops commands at their time limit and reports requested kills as successful", async () => {
+    const limited = await execute("bash", {
+      command: "printf started; sleep 30",
+      yield_time_ms: 0,
+      timeout_ms: 300,
+    });
+    assert.equal(limited.isError, undefined);
+    const task = limited.structuredContent as ProcessResult;
+    const response = await execute("process", {
+      action: "poll",
+      session_id: task.session_id,
+      yield_time_ms: 5000,
+    });
+    const stopped = response.structuredContent as ProcessResult;
+    assert.equal(stopped.state, "exited");
+    assert.equal(stopped.stopped_by, "timeout");
+    assert.equal(stopped.signal, "SIGTERM");
+    assert.equal(response.isError, true);
+    assert.match(text(response), /stopped by timeout_ms after 0 s, exited with code 143/u);
+
+    const quick = await execute("bash", { command: "sleep 30", timeout_ms: 300 });
+    assert.equal(quick.isError, true);
+    assert.match(text(quick), /Command stopped by timeout_ms/u);
+
+    const running = await start("sleep 30");
+    const killed = await execute("process", { action: "kill", session_id: running.session_id });
+    assert.equal(killed.isError, undefined);
+    assert.equal((killed.structuredContent as ProcessResult).stopped_by, "kill");
+    assert.match(text(killed), /stopped by process kill, exited with code 143 \(SIGTERM\)/u);
   });
 
   test.skipIf(process.platform !== "linux")(
@@ -547,7 +599,11 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
         async () => assert.equal((await poll(running, { yield_time_ms: 0 })).state, "draining"),
         { timeout: 3000 },
       );
-      const killed = await processAction({ action: "kill", session_id: running.session_id });
+      const killed = await processAction({
+        action: "kill",
+        session_id: running.session_id,
+        cursor_bytes: 0,
+      });
       assert.equal(killed.state, "exited");
       assert.match(killed.output, /\.clean$/u);
     },
@@ -634,11 +690,17 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     LONG_TEST_TIMEOUT_MS,
   );
 
-  test("rejects invalid waits, empty commands, and parameters of other actions", async () => {
-    for (const value of [-1, NaN, Infinity, 2_147_483_648]) {
+  test("rejects invalid waits and limits, empty commands, and parameters of other actions", async () => {
+    for (const value of [-1, NaN, Infinity]) {
       await assert.rejects(
         execute("bash", { command: "sleep 30", yield_time_ms: value }),
-        /Wait must/u,
+        /yield_time_ms must/u,
+      );
+    }
+    for (const value of [0, -1, NaN, 2_147_483_648]) {
+      await assert.rejects(
+        execute("bash", { command: "sleep 30", timeout_ms: value }),
+        /timeout_ms must/u,
       );
     }
     await assert.rejects(execute("bash", { command: " " }), /command must not be empty/u);
@@ -723,7 +785,7 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
         await reminder(),
         `Bash sessions finished since last checked: ${unreported!.session_id}.`,
       );
-      assert.equal((await poll(unreported!)).output, "completed");
+      assert.equal((await poll(unreported!, { cursor_bytes: 0 })).output, "completed");
       assert.equal(await reminder(), undefined);
       assert.deepEqual(session.sessionManager.getEntries(), stored);
 
