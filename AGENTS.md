@@ -45,5 +45,9 @@ update the hash.
 Run `mise run check`. For dependency or bundling changes, also run
 `nix build .#pi-extensions`.
 
+For changes to how async bash behaves or what its prompts say, also run
+`mise run eval:async-bash -- --repeat 3`, and the same with `--extension`
+pointing at a build of the base commit, then compare the two.
+
 Test runs are cached by the inputs listed in `vite.config.ts`. When tests start
 reading other files, add them there.

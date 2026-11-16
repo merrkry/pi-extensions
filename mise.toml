@@ -37,6 +37,12 @@ raw = true
 raw_args = true
 run = "pnpm run dev"
 
+[tasks."eval:async-bash"]
+description = "Run the async bash eval with a model through Pi; uses provider logins from .dev/agent"
+depends = ["build"]
+raw_args = true
+run = "node src/async-bash/eval/run.ts"
+
 [tasks."nix:hash:check"]
 description = "Rebuild fixed-output dependencies to verify their hashes"
 raw_args = true
