@@ -55,6 +55,8 @@ export interface Command {
   shellCommandPrefix?: string;
   /** Stops the process group once the session has run this long. */
   timeoutMs?: number;
+  /** Runs the command in a pseudo-terminal, so input such as Ctrl-C reaches it as typed. */
+  tty?: boolean;
 }
 
 /** Why the session's process group was stopped. */
@@ -80,6 +82,8 @@ export type TaskSummary = {
   total_bytes: number;
   /** Since the command started, until it finished. */
   runtime_seconds: number;
+  /** The time limit set with the command, if any. */
+  timeout_seconds?: number;
   /** Since the last output, or since the start when there was none. */
   idle_seconds: number;
   full_output_path: string;
@@ -90,10 +94,15 @@ type Shown = Pick<TaskSummary, "state" | "input_error"> & { cursor_bytes?: numbe
 
 const seconds = (milliseconds: number) => Math.round(milliseconds / 1000);
 
+/** A process still running in a session's process group. */
+export type Member = { pid: number; command: string; state: string };
+
 export type ProcessResult = TaskSummary &
   Page & {
     /** Why this write call wrote nothing. */
     input_refused?: string;
+    /** Up to a few processes still running in the group, where procfs shows them. */
+    processes?: Member[];
   };
 
 function terminateTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals) {
@@ -178,6 +187,88 @@ function groupAlive(fs: FileSystem.FileSystem, pgid: number) {
   });
 }
 
+const MAX_LISTED_MEMBERS = 4;
+const MAX_MEMBER_COMMAND_CHARS = 80;
+// Linux process states, as /proc/<pid>/stat reports them.
+const PROCESS_STATES: Record<string, string> = {
+  R: "running",
+  S: "sleeping",
+  D: "waiting on I/O",
+  T: "stopped",
+  t: "stopped",
+  Z: "defunct",
+  I: "idle",
+};
+
+type ProcStat = {
+  pid: number;
+  name: string;
+  state: string;
+  ppid: number;
+  pgrp: number;
+  session: number;
+};
+
+function parseStat(pid: number, text: string): ProcStat {
+  // The fields after the parenthesized command name start with state, ppid, pgrp, and session.
+  const [state = "", ppid, pgrp, session] = text.slice(text.lastIndexOf(")") + 2).split(" ");
+  return {
+    pid,
+    name: text.slice(text.indexOf("(") + 1, text.lastIndexOf(")")),
+    state,
+    ppid: Number(ppid),
+    pgrp: Number(pgrp),
+    session: Number(session),
+  };
+}
+
+/**
+ * Processes still running a session's command, so a result can show what it waits on. A tty
+ * command runs in the terminal's own session under `script`, the group leader; otherwise the
+ * command's process group holds them. The shell running the command is left out, and subshells it
+ * forked are named as such rather than by the launcher's argv. Linux only.
+ */
+function groupMembers(fs: FileSystem.FileSystem, pgid: number, tty: boolean) {
+  if (process.platform !== "linux") return Effect.succeed([] as Member[]);
+  return Effect.gen(function* () {
+    const entries = yield* fs.readDirectory("/proc").pipe(Effect.orElseSucceed(() => []));
+    const stats: ProcStat[] = [];
+    for (const entry of entries) {
+      if (!/^\d+$/u.test(entry)) continue;
+      const text = yield* fs.readFileString(`/proc/${entry}/stat`).pipe(Effect.option);
+      if (Option.isSome(text)) stats.push(parseStat(Number(entry), text.value));
+    }
+    const terminal = tty ? stats.find((stat) => stat.ppid === pgid)?.pid : undefined;
+    const shellPid = tty ? terminal : pgid;
+    const selected = stats.filter((stat) =>
+      tty ? stat.session === terminal && terminal !== undefined : stat.pgrp === pgid,
+    );
+    const members: Member[] = [];
+    for (const stat of selected) {
+      if (members.length === MAX_LISTED_MEMBERS) break;
+      if (stat.pid === shellPid) continue;
+      const cmdline = yield* fs
+        .readFileString(`/proc/${stat.pid}/cmdline`)
+        .pipe(Effect.orElseSucceed(() => ""));
+      const argv = cmdline.split("\0").filter(Boolean).join(" ");
+      let command = argv || stat.name;
+      if (argv.includes(COMMAND_VARIABLE)) command = `${stat.name} (subshell of the command)`;
+      if (command.length > MAX_MEMBER_COMMAND_CHARS) {
+        command = `${command.slice(0, MAX_MEMBER_COMMAND_CHARS)} …`;
+      }
+      let state = PROCESS_STATES[stat.state] ?? stat.state;
+      if (stat.state === "S" || stat.state === "D") {
+        const channel = yield* fs
+          .readFileString(`/proc/${stat.pid}/wchan`)
+          .pipe(Effect.orElseSucceed(() => ""));
+        if (channel && channel !== "0") state = `${state} in ${channel.trim()}`;
+      }
+      members.push({ pid: stat.pid, command, state });
+    }
+    return members;
+  });
+}
+
 /**
  * A session's lifecycle. Each step only moves forward, and only the session's monitor finishes it.
  * `draining`: the shell has exited, but its process group or output capture has not finished.
@@ -212,6 +303,7 @@ class Task {
     readonly command: Command,
     readonly child: ChildProcessWithoutNullStreams,
     readonly output: Output,
+    private readonly fs: FileSystem.FileSystem,
   ) {
     // Node resumes unread stdio on exit. Retain it until Effect attaches its readers.
     child.stdout.on("readable", preserveOutput);
@@ -283,6 +375,9 @@ class Task {
       stdin: this.stdinOpen ? "open" : "closed",
       total_bytes: this.output.totalBytes,
       runtime_seconds: seconds(now - this.startedAt),
+      ...(this.command.timeoutMs === undefined
+        ? {}
+        : { timeout_seconds: seconds(this.command.timeoutMs) }),
       idle_seconds: seconds(Math.max(0, now - lastOutput)),
       full_output_path: this.output.path,
     };
@@ -324,14 +419,23 @@ class Task {
     return this.phase.tag === "finished" && !this.unreported ? this.phase.seenAt : undefined;
   }
 
-  /** Reads without marking anything as shown; see `acknowledge`. */
-  observe(cursor: number, from: "cursor" | "end") {
-    return Effect.suspend(() => {
+  /**
+   * Reads without marking anything as shown; see `acknowledge`. Results a call returns also list
+   * the processes still running in the group, which streaming updates skip to stay cheap.
+   */
+  observe(cursor: number, from: "cursor" | "end", withProcesses = false) {
+    return Effect.gen({ self: this }, function* () {
       // Observe state before output, so a finished state always comes with the final bytes.
       const summary = this.summary();
-      return this.output
-        .page(cursor, from)
-        .pipe(Effect.map((page): ProcessResult => ({ ...summary, ...page })));
+      const page = yield* this.output.page(cursor, from);
+      const pgid = this.child.pid;
+      const live = summary.state === "running" || summary.state === "draining";
+      const processes =
+        withProcesses && live && pgid !== undefined
+          ? yield* groupMembers(this.fs, pgid, this.command.tty ?? false)
+          : [];
+      const result: ProcessResult = { ...summary, ...page };
+      return processes.length ? { ...result, processes } : result;
     });
   }
 
@@ -370,7 +474,7 @@ class Task {
         });
         yield* Effect.raceFirst(finished, updates);
       }
-      return yield* this.observe(cursor, "end");
+      return yield* this.observe(cursor, "end", true);
     });
   }
 
@@ -395,9 +499,10 @@ class Task {
    * through setsid, escape both this wait and group signals, as they do in Pi's own bash; only
    * their hold on the output pipes is bounded, by MAX_CAPTURE_AFTER_TREE_EXIT_MS.
    */
-  private waitForTreeExit(fs: FileSystem.FileSystem) {
+  private waitForTreeExit() {
     if (process.platform === "win32") return Deferred.await(this.exited).pipe(Effect.asVoid);
     const pid = this.child.pid;
+    const fs = this.fs;
     return Effect.gen(function* () {
       while (pid && (yield* groupAlive(fs, pid))) {
         yield* Effect.sleep(TERMINATION_POLL_INTERVAL_MS);
@@ -410,7 +515,7 @@ class Task {
    * finishes the session once its process group has exited and capture has ended. It then closes
    * `scope`, which holds the child process.
    */
-  monitor(fs: FileSystem.FileSystem, scope: Scope.Closeable) {
+  monitor(scope: Scope.Closeable) {
     return Effect.gen({ self: this }, function* () {
       const { child, output } = this;
       const terminated = Deferred.makeUnsafe<void>();
@@ -426,7 +531,7 @@ class Task {
       yield* Effect.forkChild(
         Deferred.await(this.killRequested).pipe(
           Effect.andThen(terminateTree(child, "SIGTERM")),
-          Effect.andThen(this.waitForTreeExit(fs).pipe(Effect.timeoutOption(TERMINATION_GRACE_MS))),
+          Effect.andThen(this.waitForTreeExit().pipe(Effect.timeoutOption(TERMINATION_GRACE_MS))),
           Effect.flatMap((exited) =>
             Option.isNone(exited) ? terminateTree(child, "SIGKILL") : Effect.void,
           ),
@@ -439,7 +544,7 @@ class Task {
           yield* Deferred.await(this.exited);
           // After KILL, members still in the group are zombies or unkillable; waiting longer
           // cannot help.
-          yield* Effect.raceFirst(this.waitForTreeExit(fs), Deferred.await(terminated));
+          yield* Effect.raceFirst(this.waitForTreeExit(), Deferred.await(terminated));
           yield* Deferred.succeed(treeExited, undefined);
           yield* Effect.sleep(MAX_CAPTURE_AFTER_TREE_EXIT_MS);
           yield* Deferred.succeed(captureDeadline, undefined);
@@ -503,6 +608,48 @@ class Task {
       yield* Deferred.succeed(this.finished, undefined);
     });
   }
+}
+
+// The shell reads the command from here, then removes it from the command's environment.
+const COMMAND_VARIABLE = "PI_BASH_COMMAND";
+const SHELL_VARIABLE = "PI_BASH_SHELL";
+export const TTY_COLUMNS = 200;
+export const TTY_ROWS = 50;
+
+/**
+ * How to start a command. The shell evaluates the command from the environment, so the command's
+ * text stays out of every argv: `pgrep -f` and `pkill -f` patterns written in a command would
+ * otherwise match the shell running it. A tty command runs under util-linux `script`, which runs
+ * this through $SHELL; the script restores the caller's SHELL before evaluating the command.
+ */
+function launcher(shell: { shell: string; args: string[] }, command: Command) {
+  const text = command.shellCommandPrefix
+    ? `${command.shellCommandPrefix}\n${command.command}`
+    : command.command;
+  const evaluate = `__pi_bash_command=$${COMMAND_VARIABLE}; unset ${COMMAND_VARIABLE}; eval "unset __pi_bash_command; $__pi_bash_command"`;
+  // Python output reaches the log as it is written, so sessions show progress.
+  const env: NodeJS.ProcessEnv = {
+    ...command.env,
+    TERM: "dumb",
+    NO_COLOR: "1",
+    FORCE_COLOR: "0",
+    PYTHONUNBUFFERED: "1",
+    [COMMAND_VARIABLE]: text,
+  };
+  if (!command.tty) return { file: shell.shell, args: [...shell.args, evaluate], env };
+  if (process.platform !== "linux") throw new Error("tty requires Linux and util-linux script");
+  const restoreShell = `if [ -n "\${${SHELL_VARIABLE}+set}" ]; then export SHELL="$${SHELL_VARIABLE}"; else unset SHELL; fi; unset ${SHELL_VARIABLE}`;
+  const sized = `stty cols ${TTY_COLUMNS} rows ${TTY_ROWS} 2>/dev/null`;
+  const { SHELL: callerShell, ...rest } = env;
+  return {
+    file: "script",
+    args: ["-qfec", `${restoreShell}; ${sized}; ${evaluate}`, "/dev/null"],
+    env: {
+      ...rest,
+      SHELL: shell.shell,
+      ...(callerShell === undefined ? {} : { [SHELL_VARIABLE]: callerShell }),
+    },
+  };
 }
 
 export const makeProcesses = Effect.gen(function* () {
@@ -609,24 +756,15 @@ export const makeProcesses = Effect.gen(function* () {
           const output = yield* Output.make(fs, path, taskScope);
           return yield* Effect.acquireRelease(
             Effect.try(() => {
-              const shellCommand = command.shellCommandPrefix
-                ? `${command.shellCommandPrefix}\n${command.command}`
-                : command.command;
-              const child = spawn(shell.shell, [...shell.args, shellCommand], {
+              const launch = launcher(shell, command);
+              const child = spawn(launch.file, launch.args, {
                 cwd: command.cwd,
-                // Python output reaches the log as it is written, so sessions show progress.
-                env: {
-                  ...command.env,
-                  TERM: "dumb",
-                  NO_COLOR: "1",
-                  FORCE_COLOR: "0",
-                  PYTHONUNBUFFERED: "1",
-                },
+                env: launch.env,
                 detached: process.platform !== "win32",
                 windowsHide: true,
                 stdio: ["pipe", "pipe", "pipe"],
               });
-              return new Task(id, command, child, output);
+              return new Task(id, command, child, output, fs);
             }),
             (task) =>
               terminateTree(task.child, "SIGKILL").pipe(
@@ -649,7 +787,7 @@ export const makeProcesses = Effect.gen(function* () {
         );
         tasks.set(id, task);
         // The monitor owns the task scope once the command has started.
-        yield* Effect.forkIn(task.monitor(fs, taskScope), scope);
+        yield* Effect.forkIn(task.monitor(taskScope), scope);
         return task;
       }).pipe(Effect.uninterruptible),
 
@@ -666,7 +804,7 @@ export const makeProcesses = Effect.gen(function* () {
 
     read: (id: string, cursor: number) =>
       checked(id, cursor).pipe(
-        Effect.flatMap((task) => task.observe(cursor, "cursor")),
+        Effect.flatMap((task) => task.observe(cursor, "cursor", true)),
         live(id),
       ),
 
@@ -715,10 +853,13 @@ export const makeProcesses = Effect.gen(function* () {
         live(id),
       ),
 
-    kill: (id: string, cursor: number) =>
+    /** Stops a session; `waitMs` bounds the wait for it to finish, which goes on regardless. */
+    kill: (id: string, cursor: number, waitMs?: number) =>
       checked(id, cursor).pipe(
-        Effect.tap((task) => task.kill()),
-        Effect.flatMap((task) => task.observe(cursor, "end")),
+        Effect.tap((task) =>
+          waitMs === undefined ? task.kill() : task.kill().pipe(Effect.timeoutOption(waitMs)),
+        ),
+        Effect.flatMap((task) => task.observe(cursor, "end", true)),
         live(id),
       ),
 
@@ -744,11 +885,11 @@ export const makeProcesses = Effect.gen(function* () {
 
     /** Sessions that still need the caller's attention. */
     pending: Effect.sync(() => {
-      const running: string[] = [];
-      const unreported: string[] = [];
+      const running: TaskSummary[] = [];
+      const unreported: TaskSummary[] = [];
       for (const task of tasks.values()) {
-        if (!task.isFinished) running.push(task.id);
-        else if (task.unreported) unreported.push(task.id);
+        if (!task.isFinished) running.push(task.summary());
+        else if (task.unreported) unreported.push(task.summary());
       }
       return { running, unreported };
     }),

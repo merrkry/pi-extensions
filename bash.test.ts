@@ -123,6 +123,9 @@ async function processSessions() {
 const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
 const javascript = (source: string) => `${quote(process.execPath)} -e ${quote(source)}`;
 
+const SESSION_ID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gu;
+const sessionIds = (text: string | undefined) => text?.match(SESSION_ID) ?? [];
+
 async function reminder() {
   const messages = await session.extensionRunner.emitContext([]);
   if (messages.length === 0) return undefined;
@@ -513,8 +516,19 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     "returns shortly after the shell exits and waits for background processes when polled",
     async () => {
       const started = performance.now();
-      const server = await bash("sleep 4 >/dev/null 2>&1 & printf started", 20_000);
+      const response = await execute("bash", {
+        command: "sleep 4 >/dev/null 2>&1 & printf started",
+        yield_time_ms: 20_000,
+      });
+      const server = response.structuredContent as ProcessResult;
       assert.equal(server.state, "draining");
+      if (process.platform === "linux") {
+        assert.deepEqual(
+          server.processes?.map((member) => member.command),
+          ["sleep 4"],
+        );
+        assert.match(text(response), /still running: pid \d+ sleep 4 \(sleeping in \w+\)/u);
+      }
       assert.ok(performance.now() - started < 3000);
       const finished = await poll(server as ProcessResult, { yield_time_ms: 20_000 });
       assert.equal(finished.state, "exited");
@@ -523,35 +537,98 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     LONG_TEST_TIMEOUT_MS,
   );
 
-  test("stops commands at their time limit and reports requested kills as successful", async () => {
-    const limited = await execute("bash", {
-      command: "printf started; sleep 30",
-      yield_time_ms: 0,
-      timeout_ms: 300,
-    });
-    assert.equal(limited.isError, undefined);
-    const task = limited.structuredContent as ProcessResult;
-    const response = await execute("process", {
-      action: "poll",
-      session_id: task.session_id,
-      yield_time_ms: 5000,
-    });
-    const stopped = response.structuredContent as ProcessResult;
-    assert.equal(stopped.state, "exited");
-    assert.equal(stopped.stopped_by, "timeout");
-    assert.equal(stopped.signal, "SIGTERM");
-    assert.equal(response.isError, true);
-    assert.match(text(response), /stopped by timeout_ms after 0 s, exited with code 143/u);
+  test(
+    "stops commands at their time limit and reports requested kills as successful",
+    async () => {
+      const limited = await execute("bash", {
+        command: "printf started; sleep 30",
+        yield_time_ms: 0,
+        timeout_ms: 300,
+      });
+      assert.equal(limited.isError, undefined);
+      const task = limited.structuredContent as ProcessResult;
+      const response = await execute("process", {
+        action: "poll",
+        session_id: task.session_id,
+        yield_time_ms: 5000,
+      });
+      const stopped = response.structuredContent as ProcessResult;
+      assert.equal(stopped.state, "exited");
+      assert.equal(stopped.stopped_by, "timeout");
+      assert.equal(stopped.signal, "SIGTERM");
+      assert.equal(response.isError, true);
+      assert.match(
+        text(response),
+        /stopped by timeout_ms at 0 s, exited with code 143 \(SIGTERM\) after 0 s; no processes remain/u,
+      );
 
-    const quick = await execute("bash", { command: "sleep 30", timeout_ms: 300 });
-    assert.equal(quick.isError, true);
-    assert.match(text(quick), /Command stopped by timeout_ms/u);
+      const quick = await execute("bash", { command: "sleep 30", timeout_ms: 300 });
+      assert.equal(quick.isError, true);
+      assert.match(text(quick), /Command stopped by timeout_ms at 0 s/u);
 
-    const running = await start("sleep 30");
-    const killed = await execute("process", { action: "kill", session_id: running.session_id });
-    assert.equal(killed.isError, undefined);
-    assert.equal((killed.structuredContent as ProcessResult).stopped_by, "kill");
-    assert.match(text(killed), /stopped by process kill, exited with code 143 \(SIGTERM\)/u);
+      const running = await start("sleep 30");
+      const killed = await execute("process", { action: "kill", session_id: running.session_id });
+      assert.equal(killed.isError, undefined);
+      assert.equal((killed.structuredContent as ProcessResult).stopped_by, "kill");
+      assert.match(text(killed), /stopped by process kill, exited with code 143 \(SIGTERM\)/u);
+
+      const stubborn = await start("trap '' TERM; sleep 30");
+      const stopping = await execute("process", {
+        action: "kill",
+        session_id: stubborn.session_id,
+        yield_time_ms: 100,
+      });
+      assert.equal((stopping.structuredContent as ProcessResult).state, "running");
+      assert.match(text(stopping), /stopping after process kill \(TERM, then KILL\)/u);
+      assert.equal((await poll(stubborn, { yield_time_ms: 10_000 })).signal, "SIGKILL");
+    },
+    LONG_TEST_TIMEOUT_MS,
+  );
+
+  test.skipIf(process.platform !== "linux")(
+    "keeps the command text out of process command lines",
+    async () => {
+      // The marker is unique, so only this command's own processes could contain it.
+      const marker = `marker-${Date.now()}`;
+      const pattern = `${marker.slice(0, -1)}[${marker.slice(-1)}]`;
+      const result = await bash(
+        `: ${marker}; cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\\0' '\\n' | grep -c '${pattern}'`,
+        5000,
+      );
+      assert.equal(result.output, "0\n");
+    },
+  );
+
+  test.skipIf(process.platform !== "linux")(
+    "runs tty commands in a terminal that receives typed Ctrl-C",
+    async () => {
+      const program = javascript(
+        "process.stdout.write(`tty:${process.stdin.isTTY} cols:${process.stdout.columns}\\n`); process.on('SIGINT',()=>{process.stdout.write('interrupted\\n');process.exit(0)}); setInterval(()=>{},1000)",
+      );
+      const response = await execute("bash", { command: program, yield_time_ms: 1000, tty: true });
+      const started = response.structuredContent as ProcessResult;
+      assert.match(started.output, /tty:true cols:200/u);
+      const stopped = await processAction({
+        action: "write",
+        session_id: started.session_id,
+        chars: "\u0003",
+        yield_time_ms: 5000,
+      });
+      assert.equal(stopped.state, "exited");
+      assert.equal(stopped.exit_code, 0);
+      assert.match(stopped.output, /interrupted/u);
+    },
+  );
+
+  test("shows only the last frame of lines redrawn with carriage returns", async () => {
+    const response = await execute("bash", {
+      command: "printf 'step 1\\rstep 2\\rdone\\nnext\\r'",
+    });
+    assert.equal(text(response), "done\nnext\r");
+    assert.equal(
+      (response.structuredContent as ProcessResult).output,
+      "step 1\rstep 2\rdone\nnext\r",
+    );
   });
 
   test.skipIf(process.platform !== "linux")(
@@ -717,17 +794,14 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
 
   test("terminates commands when their initial bash call is cancelled", async () => {
     const finished = async () =>
-      ((await reminder()) ?? "").match(/finished since last checked: ([^;.]*)/u)?.[1] ?? "";
+      sessionIds(((await reminder()) ?? "").split("finished since last checked:")[1]);
     const before = await finished();
     const aborted = new AbortController();
     const initial = execute("bash", { command: "sleep 30", yield_time_ms: 60_000 }, aborted.signal);
     setTimeout(() => aborted.abort(), 50);
     await assert.rejects(initial);
     // The final state never reached the model, so the reminder names the session.
-    assert.equal(
-      (await finished()).split(", ").filter(Boolean).length,
-      before.split(", ").filter(Boolean).length + 1,
-    );
+    assert.equal((await finished()).length, before.length + 1);
     assert.equal(
       (await processSessions()).some((task) => task.state === "running"),
       false,
@@ -749,8 +823,10 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
       );
       const ids = concurrent.map((task) => task.session_id);
       // Concurrent starts register in completion order.
-      const running = (await reminder())?.match(/^Bash sessions running: (.*)\.$/u)?.[1];
-      assert.deepEqual(running?.split(", ").sort(), ids.toSorted());
+      const running = await reminder();
+      assert.match(running ?? "", /^Bash sessions running: /u);
+      assert.match(running ?? "", /\(IFS= read -r line; printf completed, running for \d+ s\)/u);
+      assert.deepEqual(sessionIds(running).sort(), ids.toSorted());
 
       const [unreported, ...rest] = concurrent;
       await processAction({
@@ -771,9 +847,12 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
         }),
       );
       await vi.waitFor(async () =>
-        assert.equal(
-          await reminder(),
-          `Bash sessions finished since last checked: ${unreported!.session_id}.`,
+        assert.match(
+          (await reminder()) ?? "",
+          new RegExp(
+            `^Bash sessions finished since last checked: ${unreported!.session_id} \\(IFS= read -r line; printf completed, exited with code 0 after \\d+ s\\); poll them to see their final output\\.$`,
+            "u",
+          ),
         ),
       );
       // A rejected observation does not count as reporting the finish.
@@ -781,10 +860,7 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
         processAction({ action: "read", session_id: unreported!.session_id, cursor_bytes: 99 }),
         /between 0 and 9/u,
       );
-      assert.equal(
-        await reminder(),
-        `Bash sessions finished since last checked: ${unreported!.session_id}.`,
-      );
+      assert.deepEqual(sessionIds(await reminder()), [unreported!.session_id]);
       assert.equal((await poll(unreported!, { cursor_bytes: 0 })).output, "completed");
       assert.equal(await reminder(), undefined);
       assert.deepEqual(session.sessionManager.getEntries(), stored);

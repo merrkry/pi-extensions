@@ -11,8 +11,11 @@ import { delimiter, join } from "node:path";
 import { Type, type Static } from "typebox";
 import {
   MAX_REPORTED_SESSIONS,
+  type Member,
   makeProcesses,
   TERMINATION_GRACE_MS,
+  TTY_COLUMNS,
+  TTY_ROWS,
   type ProcessResult,
   type Processes,
   type TaskSummary,
@@ -34,6 +37,7 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const NOTABLE_IDLE_SECONDS = 10;
 const PAGE_LIMIT = `${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB`;
 const MAX_LISTED_COMMAND_CHARS = 200;
+const MAX_REMINDER_COMMAND_CHARS = 60;
 
 /** Waits above the cap are shortened rather than rejected, so an oversized wait costs no turn. */
 function waitTime(value: number | undefined, max: number): number {
@@ -65,33 +69,56 @@ type Observation = Omit<ProcessResult, "session_id" | "full_output_path"> &
 
 type Status = Pick<
   TaskSummary,
-  "state" | "exit_code" | "signal" | "stdin" | "stopped_by" | "runtime_seconds" | "idle_seconds"
->;
+  | "state"
+  | "exit_code"
+  | "signal"
+  | "stdin"
+  | "stopped_by"
+  | "runtime_seconds"
+  | "timeout_seconds"
+  | "idle_seconds"
+> & { processes?: Member[] };
 
-function stopNote(value: Pick<TaskSummary, "stopped_by" | "runtime_seconds">): string {
-  if (value.stopped_by === "kill") return "stopped by process kill, ";
-  if (value.stopped_by === "timeout") {
-    return `stopped by timeout_ms after ${value.runtime_seconds} s, `;
-  }
-  return "";
+const describeMembers = (members: Member[]) =>
+  members.map((member) => `pid ${member.pid} ${member.command} (${member.state})`).join(", ");
+
+/** Who stopped the session; the limit is stated as set, since the runtime goes on past it. */
+function stopper(value: Pick<TaskSummary, "stopped_by" | "timeout_seconds">): string {
+  if (value.stopped_by === "kill") return "process kill";
+  return `timeout_ms at ${value.timeout_seconds} s`;
 }
 
 function status(value: Status): string {
   const code = `code ${value.exit_code}${value.signal ? ` (${value.signal})` : ""}`;
   const runtime = `${value.runtime_seconds} s`;
+  const stopped = value.stopped_by ? `stopped by ${stopper(value)}, ` : "";
   switch (value.state) {
     case "running": {
       const notes = [`running for ${runtime}`];
+      if (value.stopped_by) {
+        notes.push(`stopping after ${stopper(value)} (TERM, then KILL)`);
+      } else if (value.timeout_seconds !== undefined) {
+        notes.push(`timeout_ms stops it at ${value.timeout_seconds} s`);
+      }
       if (value.idle_seconds >= NOTABLE_IDLE_SECONDS) {
         notes.push(`no output for ${value.idle_seconds} s`);
+        // A silent run is where the processes tell a hang from slow work.
+        if (value.processes?.length) notes.push(`processes: ${describeMembers(value.processes)}`);
       }
       if (value.stdin === "closed") notes.push("stdin closed");
       return notes.join(", ");
     }
-    case "draining":
-      return `${stopNote(value)}shell exited with ${code} after ${runtime}; processes it started in the background still run (poll waits for them, kill stops them)`;
+    case "draining": {
+      const remaining = value.processes?.length
+        ? describeMembers(value.processes)
+        : "processes it started in the background";
+      return `${stopped}shell exited with ${code} after ${runtime}; still running: ${remaining} (poll waits for them, kill stops them)`;
+    }
     case "exited":
-      return `${stopNote(value)}exited with ${code} after ${runtime}`;
+      // A stopped session's group has exited too, so nothing it started is left to check for.
+      return value.stopped_by
+        ? `${stopped}exited with ${code} after ${runtime}; no processes remain`
+        : `exited with ${code} after ${runtime}`;
     case "failed":
       return "failed to start";
   }
@@ -103,11 +130,15 @@ function failed(value: Observation): boolean {
   return Boolean(value.exit_code) && value.stopped_by !== "kill";
 }
 
-function firstLine(command: string): string {
+function firstLine(command: string, limit = MAX_LISTED_COMMAND_CHARS): string {
   const [line = ""] = command.split("\n", 1);
-  const shortened = line.length > MAX_LISTED_COMMAND_CHARS;
-  const more = shortened || line.length < command.length;
-  return `${line.slice(0, MAX_LISTED_COMMAND_CHARS)}${more ? " …" : ""}`;
+  const more = line.length > limit || line.length < command.length;
+  return `${line.slice(0, limit)}${more ? " …" : ""}`;
+}
+
+/** A session as the reminder names it: enough to recall the command without listing it. */
+function reminderEntry(task: TaskSummary): string {
+  return `${task.session_id} (${firstLine(task.command, MAX_REMINDER_COMMAND_CHARS)}, ${status(task)})`;
 }
 
 function inputNotes(value: Pick<ProcessResult, "input_error" | "input_refused">): string[] {
@@ -121,15 +152,32 @@ function inputNotes(value: Pick<ProcessResult, "input_error" | "input_refused">)
   return notes;
 }
 
+/**
+ * Keeps only the last state of lines redrawn with carriage returns, such as progress bars, which
+ * otherwise fill a page with frames. The log keeps every byte; terminal line ends stay.
+ */
+function collapseRedraws(text: string): string {
+  if (!text.includes("\r")) return text;
+  return text
+    .split("\n")
+    .map((line) => {
+      const ending = line.endsWith("\r") ? "\r" : "";
+      const frames = (ending ? line.slice(0, -1) : line).split("\r");
+      return `${frames.findLast((frame) => frame !== "") ?? ""}${ending}`;
+    })
+    .join("\n");
+}
+
 /** Renders output first, followed by the facts needed to continue from it. */
 function render(value: Observation, cursor: number, startedAt: number) {
-  const output = value.output || (cursor ? `(no output after byte ${cursor})` : "(no output)");
+  const shown = collapseRedraws(value.output);
+  const output = shown || (cursor ? `(no output after byte ${cursor})` : "(no output)");
   const notes = [];
   if (value.error) notes.push(value.error);
   notes.push(...inputNotes(value));
   if (value.session_id === undefined) {
     if (value.stopped_by === "timeout") {
-      notes.push(`Command stopped by timeout_ms after ${value.runtime_seconds} s`);
+      notes.push(`Command stopped by timeout_ms at ${value.timeout_seconds} s`);
     } else if (value.exit_code) {
       notes.push(`Command exited with code ${value.exit_code}`);
     }
@@ -260,7 +308,7 @@ const processParameters = Type.Object({
   yield_time_ms: Type.Optional(
     Type.Number({
       minimum: 0,
-      description: `poll and write: wait up to this long for the command to finish; it keeps running afterwards. Defaults to ${DEFAULT_WAIT_MS} ms, at most ${MAX_PROCESS_WAIT_MS} ms; 0 returns immediately.`,
+      description: `poll and write: wait up to this long for the command to finish; it keeps running afterwards. Defaults to ${DEFAULT_WAIT_MS} ms, at most ${MAX_PROCESS_WAIT_MS} ms; 0 returns immediately. kill: wait at most this long for the stop to finish; by default kill waits until it does.`,
     }),
   ),
   chars: Type.Optional(Type.String({ description: "write: text for stdin, including newlines." })),
@@ -276,7 +324,7 @@ const actionParameters: Record<ProcessParameters["action"], readonly string[]> =
   poll: ["session_id", "cursor_bytes", "yield_time_ms"],
   write: ["session_id", "cursor_bytes", "yield_time_ms", "chars", "eof"],
   read: ["session_id", "cursor_bytes"],
-  kill: ["session_id", "cursor_bytes"],
+  kill: ["session_id", "cursor_bytes", "yield_time_ms"],
 };
 
 function environment(ctx: ExtensionToolContext): NodeJS.ProcessEnv {
@@ -313,8 +361,12 @@ export default function (pi: ExtensionAPI): void {
     if (!runtime) return;
     const { running, unreported } = await run((await runtime).pending);
     const parts = [];
-    if (running.length) parts.push(`running: ${running.join(", ")}`);
-    if (unreported.length) parts.push(`finished since last checked: ${unreported.join(", ")}`);
+    if (running.length) parts.push(`running: ${running.map(reminderEntry).join(", ")}`);
+    if (unreported.length) {
+      parts.push(
+        `finished since last checked: ${unreported.map(reminderEntry).join(", ")}; poll them to see their final output`,
+      );
+    }
     if (!parts.length) return;
     return {
       messages: [
@@ -337,16 +389,17 @@ export default function (pi: ExtensionAPI): void {
     ...(piBash.promptSnippet ? { promptSnippet: piBash.promptSnippet } : {}),
     promptGuidelines: [
       ...(piBash.promptGuidelines ?? []),
-      "Before finishing, account for bash sessions: collect needed results, wait or stop as appropriate, and report anything intentionally left running.",
+      "A status reminder lists running bash sessions and finished ones whose final result you have not seen. Without a reminder no session needs attention, and finished sessions need no cleanup. Before finishing, handle the sessions it lists and report any you leave running on purpose.",
       `yield_time_ms only sets how long a call waits before returning; the command keeps running in its session. The call returns as soon as the command finishes, so set it near the expected runtime. bash waits at most ${MAX_BASH_WAIT_MS / 1000} s and process at most ${MAX_PROCESS_WAIT_MS / 1000} s per call.`,
       `To limit how long a command may run, set timeout_ms instead of using the timeout utility: it stops the whole process group, escalating from TERM to KILL after ${TERMINATION_GRACE_MS / 1000} s.`,
       "To watch a long-running program, start it with a short yield_time_ms, poll its session, and stop it with process kill. The session keeps all output and poll shows it as it arrives, so do not pipe long commands through tail or redirect their output to a file just to follow it.",
       "Tool calls in one response run concurrently and return together: put dependent steps in one command, and keep yield_time_ms short for calls batched with others.",
-      "A command's session stays draining while processes it started in its process group run, and Pi stops them when its session ends. Start a process that must outlive Pi, such as a server, with `setsid -f` and redirected output; it is then neither tracked nor stopped.",
-      "pkill -f and pgrep -f patterns also match the bash command line that contains them; match a pid file or the exact process name instead.",
+      "A command's session stays draining while processes it started in its process group run, and Pi stops them when its session ends. Start a process that must outlive Pi, such as a server, as a command of its own: `setsid -f cmd > log 2>&1 < /dev/null`; it is then neither tracked nor stopped. In `a && setsid cmd &`, the `&` backgrounds the whole list, leaving a bash wrapper in the session.",
+      "Drive programs that read stdin, such as REPLs, debuggers, and engines, by starting them once and sending each input with process write; prompts show in the output even without a trailing newline.",
+      "Python output is unbuffered in sessions. Other programs may hold output written to a pipe until they exit; use stdbuf -oL or their flush option to follow their progress.",
       "Output reads never consume output. poll, write, and kill continue after the output earlier results showed; pass cursor_bytes=0 to see it again.",
       `Only the ${MAX_REPORTED_SESSIONS} finished sessions whose final state was returned most recently keep their logs; save output needed later instead of relying on older sessions.`,
-      "Use a terminal multiplexer for programs that require terminal features.",
+      'For programs that need a terminal, such as full-screen tools, single-key prompts, or Ctrl-C, set tty: true. process write then types into the terminal: "\\u0003" sends Ctrl-C and "\\u0004" Ctrl-D, and typed input is echoed in the output.',
     ],
     parameters: Type.Object({
       command: piBash.parameters.properties.command,
@@ -362,6 +415,11 @@ export default function (pi: ExtensionAPI): void {
           maximum: MAX_TIMER_DELAY_MS,
           description:
             "Stop the command and its process group once it has run this long, also after this call has returned. No limit by default.",
+        }),
+      ),
+      tty: Type.Optional(
+        Type.Boolean({
+          description: `Run the command in a pseudo-terminal of ${TTY_COLUMNS} columns and ${TTY_ROWS} rows. Linux only. Defaults to false: stdin is a pipe.`,
         }),
       ),
     }),
@@ -386,6 +444,7 @@ export default function (pi: ExtensionAPI): void {
             ...(shellPath ? { shellPath } : {}),
             ...(shellCommandPrefix ? { shellCommandPrefix } : {}),
             ...(timeoutMs === undefined ? {} : { timeoutMs }),
+            ...(params.tty ? { tty: true } : {}),
           }),
           (task) =>
             manager.poll(
@@ -428,7 +487,10 @@ export default function (pi: ExtensionAPI): void {
       if (signal?.aborted) throw new Error("Process call aborted");
       for (const key of Object.keys(params)) {
         if (key !== "action" && !actionParameters[params.action].includes(key)) {
-          throw new Error(`${key} is not supported for action ${params.action}`);
+          const accepted = ["action", ...actionParameters[params.action]].join(", ");
+          throw new Error(
+            `${key} is not supported for action ${params.action}; it accepts ${accepted}`,
+          );
         }
       }
       const manager = await processes();
@@ -470,7 +532,14 @@ export default function (pi: ExtensionAPI): void {
             update,
           ),
         read: () => manager.read(id, cursor),
-        kill: () => manager.kill(id, cursor),
+        kill: () =>
+          manager.kill(
+            id,
+            cursor,
+            params.yield_time_ms === undefined
+              ? undefined
+              : waitTime(params.yield_time_ms, MAX_PROCESS_WAIT_MS),
+          ),
       }[params.action]();
       return reply(manager, await run(effect, signal), cursor, startedAt);
     },

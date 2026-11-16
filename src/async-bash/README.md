@@ -13,7 +13,9 @@ stopped.
   still running, which output it holds and how to get the rest, and whether
   written input may not have reached the command.
 - **No forgotten work.** The model is reminded of sessions that are still
-  running, and of finished sessions whose outcome it has not seen.
+  running, and of finished sessions whose outcome it has not seen, by command
+  and state. Without a reminder nothing is pending, and the prompt says so, so
+  the model does not check for sessions it never started.
 - **Nothing outlives Pi's session.** Commands and the processes they start end
   with Pi's session, and processes, logs, and memory stay bounded.
 - **Like Pi's own bash.** Short commands behave as in Pi's bash, with the same
@@ -32,23 +34,35 @@ stopped.
   processes it started keep the session open, so their output is captured and
   `kill` stops them. Processes that leave the group, e.g. through `setsid`, are
   out of scope, as in Pi's bash, and the prompt says so.
+- **The command's text stays out of every argv.** The shell evaluates the
+  command from an environment variable that it removes first. A `pkill -f` or
+  `pgrep -f` pattern in a command therefore never matches the shell running it;
+  in recorded runs, models killed their own shell this way despite a warning in
+  the prompt.
 - **Waits are capped, not rejected.** Models size waits as if they were time
   limits, e.g. 15 minutes for a script that hung after 10 seconds. `bash`
   waits at most 30 seconds and `process` at most 5 minutes, so a hang is
   noticed at the next result.
 - **`timeout_ms` stops the process group.** Models expect a time limit, and the
   `timeout` utility signals only its child, and escalates to KILL only with
-  `-k`, so a program that ignores TERM outlives it. The limit starts with the command, and expiry
-  escalates from TERM to KILL like `process kill`.
+  `-k`, so a program that ignores TERM outlives it. The limit starts with the
+  command, and expiry escalates from TERM to KILL like `process kill`. Results
+  state the limit while the command runs and while it is being stopped.
 - **A wait ends once the shell has exited.** It continues for two seconds, so
   short-lived descendants still report a final state; background processes
   that remain, such as a server started with `&`, then leave the session
   draining rather than holding the call to its full wait. A wait that starts
   while the session drains lasts until they exit.
-- **Results show runtime and silence.** A running session reports how long it
-  has run and how long it has gone without output, so a hang can be told from
-  slow progress. Python output is unbuffered for the same reason; other
-  programs may still buffer output to the pipe.
+- **Results show runtime, silence, and what remains.** A running session
+  reports how long it has run and how long it has gone without output. Once it
+  has been silent for 10 seconds, and whenever it drains, the result lists the
+  processes still running with the kernel function each waits in, so a run
+  blocked opening a FIFO can be told from one that sleeps. Python output is
+  unbuffered for the same reason; other programs may still buffer output to
+  the pipe.
+- **Carriage-return redraws show their last frame.** Progress bars that redraw
+  a line otherwise fill a page with frames. Only returned text is collapsed;
+  the log keeps every byte.
 - **Output is a log read by byte cursor.** Reading never consumes output, so a
   repeated or lost call loses nothing. `poll`, `write`, and `kill` continue
   after the output that returned results showed, and a cursor of 0 shows it
@@ -61,8 +75,12 @@ stopped.
 - **Input results report what was observed, not a delivery guarantee.**
   Refused input was not written. Input followed by a stdin failure may have
   been partly read.
-- **Stdin is a pipe, not a terminal.** Programs that need terminal features run
-  in an external terminal multiplexer.
+- **Stdin is a pipe unless `tty` is set.** With `tty`, the command runs in a
+  pseudo-terminal under util-linux `script`, so programs that need a terminal
+  run, and written input arrives as typed, including Ctrl-C. Codex offers the
+  same, and models chose it unprompted; without it they wrote their own pty
+  drivers or hunted for pids to signal. The command then runs in the
+  terminal's own session, which ends with the command's shell.
 - **Retention is bounded, not managed.** Sessions last until Pi's session ends.
   Only the 64 finished sessions whose outcome the model saw most recently
   are kept, and the prompt states this bound.
@@ -74,3 +92,6 @@ stopped.
   ([oven-sh/bun#45882](https://github.com/oven-sh/bun/issues/45882)).
 - Windows has no process groups: a session ends with its shell, and `kill`
   stops the process tree with `taskkill`.
+- `tty` needs Linux with util-linux `script`. Background processes a tty
+  command leaves in its terminal session are not tracked once its shell
+  exits.
