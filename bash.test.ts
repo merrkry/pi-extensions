@@ -512,6 +512,23 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     assert.equal(brief.output, "startedchild-result");
   });
 
+  test.skipIf(process.platform !== "linux")(
+    "lists the processes of a silent session, including a program that replaced the shell",
+    async () => {
+      const silent = await execute("bash", { command: "exec sleep 30", yield_time_ms: 11_000 });
+      assert.match(
+        text(silent),
+        /no output for 1\d s, processes: pid \d+ sleep 30 \(sleeping in \w+\)/u,
+      );
+      await execute("process", {
+        action: "kill",
+        session_id: (silent.structuredContent as ProcessResult).session_id,
+      });
+    },
+    // Processes are listed only after this many seconds of silence.
+    15_000,
+  );
+
   test(
     "returns shortly after the shell exits and waits for background processes when polled",
     async () => {

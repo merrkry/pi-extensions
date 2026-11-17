@@ -220,8 +220,8 @@ function parseStat(pid: number, text: string): ProcStat {
 
 /**
  * Processes still running in a session's process group, so a result can show what it waits on. The
- * shell running the command, the group leader, is left out, and subshells it forked are named as
- * such rather than by the launcher's argv. Linux only.
+ * shell running the command is left out, and subshells it forked are named as such rather than by
+ * the launcher's argv. Linux only.
  */
 function groupMembers(fs: FileSystem.FileSystem, pgid: number) {
   if (process.platform !== "linux") return Effect.succeed([] as Member[]);
@@ -236,13 +236,18 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number) {
     const members: Member[] = [];
     for (const stat of stats) {
       if (members.length === MAX_LISTED_MEMBERS) break;
-      if (stat.pgrp !== pgid || stat.pid === pgid) continue;
+      if (stat.pgrp !== pgid) continue;
       const cmdline = yield* fs
         .readFileString(`/proc/${stat.pid}/cmdline`)
         .pipe(Effect.orElseSucceed(() => ""));
       const argv = cmdline.split("\0").filter(Boolean).join(" ");
       let command = argv || stat.name;
-      if (argv.includes(COMMAND_VARIABLE)) command = `${stat.name} (subshell of the command)`;
+      if (argv.includes(COMMAND_VARIABLE)) {
+        // The group leader still running the launcher is the shell; one a command replaced with
+        // exec is the program and is listed.
+        if (stat.pid === pgid) continue;
+        command = `${stat.name} (subshell of the command)`;
+      }
       if (command.length > MAX_MEMBER_COMMAND_CHARS) {
         command = `${command.slice(0, MAX_MEMBER_COMMAND_CHARS)} …`;
       }

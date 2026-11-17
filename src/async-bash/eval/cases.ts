@@ -53,6 +53,8 @@ export interface Case {
   check: (run: Run) => Promise<Check[]>;
 }
 
+const BEAT_MS = 100;
+
 /** Agents name their shell tools differently. */
 export const SHELL_TOOLS = new Set(["bash", "exec_command"]);
 export const SESSION_TOOLS = new Set(["process", "write_stdin"]);
@@ -60,11 +62,22 @@ export const SESSION_TOOLS = new Set(["process", "write_stdin"]);
 /**
  * Fixtures record their pids, so checks can tell which are alive and cleanup can stop them, and
  * record digests of per-run values that answers must contain. Digests keep the values useless to
- * a model that finds the state directory.
+ * a model that finds the state directory. While a fixture runs, a thread touches its pid file every
+ * `BEAT_MS`, so checks can tell when it stopped, even when it is blocked or Pi stopped it on exit.
  */
-const register = (name: string) => `import hashlib, os
+const register = (name: string) => `import hashlib, os, threading, time
 _STATE = os.environ["EVAL_STATE"]
-open(os.path.join(_STATE, "pids", f"${name}.{os.getpid()}"), "w").close()
+_PID_FILE = os.path.join(_STATE, "pids", f"${name}.{os.getpid()}")
+open(_PID_FILE, "w").close()
+
+
+def _beat():
+    while True:
+        os.utime(_PID_FILE)
+        time.sleep(${BEAT_MS / 1000})
+
+
+threading.Thread(target=_beat, daemon=True).start()
 
 
 def record(key, value):
@@ -127,23 +140,43 @@ const within = (run: Run, seconds: number) =>
     `${Math.round(run.wallSeconds)} s`,
   );
 
-const leavesNothing = async (run: Run, name: string) =>
-  check(`leaves no ${name} behind`, (await livePids(run, name)).length === 0);
+/**
+ * Whether the model ran fixture `name` and every run of it had stopped before the model started
+ * its answer. Pi stops its sessions when it exits, after the answer, so being gone at check time
+ * proves nothing; a fixture still running while the answer is generated keeps beating past its
+ * start.
+ */
+async function stoppedBeforeAnswer(run: Run, name: string): Promise<Check> {
+  const label = `ran ${name} and stopped it before answering`;
+  const files = await readdir(join(run.stateDirectory, "pids"));
+  const beats: number[] = [];
+  for (const file of files.filter((entry) => entry.startsWith(`${name}.`))) {
+    beats.push((await stat(join(run.stateDirectory, "pids", file))).mtimeMs);
+  }
+  if (beats.length === 0) return check(label, false, "never ran");
+  const answer = run.answerStartedAt;
+  return check(label, answer !== undefined && beats.every((beat) => beat < answer));
+}
 
 const unchanged = async (run: Run, name: string, source: string) =>
   check(`${name} is unchanged`, (await contentOf(run, name)) === source);
 
 /**
- * Shell results ended by a signal the model did not send through process kill or timeout_ms,
- * e.g. a pkill -f pattern that matched the command's own shell.
+ * Commands ended by a signal the model did not send through process kill or timeout_ms, e.g. a
+ * pkill -f pattern that matched the command's own shell. A command still running when its first
+ * call returned shows its exit in a session call, possibly in several; each session counts once.
  */
 export function unrequestedSignalExits(calls: ToolCall[]): number {
-  return calls.filter(
-    (call) =>
-      SHELL_TOOLS.has(call.name) &&
-      /exited with code (?:137|143)\b/u.test(call.text) &&
-      !/stopped by/u.test(call.text),
-  ).length;
+  const commands = new Set<unknown>();
+  for (const call of calls) {
+    if (!/exited with code (?:137|143)\b/u.test(call.text) || /stopped by/u.test(call.text)) {
+      continue;
+    }
+    if (SHELL_TOOLS.has(call.name)) commands.add(call);
+    else if (SESSION_TOOLS.has(call.name))
+      commands.add(`session ${String(call.args["session_id"])}`);
+  }
+  return commands.size;
 }
 
 const STOPPED_EARLY =
@@ -222,21 +255,17 @@ print(f"final loss: {loss:.3f}")
     check: async (run) => [
       within(run, 90),
       check("reports that the run hangs", STOPPED_EARLY.test(plain(run.finalText))),
-      check("leaves no run behind", (await livePids(run, "train")).length === 0),
+      await stoppedBeforeAnswer(run, "train"),
     ],
   },
   {
     name: "watch-and-stop",
     budgetSeconds: 300,
     files: {
-      "emulator.py": `${register("emulator")}import time
-
-HEARTBEAT = os.path.join(_STATE, "heartbeat")
-time.sleep(4)
+      "emulator.py": `${register("emulator")}time.sleep(4)
 while True:
     with open("frame.ppm", "wb") as frame:
         frame.write(b"P6 1 1 255\\n\\0\\0\\0")
-    open(HEARTBEAT, "w").close()
     time.sleep(0.1)
 `,
     },
@@ -246,19 +275,13 @@ while True:
       const numbers = [...run.finalText.matchAll(/\d+(?:\.\d+)?/gu)].map(([value]) =>
         Number(value),
       );
-      // The heartbeat lives outside the working directory, which the model may clean up.
-      const beat = await stat(join(run.stateDirectory, "heartbeat")).catch(() => undefined);
-      const stoppedBeforeAnswer =
-        beat !== undefined &&
-        run.answerStartedAt !== undefined &&
-        beat.mtimeMs < run.answerStartedAt;
       return [
         within(run, 45),
         check(
           "reports 3 to 6 seconds",
           numbers.some((value) => value >= 3 && value <= 6),
         ),
-        check("stopped the emulator before answering", stoppedBeforeAnswer),
+        await stoppedBeforeAnswer(run, "emulator"),
       ];
     },
   },
@@ -338,7 +361,7 @@ for stage in (parse, index, query, report):
     check: async (run) => [
       within(run, 60),
       check("names the stage that does not finish", /\bquery\b/iu.test(run.finalText)),
-      check("leaves no run behind", (await livePids(run, "bench")).length === 0),
+      await stoppedBeforeAnswer(run, "bench"),
     ],
   },
   {
@@ -381,7 +404,7 @@ while True:
         check("reached service ready", ready !== undefined && failed === undefined),
         check("reports the token", await matches(run, "token", run.finalText)),
         await unchanged(run, "service.py", SERVICE),
-        await leavesNothing(run, "service"),
+        await stoppedBeforeAnswer(run, "service"),
       ];
     },
   },
@@ -434,7 +457,7 @@ open(os.path.join(os.environ["EVAL_STATE"], "secrets", "content"), "w").write(ha
           await matches(run, "content", answer),
           answer,
         ),
-        await leavesNothing(run, "unarc"),
+        await stoppedBeforeAnswer(run, "unarc"),
       ];
     },
   },
@@ -450,7 +473,7 @@ open(os.path.join(os.environ["EVAL_STATE"], "secrets", "content"), "w").write(ha
         within(run, 90),
         check("code.txt holds the unlock code", await matches(run, "code", written), written),
         await unchanged(run, "console.py", CONSOLE),
-        await leavesNothing(run, "console"),
+        await stoppedBeforeAnswer(run, "console"),
       ];
     },
   },
@@ -493,7 +516,7 @@ except KeyboardInterrupt:
         within(run, 60),
         check("summary.json written after 5 s or more", valid, raw),
         check("reports the mean", reported),
-        await leavesNothing(run, "collector"),
+        await stoppedBeforeAnswer(run, "collector"),
       ];
     },
   },
@@ -571,7 +594,7 @@ print(f"\\ndone, sha256 {digest}")
       return [
         within(run, 90),
         check("reports the sha256", await matches(run, "sha256", run.finalText)),
-        await leavesNothing(run, "fetch"),
+        await stoppedBeforeAnswer(run, "fetch"),
       ];
     },
   },
