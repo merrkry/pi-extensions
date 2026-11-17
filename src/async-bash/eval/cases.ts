@@ -180,7 +180,10 @@ export function unrequestedSignalExits(calls: ToolCall[]): number {
       continue;
     }
     if (SHELL_TOOLS.has(call.name)) commands.add(call);
-    else if (SESSION_TOOLS.has(call.name) && !killed.has(session)) commands.add(session);
+    // A list names no session, and every session it shows was seen through another call.
+    else if (SESSION_TOOLS.has(call.name) && session !== undefined && !killed.has(session)) {
+      commands.add(session);
+    }
   }
   return commands.size;
 }

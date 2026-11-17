@@ -610,6 +610,23 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
   );
 
   test.skipIf(process.platform !== "linux")(
+    "ends the time limit once the process group has exited",
+    async () => {
+      // The detached loop leaves the group but keeps writing to the output past the limit.
+      const response = await execute("bash", {
+        command:
+          "setsid -f sh -c 'while :; do echo; sleep 0.02; done & sleep 0.9; kill $!'; printf done",
+        timeout_ms: 500,
+        yield_time_ms: 5000,
+      });
+      const result = response.structuredContent as ProcessResult;
+      assert.equal(result.exit_code, 0);
+      assert.equal(result.stopped_by, undefined);
+      assert.equal(response.isError, undefined);
+    },
+  );
+
+  test.skipIf(process.platform !== "linux")(
     "keeps the command text out of process command lines",
     async () => {
       // The marker is unique, so only this command's own processes could contain it.

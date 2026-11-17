@@ -517,8 +517,13 @@ class Task {
 
       const timeoutMs = this.command.timeoutMs;
       if (timeoutMs !== undefined) {
+        // The limit covers the process group. Output still arriving from processes that left it,
+        // e.g. through setsid, is not the command running past its limit.
         yield* Effect.forkChild(
-          Effect.sleep(timeoutMs).pipe(Effect.andThen(this.requestStop("timeout"))),
+          Effect.raceFirst(
+            Effect.sleep(timeoutMs).pipe(Effect.andThen(this.requestStop("timeout"))),
+            Deferred.await(treeExited),
+          ),
         );
       }
       yield* Effect.forkChild(
