@@ -611,13 +611,11 @@ function launcher(shell: { shell: string; args: string[] }, command: Command) {
     ? `${command.shellCommandPrefix}\n${command.command}`
     : command.command;
   const evaluate = `__pi_bash_command=$${COMMAND_VARIABLE}; unset ${COMMAND_VARIABLE}; eval "unset __pi_bash_command; $__pi_bash_command"`;
-  // Python output reaches the log as it is written, so sessions show progress.
   const env: NodeJS.ProcessEnv = {
     ...command.env,
     TERM: "dumb",
     NO_COLOR: "1",
     FORCE_COLOR: "0",
-    PYTHONUNBUFFERED: "1",
     [COMMAND_VARIABLE]: text,
   };
   return { file: shell.shell, args: [...shell.args, evaluate], env };

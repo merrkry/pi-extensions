@@ -23,12 +23,11 @@ import {
 // that do not need the result pass 0.
 const DEFAULT_WAIT_MS = 5_000;
 /**
- * Caps how long one call holds control. Models size waits as if they were time limits, so a hung
- * command could otherwise block for as long as they guessed. The first wait is shorter: a call
- * returning while the command runs is when a hang can still be noticed cheaply.
+ * Caps how long one call holds control. Models size waits to the work they expect, and nearly all
+ * long waits end early because the command finishes; the cap bounds the rare wait sized as a time
+ * limit on a command that hangs. Cancelling a call ends only its wait.
  */
-const MAX_BASH_WAIT_MS = 30_000;
-const MAX_PROCESS_WAIT_MS = 300_000;
+const MAX_WAIT_MS = 1_800_000;
 // Node and Bun timers cap delays at the largest signed 32-bit integer.
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 // Runs without output this long are worth pointing out; shorter pauses are ordinary.
@@ -38,12 +37,12 @@ const MAX_LISTED_COMMAND_CHARS = 200;
 const MAX_REMINDER_COMMAND_CHARS = 60;
 
 /** Waits above the cap are shortened rather than rejected, so an oversized wait costs no turn. */
-function waitTime(value: number | undefined, max: number): number {
+function waitTime(value: number | undefined): number {
   const duration = value ?? DEFAULT_WAIT_MS;
   if (!Number.isFinite(duration) || duration < 0) {
     throw new Error("yield_time_ms must be a finite, non-negative number of milliseconds");
   }
-  return Math.min(duration, max);
+  return Math.min(duration, MAX_WAIT_MS);
 }
 
 function timeLimit(value: number | undefined): number | undefined {
@@ -122,10 +121,14 @@ function status(value: Status): string {
   }
 }
 
-/** A requested kill is the outcome the model asked for, not a failure. */
+/**
+ * A requested kill is the outcome the model asked for, not a failure. A timeout is one even when
+ * the shell exits cleanly, e.g. after backgrounding the work the limit stopped.
+ */
 function failed(value: Observation): boolean {
   if (value.error || value.input_error || value.input_refused) return true;
-  return Boolean(value.exit_code) && value.stopped_by !== "kill";
+  if (value.stopped_by) return value.stopped_by === "timeout";
+  return Boolean(value.exit_code);
 }
 
 function firstLine(command: string, limit = MAX_LISTED_COMMAND_CHARS): string {
@@ -306,7 +309,7 @@ const processParameters = Type.Object({
   yield_time_ms: Type.Optional(
     Type.Number({
       minimum: 0,
-      description: `poll and write: wait up to this long for the command to finish; it keeps running afterwards. Defaults to ${DEFAULT_WAIT_MS} ms, at most ${MAX_PROCESS_WAIT_MS} ms; 0 returns immediately. kill: wait at most this long for the stop to finish; by default kill waits until it does.`,
+      description: `poll and write: wait up to this long for the command to finish; it keeps running afterwards. Defaults to ${DEFAULT_WAIT_MS} ms, at most ${MAX_WAIT_MS} ms; 0 returns immediately. kill: wait at most this long for the stop to finish; by default kill waits until it does.`,
     }),
   ),
   chars: Type.Optional(Type.String({ description: "write: text for stdin, including newlines." })),
@@ -388,23 +391,23 @@ export default function (pi: ExtensionAPI): void {
     promptGuidelines: [
       ...(piBash.promptGuidelines ?? []),
       "A status reminder lists running bash sessions and finished ones whose final result you have not seen. Without a reminder no session needs attention, and finished sessions need no cleanup. Before finishing, handle the sessions it lists and report any you leave running on purpose.",
-      `yield_time_ms only sets how long a call waits before returning; the command keeps running in its session. The call returns as soon as the command finishes, so set it near the expected runtime. bash waits at most ${MAX_BASH_WAIT_MS / 1000} s and process at most ${MAX_PROCESS_WAIT_MS / 1000} s per call.`,
+      `yield_time_ms only sets how long a call waits before returning; the command keeps running in its session. The call returns as soon as the command finishes, so set it near the expected runtime. A call waits at most ${MAX_WAIT_MS / 60_000} minutes.`,
       `To limit how long a command may run, set timeout_ms instead of using the timeout utility: it stops the whole process group, escalating from TERM to KILL after ${TERMINATION_GRACE_MS / 1000} s.`,
       "To watch a long-running program, start it with a short yield_time_ms, poll its session, and stop it with process kill. The session keeps all output and poll shows it as it arrives, so do not pipe long commands through tail or redirect their output to a file just to follow it.",
       "Tool calls in one response run concurrently and return together: put dependent steps in one command, and keep yield_time_ms short for calls batched with others.",
       "A command's session stays draining while processes it started in its process group run, and Pi stops them when its session ends. Start a process that must outlive Pi, such as a server, as a command of its own: `setsid -f cmd > log 2>&1 < /dev/null`; it is then neither tracked nor stopped. In `a && setsid cmd &`, the `&` backgrounds the whole list, leaving a bash wrapper in the session.",
       "Drive programs that read stdin, such as REPLs, debuggers, and engines, by starting them once and sending each input with process write; prompts show in the output even without a trailing newline.",
-      "Python output is unbuffered in sessions. Other programs may hold output written to a pipe until they exit; use stdbuf -oL or their flush option to follow their progress.",
+      "Programs may hold output written to a pipe until they exit; to follow their progress, use stdbuf -oL, python -u, or their flush option.",
       "Output reads never consume output. poll, write, and kill continue after the output earlier results showed; pass cursor_bytes=0 to see it again.",
       `Only the ${MAX_REPORTED_SESSIONS} finished sessions whose final state was returned most recently keep their logs; save output needed later instead of relying on older sessions.`,
-      "Commands have no terminal: stdin is a pipe. Run a program that requires a terminal under a pseudo-terminal, e.g. with script(1) or a terminal multiplexer. To interrupt a program as Ctrl-C would, send SIGINT to its pid with kill -INT.",
+      "Commands have no terminal: stdin is a pipe. Run a program that requires a terminal under a pseudo-terminal, e.g. with script(1) or a terminal multiplexer. To interrupt a program as Ctrl-C would, send SIGINT to the program's own pid, e.g. from pgrep or the process list in results, with kill -INT; the session's shell does not pass it on.",
     ],
     parameters: Type.Object({
       command: piBash.parameters.properties.command,
       yield_time_ms: Type.Optional(
         Type.Number({
           minimum: 0,
-          description: `Wait up to this long for the command to finish; it keeps running afterwards. Defaults to ${DEFAULT_WAIT_MS} ms, at most ${MAX_BASH_WAIT_MS} ms; 0 returns immediately.`,
+          description: `Wait up to this long for the command to finish; it keeps running afterwards. Defaults to ${DEFAULT_WAIT_MS} ms, at most ${MAX_WAIT_MS} ms; 0 returns immediately.`,
         }),
       ),
       timeout_ms: Type.Optional(
@@ -422,34 +425,34 @@ export default function (pi: ExtensionAPI): void {
     ...(piBash.renderResult ? { renderResult: piBash.renderResult } : {}),
     async execute(_id, params, signal, onUpdate, ctx) {
       const startedAt = performance.now();
-      const wait = waitTime(params.yield_time_ms, MAX_BASH_WAIT_MS);
+      const wait = waitTime(params.yield_time_ms);
       const timeoutMs = timeLimit(params.timeout_ms);
       if (!params.command.trim()) throw new Error("command must not be empty");
       if (signal?.aborted) throw new Error("Bash call aborted");
       const manager = await processes();
       const { shellPath, shellCommandPrefix } = pi.getSettings();
       const value = await run(
-        Effect.acquireUseRelease(
-          manager.start({
+        // Cancelling the call ends only its wait: the session keeps running, and the reminder
+        // names it, since its ID never reached the model.
+        manager
+          .start({
             command: params.command,
             cwd: ctx.cwd,
             env: environment(ctx),
             ...(shellPath ? { shellPath } : {}),
             ...(shellCommandPrefix ? { shellCommandPrefix } : {}),
             ...(timeoutMs === undefined ? {} : { timeoutMs }),
-          }),
-          (task) =>
-            manager.poll(
-              task.id,
-              wait,
-              0,
-              onUpdate ? (update) => onUpdate(render(update, 0, startedAt)) : undefined,
+          })
+          .pipe(
+            Effect.flatMap((task) =>
+              manager.poll(
+                task.id,
+                wait,
+                0,
+                onUpdate ? (update) => onUpdate(render(update, 0, startedAt)) : undefined,
+              ),
             ),
-          (task, exit) =>
-            Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)
-              ? manager.kill(task.id, 0).pipe(Effect.ignore)
-              : Effect.void,
-        ),
+          ),
         signal,
       );
       if (
@@ -512,14 +515,13 @@ export default function (pi: ExtensionAPI): void {
         ? (value: ProcessResult) => onUpdate(render(value, cursor, startedAt))
         : undefined;
       const effect = {
-        poll: () =>
-          manager.poll(id, waitTime(params.yield_time_ms, MAX_PROCESS_WAIT_MS), cursor, update),
+        poll: () => manager.poll(id, waitTime(params.yield_time_ms), cursor, update),
         write: () =>
           manager.write(
             id,
             params.chars ?? "",
             params.eof ?? false,
-            waitTime(params.yield_time_ms, MAX_PROCESS_WAIT_MS),
+            waitTime(params.yield_time_ms),
             cursor,
             update,
           ),
@@ -528,9 +530,7 @@ export default function (pi: ExtensionAPI): void {
           manager.kill(
             id,
             cursor,
-            params.yield_time_ms === undefined
-              ? undefined
-              : waitTime(params.yield_time_ms, MAX_PROCESS_WAIT_MS),
+            params.yield_time_ms === undefined ? undefined : waitTime(params.yield_time_ms),
           ),
       }[params.action]();
       return reply(manager, await run(effect, signal), cursor, startedAt);

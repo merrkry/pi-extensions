@@ -124,7 +124,7 @@ const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
 const javascript = (source: string) => `${quote(process.execPath)} -e ${quote(source)}`;
 
 const SESSION_ID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gu;
-const sessionIds = (text: string | undefined) => text?.match(SESSION_ID) ?? [];
+const sessionIds = (text: string | undefined): string[] => text?.match(SESSION_ID) ?? [];
 
 async function reminder() {
   const messages = await session.extensionRunner.emitContext([]);
@@ -171,9 +171,9 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
   );
 
   test("uses Pi shell settings, session environment, and working directory", async () => {
-    const command = 'printf \'%s:%s:%s\' "$BASH_CHECK_PREFIX" "$PI_SESSION_ID" "$PYTHONUNBUFFERED"';
+    const command = 'printf \'%s:%s\' "$BASH_CHECK_PREFIX" "$PI_SESSION_ID"';
     const env = await bash(command, 1000);
-    assert.equal(env.output, `present:${session.sessionId}:1`, JSON.stringify(env));
+    assert.equal(env.output, `present:${session.sessionId}`, JSON.stringify(env));
     assert.equal(env.command, command);
     const cwd = await bash(javascript("process.stdout.write(process.cwd())"), 1000);
     assert.equal(cwd.output, directory);
@@ -565,6 +565,13 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
       const quick = await execute("bash", { command: "sleep 30", timeout_ms: 300 });
       assert.equal(quick.isError, true);
       assert.match(text(quick), /Command stopped by timeout_ms at 0 s/u);
+      // A command that exits cleanly on TERM still did not finish within its limit.
+      const graceful = await execute("bash", {
+        command: "trap 'exit 0' TERM; sleep 30 & wait",
+        timeout_ms: 300,
+      });
+      assert.equal((graceful.structuredContent as ProcessResult).exit_code, 0);
+      assert.equal(graceful.isError, true);
 
       const running = await start("sleep 30");
       const killed = await execute("process", { action: "kill", session_id: running.session_id });
@@ -771,20 +778,30 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     );
   });
 
-  test("terminates commands when their initial bash call is cancelled", async () => {
-    const finished = async () =>
-      sessionIds(((await reminder()) ?? "").split("finished since last checked:")[1]);
-    const before = await finished();
+  test("keeps commands running when their initial bash call is cancelled", async () => {
+    const running = async () =>
+      sessionIds(
+        ((await reminder()) ?? "").split("Bash sessions running:")[1]?.split("finished since")[0],
+      );
+    const before = await running();
     const aborted = new AbortController();
-    const initial = execute("bash", { command: "sleep 30", yield_time_ms: 60_000 }, aborted.signal);
+    const initial = execute(
+      "bash",
+      { command: "IFS= read -r line", yield_time_ms: 60_000 },
+      aborted.signal,
+    );
     setTimeout(() => aborted.abort(), 50);
     await assert.rejects(initial);
-    // The final state never reached the model, so the reminder names the session.
-    assert.equal((await finished()).length, before.length + 1);
-    assert.equal(
-      (await processSessions()).some((task) => task.state === "running"),
-      false,
-    );
+    // The session ID never reached the model, so the reminder names the session.
+    const [id] = (await running()).filter((item) => !before.includes(item));
+    assert.ok(id);
+    const done = await processAction({
+      action: "write",
+      session_id: id,
+      chars: "go\n",
+      yield_time_ms: 5000,
+    });
+    assert.equal(done.state, "exited");
   });
 
   test(

@@ -39,10 +39,12 @@ stopped.
   `pgrep -f` pattern in a command therefore never matches the shell running it;
   in recorded runs, models killed their own shell this way despite a warning in
   the prompt.
-- **Waits are capped, not rejected.** Models size waits as if they were time
-  limits, e.g. 15 minutes for a script that hung after 10 seconds. `bash`
-  waits at most 30 seconds and `process` at most 5 minutes, so a hang is
-  noticed at the next result.
+- **Waits are capped, not rejected.** Models size waits to the work they
+  expect, and in recorded runs nearly every wait over 30 seconds ended early
+  because the command finished. Some waits are sized as time limits, e.g. 15
+  minutes for a script that hung after 10 seconds, so a call waits at most 30
+  minutes. Cancelling a call, e.g. with Esc, ends only its wait; the command
+  keeps running, and the reminder names its session.
 - **`timeout_ms` stops the process group.** Models expect a time limit, and the
   `timeout` utility signals only its child, and escalates to KILL only with
   `-k`, so a program that ignores TERM outlives it. The limit starts with the
@@ -57,9 +59,8 @@ stopped.
   reports how long it has run and how long it has gone without output. Once it
   has been silent for 10 seconds, and whenever it drains, the result lists the
   processes still running with the kernel function each waits in, so a run
-  blocked opening a FIFO can be told from one that sleeps. Python output is
-  unbuffered for the same reason; other programs may still buffer output to
-  the pipe.
+  blocked opening a FIFO can be told from one that sleeps, even when the
+  program buffers its output to the pipe.
 - **Carriage-return redraws show their last frame.** Progress bars that redraw
   a line otherwise fill a page with frames. Only returned text is collapsed;
   the log keeps every byte.
