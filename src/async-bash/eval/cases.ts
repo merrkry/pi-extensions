@@ -22,8 +22,12 @@ export interface Run {
   wallSeconds: number;
   calls: ToolCall[];
   finalText: string;
-  /** When the final answer was recorded, in milliseconds since the epoch. */
-  finalAt: number | undefined;
+  /**
+   * When the agent started its final answer, in milliseconds since the epoch: the last tool
+   * result before it, so anything the agent stopped had stopped by then. Undefined when no tool
+   * returned before the answer.
+   */
+  answerStartedAt: number | undefined;
   /** Fixture processes the runner started before the agent. */
   setupPids: number[];
 }
@@ -245,7 +249,9 @@ while True:
       // The heartbeat lives outside the working directory, which the model may clean up.
       const beat = await stat(join(run.stateDirectory, "heartbeat")).catch(() => undefined);
       const stoppedBeforeAnswer =
-        beat !== undefined && run.finalAt !== undefined && beat.mtimeMs < run.finalAt;
+        beat !== undefined &&
+        run.answerStartedAt !== undefined &&
+        beat.mtimeMs < run.answerStartedAt;
       return [
         within(run, 45),
         check(

@@ -1,7 +1,7 @@
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { Duration, Effect, Fiber, FileSystem, Option, Stream } from "effect";
 import { ChildProcess } from "effect/process";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -175,15 +175,18 @@ function attempt(agent: Agent, testCase: Case, index: number, out: string) {
           Effect.ignore,
         ),
       );
+      // The attempt's scope owns each fixture's process group from the start, so an attempt
+      // interrupted before a fixture registers still stops it.
       for (const script of testCase.setup ?? []) {
-        yield* Effect.sync(() =>
-          spawn("python3", [script], {
-            cwd: workdir,
-            env: { ...process.env, ...env },
-            detached: true,
-            stdio: "ignore",
-          }).unref(),
-        );
+        yield* ChildProcess.make("python3", [script], {
+          cwd: workdir,
+          env: { ...process.env, ...env },
+          extendEnv: false,
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          forceKillAfter: Duration.seconds(1),
+        });
       }
       const setupPids = yield* Effect.promise(async () => {
         const expected = testCase.setup?.length ?? 0;
@@ -222,11 +225,19 @@ function attempt(agent: Agent, testCase: Case, index: number, out: string) {
         setupPids,
         calls: transcript.calls,
         finalText: transcript.finalText,
-        finalAt: transcript.finalAt,
+        answerStartedAt: transcript.answerStartedAt,
       };
       // Let processes the agent stopped on exit finish dying before checks look at them.
       yield* Effect.sleep(Duration.seconds(1));
-      const checks = yield* Effect.promise(() => testCase.check(run));
+      // Checks read files the agent left behind, so a malformed one fails the attempt, not the eval.
+      const checks = yield* Effect.tryPromise({
+        try: () => testCase.check(run),
+        catch: (cause) => (cause instanceof Error ? cause.message : JSON.stringify(cause)),
+      }).pipe(
+        Effect.catch((detail) =>
+          Effect.succeed<Check[]>([{ name: "checks ran", ok: false, detail }]),
+        ),
+      );
 
       let debrief: string | undefined;
       if (options.debrief) {

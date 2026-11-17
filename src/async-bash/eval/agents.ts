@@ -18,7 +18,8 @@ export interface Transcript {
   file: string;
   calls: ToolCall[];
   finalText: string;
-  finalAt: number | undefined;
+  /** See `Run.answerStartedAt`. */
+  answerStartedAt: number | undefined;
 }
 
 export interface AgentOptions {
@@ -136,7 +137,8 @@ export function pi(options: AgentOptions): Agent {
         const file = yield* onlyFile(fs, join(home, "sessions"));
         const calls = new Map<string, ToolCall>();
         let finalText = "";
-        let finalAt: number | undefined;
+        let answerStartedAt: number | undefined;
+        let lastResultAt: number | undefined;
         for (const entry of parseLines(yield* fs.readFileString(file))) {
           const message = entry["message"] as Record<string, unknown> | undefined;
           if (entry["type"] !== "message" || !message || !Array.isArray(message["content"])) {
@@ -157,9 +159,10 @@ export function pi(options: AgentOptions): Agent {
             const text = textOf(content);
             if (text.trim()) {
               finalText = text;
-              finalAt = Date.parse(String(entry["timestamp"]));
+              answerStartedAt = lastResultAt;
             }
           } else if (message["role"] === "toolResult") {
+            lastResultAt = Date.parse(String(entry["timestamp"]));
             const call = calls.get(String(message["toolCallId"]));
             if (!call) continue;
             call.text = textOf(content);
@@ -167,7 +170,7 @@ export function pi(options: AgentOptions): Agent {
             call.seconds = Number(message["durationMs"] ?? 0) / 1000;
           }
         }
-        return { file, calls: [...calls.values()], finalText, finalAt };
+        return { file, calls: [...calls.values()], finalText, answerStartedAt };
       }),
     debrief: (home, transcript, prompt) => ({
       command: process.execPath,
@@ -260,7 +263,8 @@ export function codex(options: AgentOptions): Agent {
         const file = yield* onlyFile(fs, join(home, "sessions"));
         const calls = new Map<string, ToolCall>();
         let finalText = "";
-        let finalAt: number | undefined;
+        let answerStartedAt: number | undefined;
+        let lastResultAt: number | undefined;
         for (const line of parseLines(yield* fs.readFileString(file))) {
           if (line["type"] !== "response_item") continue;
           const item = line["payload"] as Record<string, unknown>;
@@ -279,6 +283,7 @@ export function codex(options: AgentOptions): Agent {
               seconds: 0,
             });
           } else if (type === "function_call_output" || type === "custom_tool_call_output") {
+            lastResultAt = Date.parse(String(line["timestamp"]));
             const call = calls.get(String(item["call_id"]));
             if (!call) continue;
             const output = item["output"];
@@ -291,11 +296,11 @@ export function codex(options: AgentOptions): Agent {
             const text = textOf(item["content"]);
             if (text.trim()) {
               finalText = text;
-              finalAt = Date.parse(String(line["timestamp"]));
+              answerStartedAt = lastResultAt;
             }
           }
         }
-        return { file, calls: [...calls.values()], finalText, finalAt };
+        return { file, calls: [...calls.values()], finalText, answerStartedAt };
       }),
     debrief: (home, transcript, prompt) => {
       const thread = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/u.exec(
