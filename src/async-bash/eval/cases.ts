@@ -143,8 +143,8 @@ const within = (run: Run, seconds: number) =>
 /**
  * Whether the model ran fixture `name` and every run of it had stopped before the model started
  * its answer. Pi stops its sessions when it exits, after the answer, so being gone at check time
- * proves nothing; a fixture still running while the answer is generated keeps beating past its
- * start.
+ * proves nothing. A fixture still running when the answer starts beats again before Pi exits:
+ * generating an answer takes far longer than `BEAT_MS`, at least 0.8 s in recorded runs.
  */
 async function stoppedBeforeAnswer(run: Run, name: string): Promise<Check> {
   const label = `ran ${name} and stopped it before answering`;
@@ -165,16 +165,22 @@ const unchanged = async (run: Run, name: string, source: string) =>
  * Commands ended by a signal the model did not send through process kill or timeout_ms, e.g. a
  * pkill -f pattern that matched the command's own shell. A command still running when its first
  * call returned shows its exit in a session call, possibly in several; each session counts once.
+ * Kills are recognized by the call rather than its result text, which differs between builds.
  */
 export function unrequestedSignalExits(calls: ToolCall[]): number {
+  const killed = new Set<unknown>();
   const commands = new Set<unknown>();
   for (const call of calls) {
-    if (!/exited with code (?:137|143)\b/u.test(call.text) || /stopped by/u.test(call.text)) {
+    const session = call.args["session_id"];
+    if (call.name === "process" && call.args["action"] === "kill") killed.add(session);
+    if (
+      !/exited with code (?:137|143)\b/u.test(call.text) ||
+      /stopped by timeout_ms/u.test(call.text)
+    ) {
       continue;
     }
     if (SHELL_TOOLS.has(call.name)) commands.add(call);
-    else if (SESSION_TOOLS.has(call.name))
-      commands.add(`session ${String(call.args["session_id"])}`);
+    else if (SESSION_TOOLS.has(call.name) && !killed.has(session)) commands.add(session);
   }
   return commands.size;
 }
