@@ -256,7 +256,6 @@ function attempt(agent: Agent, testCase: Case, index: number, out: string, exten
       for (const directory of [workdir, stateDirectory, home]) {
         yield* fs.makeDirectory(directory, { mode: 0o700 });
       }
-      yield* fs.makeDirectory(join(stateDirectory, "secrets"));
       yield* fs.makeDirectory(join(stateDirectory, "started"));
       yield* agent.prepare(home);
       for (const [name, content] of Object.entries(testCase.files)) {
