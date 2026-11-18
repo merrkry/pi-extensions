@@ -2,7 +2,7 @@ import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { Duration, Effect, Fiber, FileSystem, Option, Stream } from "effect";
 import { ChildProcess } from "effect/process";
 import { execFileSync } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { readdir, readFile, readlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { createServer } from "node:net";
@@ -178,22 +178,21 @@ const bubblewrap = (() => {
 
 const nodeInstallation = resolve(process.execPath, "../..");
 
+/** What attempts share: the extension under test, and host paths hidden from them. */
+interface Sandbox {
+  extension: string;
+  hidden: string[];
+}
+
 /**
- * Hides the home directory, /tmp, the eval's sources and Git history, and results, including `out`
- * wherever it is, from the agent, so an attempt sees neither the cases' answers, earlier attempts, nor
- * credentials beyond its own, which models otherwise go looking for. The attempt's directory, the
- * repository and Node installation the agent runs from, and the extension under test stay visible.
+ * Hides the home directory, /tmp, and the sandbox's hidden paths from the agent, so an attempt sees
+ * neither the cases' answers, earlier attempts, nor credentials beyond its own, which models
+ * otherwise go looking for. The attempt's directory, the repository and Node installation the agent
+ * runs from, and the extension under test stay visible.
  */
-function sandboxed(
-  invocation: Invocation,
-  root: string,
-  extension: string,
-  out: string,
-): Invocation {
-  const hidden = [
-    ...["src/async-bash/eval", ".eval", ".dev", ".git"].map((path) => join(repository, path)),
-    out,
-  ]
+function sandboxed(invocation: Invocation, root: string, sandbox: Sandbox): Invocation {
+  const { extension } = sandbox;
+  const hidden = sandbox.hidden
     .filter((path) => existsSync(path))
     // A worktree's .git is a file.
     .flatMap((path) =>
@@ -261,12 +260,17 @@ const invoke = (
       const stderr = yield* Stream.mkString(Stream.decodeText(child.stderr)).pipe(
         Effect.forkScoped,
       );
-      const exit = yield* child.exitCode.pipe(Effect.timeoutOption(budget));
+      // A signal ends the agent without an exit code, which fails exitCode.
+      const exit = yield* child.exitCode.pipe(
+        Effect.map((code) => code === 0),
+        Effect.orElseSucceed(() => false),
+        Effect.timeoutOption(budget),
+      );
       if (Option.isNone(exit)) {
         yield* child.kill({ killSignal: "SIGTERM", forceKillAfter: AGENT_TERMINATION_GRACE });
       }
       return {
-        finished: Option.isSome(exit),
+        finished: Option.getOrElse(exit, () => false),
         stdout: yield* Fiber.join(stdout),
         stderr: yield* Fiber.join(stderr),
       };
@@ -281,7 +285,7 @@ function attempt(
   testCase: Case,
   index: number,
   out: string,
-  extension: string,
+  sandbox: Sandbox,
   redact: Redact,
 ) {
   return Effect.scoped(
@@ -326,7 +330,7 @@ function attempt(
 
       const started = performance.now();
       const turn = yield* invoke(
-        sandboxed(agent.start(home, workdir, testCase.prompt(port)), root, extension, out),
+        sandboxed(agent.start(home, workdir, testCase.prompt(port)), root, sandbox),
         workdir,
         env,
         Duration.seconds(testCase.budgetSeconds),
@@ -373,7 +377,7 @@ function attempt(
       if (options.debrief) {
         const invocation = agent.debrief(home, transcript, DEBRIEF_PROMPT);
         const reply = yield* invoke(
-          sandboxed(invocation, root, extension, out),
+          sandboxed(invocation, root, sandbox),
           workdir,
           env,
           DEBRIEF_BUDGET,
@@ -426,12 +430,13 @@ const main = Effect.gen(function* () {
   }
   const extension = join(staged, basename(built));
   const modelsCache = yield* fs.makeTempDirectoryScoped({ prefix: "async-bash-eval-models-" });
+  const auth = resolve(options.auth);
   const agentOptions = {
     provider: options.provider,
     model: options.model,
     thinking: options.thinking,
     key: yield* Effect.promise(() =>
-      providerKey(resolve(options.auth), options.provider, join(modelsCache, "models.json")),
+      providerKey(auth, options.provider, join(modelsCache, "models.json")),
     ),
     extension,
     baseUrl: options["base-url"],
@@ -449,6 +454,16 @@ const main = Effect.gen(function* () {
   const stamp = new Date().toISOString().replaceAll(/[:.]/gu, "-");
   const out = resolve(options.out ?? join(repository, ".eval/async-bash", stamp));
   yield* fs.makeDirectory(out, { recursive: true });
+  const sandbox: Sandbox = {
+    extension,
+    hidden: [
+      ...["src/async-bash/eval", ".eval", ".dev", ".git"].map((path) => join(repository, path)),
+      out,
+      // Holds other providers' credentials, wherever --auth points.
+      auth,
+      realpathSync(auth),
+    ],
+  };
 
   const redact: Redact = (text) => text.replaceAll(agentOptions.key, "[API key]");
   const attempts = chosen.flatMap((testCase) =>
@@ -457,7 +472,18 @@ const main = Effect.gen(function* () {
   const results = yield* Effect.forEach(
     attempts,
     ({ testCase, index }) =>
-      attempt(agent, testCase, index, out, extension, redact).pipe(
+      attempt(agent, testCase, index, out, sandbox, redact).pipe(
+        // One attempt's failure, e.g. an agent that left no transcript, leaves the others to run.
+        Effect.catch((error) =>
+          Effect.succeed<Result>({
+            case: testCase.name,
+            attempt: index,
+            passed: false,
+            checks: [{ name: "attempt ran", ok: false, detail: redact(String(error)) }],
+            metrics: {},
+            transcript: "",
+          }),
+        ),
         Effect.tap((result) =>
           Effect.sync(() => console.error(summarize([result]).split("\n")[0])),
         ),

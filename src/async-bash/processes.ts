@@ -212,7 +212,6 @@ const PROCESS_STATES: Record<string, string> = {
   D: "waiting on I/O",
   T: "stopped",
   t: "stopped",
-  Z: "defunct",
   I: "idle",
 };
 
@@ -374,6 +373,8 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | u
     const members: Member[] = [];
     for (const stat of yield* groupStats(fs, pgid)) {
       if (members.length === MAX_LISTED_MEMBERS) break;
+      // A zombie has exited; only its parent's wait remains, which kill cannot shorten.
+      if (stat.state === "Z") continue;
       const cmdline = yield* fs
         .readFileString(`/proc/${stat.pid}/cmdline`)
         .pipe(Effect.orElseSucceed(() => ""));

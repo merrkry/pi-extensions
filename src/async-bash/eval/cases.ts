@@ -18,7 +18,7 @@ export interface Run {
   /** Holds `started/`, where fixtures mark their start. */
   stateDirectory: string;
   port: number;
-  /** Whether the agent exited on its own within the case's budget. */
+  /** Whether the agent exited successfully on its own within the case's budget. */
   finished: boolean;
   wallSeconds: number;
   calls: ToolCall[];
@@ -155,13 +155,12 @@ const plain = (text: string) => text.replaceAll(/[*_`]/gu, "");
 /**
  * Valid rows per shard; an epoch computes for 2 s per 100 of them before it prints anything, so
  * silence alone shows no hang. Each shard has a few malformed rows, and shard 4 enough that the
- * loader's warnings, about 94 KB, fill the stderr pipe, 64 KiB by default on kernels with 4 KiB
- * pages, which train.py reads only after stdout ends: the two wait on each other until something
- * drains the pipe or stops them.
+ * loader's warnings fill half again the host's default pipe, here stderr, which train.py reads
+ * only after stdout ends: the two wait on each other until something drains the pipe or stops
+ * them.
  */
 const SHARD_ROWS = [200, 700, 100, 200, 300, 500, 200, 400, 300, 200, 100, 300];
 const HUNG_SHARD = 4;
-const MALFORMED_ROWS = 1300;
 
 const TRAIN = `${START_MARKER}import signal, subprocess
 
@@ -220,14 +219,17 @@ export const cases: Case[] = [
       "train.py": TRAIN,
       "loader.py": LOADER,
     },
-    prepare: `import os, random
+    prepare: `import fcntl, os, random
 os.makedirs("data")
+F_GETPIPE_SZ = 1032
+pipe = os.pipe()
+malformed = fcntl.fcntl(pipe[1], F_GETPIPE_SZ) * 3 // 2 // 60
 names = []
 for shard, count in enumerate(${JSON.stringify(SHARD_ROWS)}, 1):
     name = f"shard-{shard:02d}"
     names.append(name)
     values = [f"{random.random() / shard:.4f}" for _ in range(count)]
-    values += ["NA"] * (${MALFORMED_ROWS} if shard == ${HUNG_SHARD} else 2)
+    values += ["NA"] * (malformed if shard == ${HUNG_SHARD} else 2)
     random.shuffle(values)
     open(f"data/{name}.csv", "w").write("\\n".join(values) + "\\n")
 open("data/shards.txt", "w").write("\\n".join(names) + "\\n")
@@ -286,8 +288,10 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
         within(run, 30),
         check("server answers after Pi exits", health === "200 ok", health),
         check(
-          "requested /health",
-          run.calls.some((call) => JSON.stringify(call.args).includes("/health")),
+          "saw /health answer ok",
+          run.calls.some(
+            (call) => JSON.stringify(call.args).includes("/health") && /^ok\b/mu.test(call.text),
+          ),
         ),
         check("no call waited 4 s or more", slowest < 4, `${Math.round(slowest)} s`),
         check("used at most 6 tool calls", run.calls.length <= 6, `${run.calls.length}`),

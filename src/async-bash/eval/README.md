@@ -94,8 +94,8 @@ nothing.
 - **Source:** hf-model-inference and kv-store-grpc, where
   `cd /app && setsid nohup server &` left a wrapper subshell that held each call
   for its whole wait, followed by turns spent on the session's state.
-- **Checks:** within 30 s and 6 calls, no call of 4 s or more, requested
-  `/health`, the server answers 200 `ok` after the agent exits.
+- **Checks:** within 30 s and 6 calls, no call of 4 s or more, saw `/health`
+  answer `ok`, and the server still answers 200 `ok` after the agent exits.
 
 `results.json` also records metrics per attempt: wall time, tool calls, shell
 and session calls, the slowest call, kilobytes of tool results, uses of the

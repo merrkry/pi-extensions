@@ -276,6 +276,9 @@ const summaryFields = {
     }),
   ),
   stdin: Type.Union([Type.Literal("open"), Type.Literal("closed")]),
+  timeout_seconds: Type.Optional(
+    Type.Number({ description: "The time limit timeout_ms set, when one was set." }),
+  ),
   total_bytes: Type.Number({ description: "UTF-8 bytes of combined output logged so far." }),
   runtime_seconds: Type.Number({ description: "Since the command started, until it finished." }),
   idle_seconds: Type.Number({
@@ -288,6 +291,18 @@ const summaryFields = {
 
 const processOutput = Type.Object({
   ...summaryFields,
+  processes: Type.Optional(
+    Type.Array(Type.Object({ pid: Type.Number(), command: Type.String(), state: Type.String() }), {
+      description:
+        "Linux: up to a few processes still running in the session's process group, with what each waits on; empty once the group has exited.",
+    }),
+  ),
+  quiet_seconds: Type.Optional(
+    Type.Number({
+      description:
+        "Linux: set when the wait ended early because the command had no output, CPU, or I/O for this long.",
+    }),
+  ),
   input_refused: Type.Optional(
     Type.String({ description: "write: why this call wrote no input." }),
   ),
