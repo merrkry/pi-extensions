@@ -25,6 +25,18 @@ const TERMINATION_POLL_INTERVAL_MS = 100;
  * of holding it to its limit.
  */
 const SHELL_EXIT_GRACE_MS = MAX_CAPTURE_AFTER_TREE_EXIT_MS + 1_000;
+/**
+ * A wait ends early once it has seen the command produce no output while its processes used no CPU
+ * or I/O for this long: a stalled command needs a decision, and a long wait sized for slow work
+ * would otherwise hide it until the wait runs out. It ends early once per quiet stretch, so a wait
+ * the caller repeats on purpose runs its full length. Linux only.
+ */
+export const QUIET_WAKE_MS = 30_000;
+const ACTIVITY_SAMPLE_INTERVAL_MS = 1_000;
+// CPU use below this share of one core, e.g. a background thread's periodic timer, counts as quiet.
+const QUIET_CPU_SHARE = 0.01;
+// Linux reports CPU time in USER_HZ, which is 100 on every architecture Node supports.
+const CLOCK_TICKS_PER_SECOND = 100;
 
 /**
  * Finished sessions kept once their final state has been returned; starting a command removes
@@ -101,6 +113,8 @@ export type ProcessResult = TaskSummary &
     input_refused?: string;
     /** Up to a few processes still running in the group, where procfs shows them. */
     processes?: Member[];
+    /** Set when the wait ended early because the command was quiet this long; see QUIET_WAKE_MS. */
+    quiet_seconds?: number;
   };
 
 function terminateTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals) {
@@ -198,24 +212,138 @@ const PROCESS_STATES: Record<string, string> = {
   I: "idle",
 };
 
+/**
+ * What common kernel wait channels mean for a blocked command; others show by their kernel name.
+ * Names differ between kernel versions, so several map to one meaning.
+ */
+const WAIT_CHANNELS: Record<string, string> = {
+  wait_for_partner: "opening a FIFO that no process has opened from the other end",
+  pipe_read: "reading from a pipe",
+  anon_pipe_read: "reading from a pipe",
+  pipe_wait_readable: "reading from a pipe",
+  pipe_write: "writing to a full pipe",
+  anon_pipe_write: "writing to a full pipe",
+  pipe_wait_writable: "writing to a full pipe",
+  do_wait: "waiting for a child process to exit",
+  kernel_wait4: "waiting for a child process to exit",
+  hrtimer_nanosleep: "sleeping on a timer",
+  do_nanosleep: "sleeping on a timer",
+  futex_wait_queue: "waiting on a lock or condition variable",
+  futex_wait_queue_me: "waiting on a lock or condition variable",
+  futex_do_wait: "waiting on a lock or condition variable",
+  do_select: "waiting for I/O in select",
+  do_sys_poll: "waiting for I/O in poll",
+  poll_schedule_timeout: "waiting for I/O in select or poll",
+  do_epoll_wait: "waiting for I/O in epoll",
+  ep_poll: "waiting for I/O in epoll",
+  inet_csk_accept: "waiting for a network connection",
+  sk_wait_data: "reading from a socket",
+  unix_stream_read_generic: "reading from a socket",
+  unix_stream_data_wait: "reading from a socket",
+  n_tty_read: "reading from a terminal",
+  locks_lock_inode_wait: "waiting for a file lock",
+  flock_lock_inode_wait: "waiting for a file lock",
+  posix_lock_inode_wait: "waiting for a file lock",
+  sigsuspend: "waiting for a signal",
+  do_sigtimedwait: "waiting for a signal",
+};
+
+/**
+ * System calls that read from the file descriptor in their first argument, by the numbers
+ * /proc/<pid>/syscall reports: read, readv, pread64, splice, copy_file_range, recvfrom, and recvmsg.
+ * Other architectures skip the check for reads from stdin.
+ */
+const READ_SYSCALLS: Partial<Record<NodeJS.Architecture, ReadonlySet<number>>> = {
+  x64: new Set([0, 19, 17, 275, 326, 45, 47]),
+  arm64: new Set([63, 65, 67, 76, 285, 207, 212]),
+};
+
 type ProcStat = {
   pid: number;
   name: string;
   state: string;
   ppid: number;
   pgrp: number;
+  /** CPU time in clock ticks, including that of children it has reaped. */
+  cpuTicks: number;
 };
 
 function parseStat(pid: number, text: string): ProcStat {
-  // The fields after the parenthesized command name start with state, ppid, and pgrp.
-  const [state = "", ppid, pgrp] = text.slice(text.lastIndexOf(")") + 2).split(" ");
+  // The fields after the parenthesized command name start with state, ppid, and pgrp; utime,
+  // stime, cutime, and cstime are the 12th to 15th.
+  const fields = text.slice(text.lastIndexOf(")") + 2).split(" ");
+  const [state = "", ppid, pgrp] = fields;
   return {
     pid,
     name: text.slice(text.indexOf("(") + 1, text.lastIndexOf(")")),
     state,
     ppid: Number(ppid),
     pgrp: Number(pgrp),
+    cpuTicks: fields.slice(11, 15).reduce((sum, value) => sum + Number(value), 0),
   };
+}
+
+/** The processes in a process group, as procfs shows them. Linux only. */
+function groupStats(fs: FileSystem.FileSystem, pgid: number) {
+  return Effect.gen(function* () {
+    const entries = yield* fs.readDirectory("/proc").pipe(Effect.orElseSucceed(() => []));
+    const stats: ProcStat[] = [];
+    for (const entry of entries) {
+      if (!/^\d+$/u.test(entry)) continue;
+      const text = yield* fs.readFileString(`/proc/${entry}/stat`).pipe(Effect.option);
+      if (Option.isNone(text)) continue;
+      const stat = parseStat(Number(entry), text.value);
+      if (stat.pgrp === pgid) stats.push(stat);
+    }
+    return stats;
+  });
+}
+
+/** What a process group has done so far: which processes it has, their CPU time, and their I/O. */
+type Activity = { at: number; pids: string; cpuTicks: number; ioBytes: number };
+
+function sampleActivity(fs: FileSystem.FileSystem, pgid: number) {
+  return Effect.gen(function* () {
+    const stats = yield* groupStats(fs, pgid);
+    let ioBytes = 0;
+    for (const stat of stats) {
+      // rchar and wchar count bytes passed through read and write calls, including pipes and
+      // sockets; procfs hides them for processes the caller may not trace.
+      const io = yield* fs
+        .readFileString(`/proc/${stat.pid}/io`)
+        .pipe(Effect.orElseSucceed(() => ""));
+      for (const match of io.matchAll(/^[rw]char: (\d+)$/gmu)) ioBytes += Number(match[1]);
+    }
+    return {
+      at: performance.now(),
+      pids: stats.map((stat) => stat.pid).join(","),
+      cpuTicks: stats.reduce((sum, stat) => sum + stat.cpuTicks, 0),
+      ioBytes,
+    } satisfies Activity;
+  });
+}
+
+/** Whether the group did anything between two samples, beyond the CPU use QUIET_CPU_SHARE allows. */
+function active(before: Activity, after: Activity) {
+  const allowedTicks = ((after.at - before.at) / 1000) * CLOCK_TICKS_PER_SECOND * QUIET_CPU_SHARE;
+  return (
+    before.pids !== after.pids ||
+    after.ioBytes !== before.ioBytes ||
+    after.cpuTicks - before.cpuTicks > allowedTicks
+  );
+}
+
+/** Whether a process is blocked in a read from file descriptor 0. Linux on x64 and arm64 only. */
+function readsStdin(fs: FileSystem.FileSystem, pid: number) {
+  const reads = READ_SYSCALLS[process.arch];
+  if (reads === undefined) return Effect.succeed(false);
+  return fs.readFileString(`/proc/${pid}/syscall`).pipe(
+    Effect.map((text) => {
+      const [number, fd] = text.trim().split(" ");
+      return reads.has(Number(number)) && Number(fd) === 0;
+    }),
+    Effect.orElseSucceed(() => false),
+  );
 }
 
 /**
@@ -226,17 +354,9 @@ function parseStat(pid: number, text: string): ProcStat {
 function groupMembers(fs: FileSystem.FileSystem, pgid: number) {
   if (process.platform !== "linux") return Effect.succeed([] as Member[]);
   return Effect.gen(function* () {
-    const entries = yield* fs.readDirectory("/proc").pipe(Effect.orElseSucceed(() => []));
-    const stats: ProcStat[] = [];
-    for (const entry of entries) {
-      if (!/^\d+$/u.test(entry)) continue;
-      const text = yield* fs.readFileString(`/proc/${entry}/stat`).pipe(Effect.option);
-      if (Option.isSome(text)) stats.push(parseStat(Number(entry), text.value));
-    }
     const members: Member[] = [];
-    for (const stat of stats) {
+    for (const stat of yield* groupStats(fs, pgid)) {
       if (members.length === MAX_LISTED_MEMBERS) break;
-      if (stat.pgrp !== pgid) continue;
       const cmdline = yield* fs
         .readFileString(`/proc/${stat.pid}/cmdline`)
         .pipe(Effect.orElseSucceed(() => ""));
@@ -256,7 +376,18 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number) {
         const channel = yield* fs
           .readFileString(`/proc/${stat.pid}/wchan`)
           .pipe(Effect.orElseSucceed(() => ""));
-        if (channel && channel !== "0") state = `${state} in ${channel.trim()}`;
+        const name = channel.trim();
+        if (name && name !== "0") state = WAIT_CHANNELS[name] ?? `${state} in ${name}`;
+        // A program reading stdin waits for input that only the model can send. The session's
+        // stdin stays open, so the wait never ends otherwise.
+        if (yield* readsStdin(fs, stat.pid)) {
+          const session = yield* fs.readLink(`/proc/${pgid}/fd/0`).pipe(Effect.option);
+          const own = yield* fs.readLink(`/proc/${stat.pid}/fd/0`).pipe(Effect.option);
+          state =
+            Option.isSome(session) && Option.isSome(own) && session.value === own.value
+              ? "waiting for input on the session's stdin, which process write sends and eof closes"
+              : "waiting for input on its stdin";
+        }
       }
       members.push({ pid: stat.pid, command, state });
     }
@@ -292,6 +423,8 @@ class Task {
   private shown = 0;
   /** Bytes written to stdin and not yet flushed; Bun leaves `writableLength` at zero. */
   queuedInput = 0;
+  /** Whether a wait already ended for the quiet stretch the command is in; see QUIET_WAKE_MS. */
+  private quietReported = false;
 
   constructor(
     readonly id: string,
@@ -433,9 +566,41 @@ class Task {
   }
 
   /**
-   * Waits until the command finishes, `until` completes, or `waitMs` elapses. A wait that starts
-   * while the shell runs also ends shortly after the shell exits, leaving any background processes
-   * draining; a wait that starts while they drain lasts until they exit.
+   * Completes with the quiet stretch's length once this wait has seen the command quiet for
+   * QUIET_WAKE_MS, unless an earlier wait already ended for the same stretch. Output or activity
+   * starts a new stretch.
+   */
+  private quietStretch(waitMs: number) {
+    const pgid = this.child.pid;
+    if (process.platform !== "linux" || pgid === undefined || waitMs <= QUIET_WAKE_MS) {
+      return Effect.never;
+    }
+    return Effect.gen({ self: this }, function* () {
+      let previous = yield* sampleActivity(this.fs, pgid);
+      let since = previous.at;
+      let outputBytes = this.output.totalBytes;
+      while (true) {
+        yield* Effect.sleep(ACTIVITY_SAMPLE_INTERVAL_MS);
+        const sample = yield* sampleActivity(this.fs, pgid);
+        if (this.output.totalBytes !== outputBytes || active(previous, sample)) {
+          outputBytes = this.output.totalBytes;
+          since = sample.at;
+          this.quietReported = false;
+        }
+        previous = sample;
+        if (!this.quietReported && sample.at - since >= QUIET_WAKE_MS) {
+          this.quietReported = true;
+          return seconds(sample.at - since);
+        }
+      }
+    });
+  }
+
+  /**
+   * Waits until the command finishes, `until` completes, the command goes quiet, or `waitMs`
+   * elapses. A wait that starts while the shell runs also ends shortly after the shell exits,
+   * leaving any background processes draining; a wait that starts while they drain lasts until
+   * they exit.
    */
   wait(
     waitMs: number,
@@ -448,9 +613,20 @@ class Task {
         this.phase.tag === "running"
           ? Deferred.await(this.exited).pipe(Effect.andThen(Effect.sleep(SHELL_EXIT_GRACE_MS)))
           : Effect.never;
-      const finished = Effect.raceAllFirst([Deferred.await(this.finished), shellExit, until]).pipe(
-        Effect.timeoutOption(waitMs),
+      let quietSeconds: number | undefined;
+      const quiet = this.quietStretch(waitMs).pipe(
+        Effect.tap((value) =>
+          Effect.sync(() => {
+            quietSeconds = value;
+          }),
+        ),
       );
+      const finished = Effect.raceAllFirst([
+        Deferred.await(this.finished),
+        shellExit,
+        until,
+        quiet,
+      ]).pipe(Effect.timeoutOption(waitMs));
       if (!onUpdate) {
         yield* finished;
       } else {
@@ -467,7 +643,12 @@ class Task {
         });
         yield* Effect.raceFirst(finished, updates);
       }
-      return yield* this.observe(cursor, "end", true);
+      const result = yield* this.observe(cursor, "end", true);
+      // A command that finished as the wait ended was not stalled.
+      const live = result.state === "running" || result.state === "draining";
+      return quietSeconds !== undefined && live
+        ? { ...result, quiet_seconds: quietSeconds }
+        : result;
     });
   }
 

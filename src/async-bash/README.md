@@ -45,9 +45,17 @@ stopped.
   minutes for a script that hung after 10 seconds, so a call waits at most 30
   minutes. Cancelling a call, e.g. with Esc, ends only its wait; the command
   keeps running, and the reminder names its session.
+- **A long wait ends when the command goes quiet.** Once a wait has seen 30
+  seconds without output, while the command's processes used no CPU and did
+  no I/O, it returns with the processes and what they wait on. A hung run then
+  costs half a minute instead of the wait sized for slow work, as in recorded
+  runs that blocked for 15 minutes. It returns early once per quiet stretch, so
+  a wait repeated on purpose, e.g. on a sleeping job, runs its full length.
+  Linux only, where procfs shows CPU time and I/O.
 - **`timeout_ms` stops the process group.** Models expect a time limit, and the
-  `timeout` utility signals only its child, and escalates to KILL only with
-  `-k`, so a program that ignores TERM outlives it. The limit starts with the
+  `timeout` utility moves the command into a process group of its own, which
+  the session no longer tracks, and escalates to KILL only with `-k`: a
+  program that ignores TERM outlives it, and Pi's session too. The limit starts with the
   command, and expiry escalates from TERM to KILL like `process kill`. Results
   state the limit while the command runs and while it is being stopped.
 - **A wait ends once the shell has exited.** It continues for two seconds, so
@@ -58,12 +66,13 @@ stopped.
 - **Results show runtime, silence, and what remains.** A running session
   reports how long it has run and how long it has gone without output. Once it
   has been silent for 10 seconds, and whenever it drains, the result lists the
-  processes still running with the kernel function each waits in, so a run
-  blocked opening a FIFO can be told from one that sleeps, even when the
-  program buffers its output to the pipe.
-- **Carriage-return redraws show their last frame.** Progress bars that redraw
-  a line otherwise fill a page with frames. Only returned text is collapsed;
-  the log keeps every byte.
+  processes still running with what each waits on, in plain words for common
+  kernel wait channels, so a run blocked opening a FIFO can be told from one
+  that sleeps, even when the program buffers its output to the pipe.
+- **Carriage-return redraws are thinned to a few frames.** Progress bars that
+  redraw a line otherwise fill a page with frames. Five frames spread from the
+  first to the last remain, since the last alone hides whether the bar still
+  moves. Only returned text is thinned; the log keeps every byte.
 - **Output is a log read by byte cursor.** Reading never consumes output, so a
   repeated or lost call loses nothing. `poll`, `write`, and `kill` continue
   after the output that returned results showed, and a cursor of 0 shows it

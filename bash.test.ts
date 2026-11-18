@@ -513,20 +513,24 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
   });
 
   test.skipIf(process.platform !== "linux")(
-    "lists the processes of a silent session, including a program that replaced the shell",
+    "ends a long wait on a quiet command and shows a program that replaced the shell reading stdin",
     async () => {
-      const silent = await execute("bash", { command: "exec sleep 30", yield_time_ms: 11_000 });
+      const started = performance.now();
+      const silent = await execute("bash", { command: "exec cat", yield_time_ms: 80_000 });
+      assert.ok(performance.now() - started < 40_000);
       assert.match(
         text(silent),
-        /no output for 1\d s, processes: pid \d+ sleep 30 \(sleeping in \w+\)/u,
+        /no output for 3\d s, no CPU or I\/O for 3\d s, which ended this wait early, processes: pid \d+ cat \(waiting for input on the session's stdin, which process write sends and eof closes\)/u,
       );
-      await execute("process", {
-        action: "kill",
+      const closed = await processAction({
+        action: "write",
         session_id: (silent.structuredContent as ProcessResult).session_id,
+        eof: true,
       });
+      assert.equal(closed.state, "exited");
     },
-    // Processes are listed only after this many seconds of silence.
-    15_000,
+    // A wait ends early after 30 s without output or activity.
+    45_000,
   );
 
   test(
@@ -544,7 +548,7 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
           server.processes?.map((member) => member.command),
           ["sleep 4"],
         );
-        assert.match(text(response), /still running: pid \d+ sleep 4 \(sleeping in \w+\)/u);
+        assert.match(text(response), /still running: pid \d+ sleep 4 \(sleeping on a timer\)/u);
       }
       assert.ok(performance.now() - started < 3000);
       const finished = await poll(server as ProcessResult, { yield_time_ms: 20_000 });
@@ -640,14 +644,15 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     },
   );
 
-  test("shows only the last frame of lines redrawn with carriage returns", async () => {
+  test("shows a few frames spread over lines redrawn with carriage returns", async () => {
+    const frames = Array.from({ length: 9 }, (_, index) => `${index + 1}/9`);
     const response = await execute("bash", {
-      command: "printf 'step 1\\rstep 2\\rdone\\nnext\\r'",
+      command: `printf '${frames.join("\\r")}\\nnext\\r'`,
     });
-    assert.equal(text(response), "done\nnext\r");
+    assert.equal(text(response), "1/9\r3/9\r5/9\r7/9\r9/9\nnext\r");
     assert.equal(
       (response.structuredContent as ProcessResult).output,
-      "step 1\rstep 2\rdone\nnext\r",
+      `${frames.join("\r")}\nnext\r`,
     );
   });
 

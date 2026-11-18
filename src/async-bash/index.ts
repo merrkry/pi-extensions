@@ -13,6 +13,7 @@ import {
   MAX_REPORTED_SESSIONS,
   type Member,
   makeProcesses,
+  QUIET_WAKE_MS,
   TERMINATION_GRACE_MS,
   type ProcessResult,
   type Processes,
@@ -35,6 +36,8 @@ const NOTABLE_IDLE_SECONDS = 10;
 const PAGE_LIMIT = `${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB`;
 const MAX_LISTED_COMMAND_CHARS = 200;
 const MAX_REMINDER_COMMAND_CHARS = 60;
+// Frames kept of a line redrawn with carriage returns: enough to show whether it still moves.
+const MAX_REDRAW_FRAMES = 5;
 
 /** Waits above the cap are shortened rather than rejected, so an oversized wait costs no turn. */
 function waitTime(value: number | undefined): number {
@@ -74,7 +77,8 @@ type Status = Pick<
   | "runtime_seconds"
   | "timeout_seconds"
   | "idle_seconds"
-> & { processes?: Member[] };
+> &
+  Pick<ProcessResult, "processes" | "quiet_seconds">;
 
 const describeMembers = (members: Member[]) =>
   members.map((member) => `pid ${member.pid} ${member.command} (${member.state})`).join(", ");
@@ -99,6 +103,9 @@ function status(value: Status): string {
       }
       if (value.idle_seconds >= NOTABLE_IDLE_SECONDS) {
         notes.push(`no output for ${value.idle_seconds} s`);
+        if (value.quiet_seconds !== undefined) {
+          notes.push(`no CPU or I/O for ${value.quiet_seconds} s, which ended this wait early`);
+        }
         // A silent run is where the processes tell a hang from slow work.
         if (value.processes?.length) notes.push(`processes: ${describeMembers(value.processes)}`);
       }
@@ -109,7 +116,11 @@ function status(value: Status): string {
       const remaining = value.processes?.length
         ? describeMembers(value.processes)
         : "processes it started in the background";
-      return `${stopped}shell exited with ${code} after ${runtime}; still running: ${remaining} (poll waits for them, kill stops them)`;
+      const quiet =
+        value.quiet_seconds === undefined
+          ? ""
+          : `; no output, CPU, or I/O for ${value.quiet_seconds} s, which ended this wait early`;
+      return `${stopped}shell exited with ${code} after ${runtime}; still running: ${remaining} (poll waits for them, kill stops them)${quiet}`;
     }
     case "exited":
       // A stopped session's group has exited too, so nothing it started is left to check for.
@@ -154,8 +165,9 @@ function inputNotes(value: Pick<ProcessResult, "input_error" | "input_refused">)
 }
 
 /**
- * Keeps only the last state of lines redrawn with carriage returns, such as progress bars, which
- * otherwise fill a page with frames. The log keeps every byte; terminal line ends stay.
+ * Thins lines redrawn with carriage returns, such as progress bars, which otherwise fill a page with
+ * frames, to a few frames spread from the first to the last: a single frame would hide whether the
+ * line still moves. The log keeps every byte; terminal line ends stay.
  */
 function collapseRedraws(text: string): string {
   if (!text.includes("\r")) return text;
@@ -163,8 +175,16 @@ function collapseRedraws(text: string): string {
     .split("\n")
     .map((line) => {
       const ending = line.endsWith("\r") ? "\r" : "";
-      const frames = (ending ? line.slice(0, -1) : line).split("\r");
-      return `${frames.findLast((frame) => frame !== "") ?? ""}${ending}`;
+      const frames = (ending ? line.slice(0, -1) : line).split("\r").filter(Boolean);
+      const last = frames.length - 1;
+      const kept =
+        frames.length <= MAX_REDRAW_FRAMES
+          ? frames
+          : Array.from(
+              { length: MAX_REDRAW_FRAMES },
+              (_, index) => frames[Math.round((index * last) / (MAX_REDRAW_FRAMES - 1))],
+            );
+      return `${kept.join("\r")}${ending}`;
     })
     .join("\n");
 }
@@ -391,8 +411,8 @@ export default function (pi: ExtensionAPI): void {
     promptGuidelines: [
       ...(piBash.promptGuidelines ?? []),
       "A status reminder lists running bash sessions and finished ones whose final result you have not seen. Without a reminder no session needs attention, and finished sessions need no cleanup. Before finishing, handle the sessions it lists and report any you leave running on purpose.",
-      `yield_time_ms only sets how long a call waits before returning; the command keeps running in its session. The call returns as soon as the command finishes, so set it near the expected runtime. A call waits at most ${MAX_WAIT_MS / 60_000} minutes.`,
-      `To limit how long a command may run, set timeout_ms instead of using the timeout utility: it stops the whole process group, escalating from TERM to KILL after ${TERMINATION_GRACE_MS / 1000} s.`,
+      `yield_time_ms only sets how long a call waits before returning; the command keeps running in its session. The call returns as soon as the command finishes, so set it near the expected runtime.${process.platform === "linux" ? ` It also returns once the command has had no output, CPU, or I/O for ${QUIET_WAKE_MS / 1000} s, so a long wait does not hide a stalled command.` : ""} A call waits at most ${MAX_WAIT_MS / 60_000} minutes.`,
+      `timeout_ms is a backstop for a command that must not run past a limit, e.g. a test suite with a time budget, or that you will not check on. It stops the whole process group, escalating from TERM to KILL after ${TERMINATION_GRACE_MS / 1000} s; use it instead of the timeout utility, which leaves processes that ignore TERM running. It is not a reason to keep waiting: once results show a command stalled or failing, stop it with process kill and act on what you saw.`,
       "To watch a long-running program, start it with a short yield_time_ms, poll its session, and stop it with process kill. The session keeps all output and poll shows it as it arrives, so do not pipe long commands through tail or redirect their output to a file just to follow it.",
       "Tool calls in one response run concurrently and return together: put dependent steps in one command, and keep yield_time_ms short for calls batched with others.",
       "A command's session stays draining while processes it started in its process group run, and Pi stops them when its session ends. Start a process that must outlive Pi, such as a server, as a command of its own: `setsid -f cmd > log 2>&1 < /dev/null`; it is then neither tracked nor stopped. In `a && setsid cmd &`, the `&` backgrounds the whole list, leaving a bash wrapper in the session.",
@@ -415,7 +435,7 @@ export default function (pi: ExtensionAPI): void {
           exclusiveMinimum: 0,
           maximum: MAX_TIMER_DELAY_MS,
           description:
-            "Stop the command and its process group once it has run this long, also after this call has returned. No limit by default.",
+            "Stop the command and its process group once it has run this long, also after this call has returned. No limit by default; a command you watch is yours to stop when it stalls.",
         }),
       ),
     }),
