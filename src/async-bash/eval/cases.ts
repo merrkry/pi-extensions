@@ -280,7 +280,10 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
     prompt: (port) =>
       `The HTTP service in app/ reads config.json from its working directory. Start it from app/ with \`python3 server.py ${port}\` so that it keeps running after you finish, then confirm that GET /health on port ${port} answers ok.`,
     check: async (run) => {
-      const health = await fetch(`http://127.0.0.1:${run.port}/health`)
+      // The deadline also covers the body, so a server that never finishes answering fails here.
+      const health = await fetch(`http://127.0.0.1:${run.port}/health`, {
+        signal: AbortSignal.timeout(5000),
+      })
         .then(async (response) => `${response.status} ${await response.text()}`)
         .catch((error: unknown) => String(error));
       const slowest = Math.max(0, ...run.calls.map((call) => call.seconds));
