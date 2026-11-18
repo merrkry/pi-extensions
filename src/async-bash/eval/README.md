@@ -44,9 +44,11 @@ replace it wherever the model printed it. Options:
   Defaults to `.eval/async-bash/<time>`.
 
 Attempts run one at a time, since they share the process table: a `pkill`
-in one would reach another's processes. On Linux with bubblewrap, each runs
-with the home directory, `/tmp`, and the eval's sources and results hidden, so
-models cannot read the cases, earlier attempts, or other credentials.
+in one would reach another's processes. Each runs under bubblewrap, which the
+eval requires, so Linux only. The home directory, `/tmp`, the eval's sources,
+the Git history, and the results are hidden, and the environment holds no host
+variables beyond those that locate programs, so models cannot read the cases,
+earlier attempts, or other credentials.
 
 The runner tracks fixture processes itself, by looking every 200 ms for Python
 processes running a case's script from the working directory. Fixtures also
@@ -75,8 +77,9 @@ nothing.
 - **Source:** vpp-loss-divergence, where a run deadlocked and ignored TERM inside
   `timeout 900`, with a 900 s wait, blocking for 15 minutes; chess-best-move,
   where a hung analysis was polled blind for 6 minutes.
-- **Checks:** within 150 s, ran into the stall, reports the final loss or that
-  the run cannot finish, edits nothing, stopped it before answering.
+- **Checks:** within 150 s, ran into the stall, reports the final loss if the
+  run showed it and otherwise that the run cannot finish, changed none of its
+  files, stopped it before answering.
 
 ### `server`
 
@@ -91,8 +94,8 @@ nothing.
 - **Source:** hf-model-inference and kv-store-grpc, where
   `cd /app && setsid nohup server &` left a wrapper subshell that held each call
   for its whole wait, followed by turns spent on the session's state.
-- **Checks:** within 30 s and 6 calls, no call of 4 s or more, the server
-  answers after the agent exits.
+- **Checks:** within 30 s and 6 calls, no call of 4 s or more, requested
+  `/health`, the server answers 200 `ok` after the agent exits.
 
 `results.json` also records metrics per attempt: wall time, tool calls, shell
 and session calls, the slowest call, kilobytes of tool results, uses of the

@@ -71,8 +71,9 @@ stopped.
   that sleeps, even when the program buffers its output to the pipe.
 - **Carriage-return redraws are thinned to a few frames.** Progress bars that
   redraw a line otherwise fill a page with frames. Five frames spread from the
-  first to the last remain, since the last alone hides whether the bar still
-  moves. Only returned text is thinned; the log keeps every byte.
+  first to the last remain, since the last alone, all a terminal shows, hides
+  whether the bar still moves. Only returned text is thinned; a session's log
+  keeps every byte.
 - **Output is a log read by byte cursor.** Reading never consumes output, so a
   repeated or lost call loses nothing. `poll`, `write`, and `kill` continue
   after the output that returned results showed, and a cursor of 0 shows it

@@ -3,6 +3,7 @@ import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { Cause, Deferred, Effect, Exit, FileSystem, Option, Scope, Stream } from "effect";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readlinkSync } from "node:fs";
 import { constants } from "node:os";
 import { join } from "node:path";
 import { Output, type Page } from "./output.ts";
@@ -350,11 +351,25 @@ function readsStdin(fs: FileSystem.FileSystem, pid: number) {
 }
 
 /**
+ * The pipe a session's stdin is, as procfs names it, to tell it from other input a process reads,
+ * such as a file or FIFO the command redirected. Read as the shell starts, before it has run any
+ * of the command. Linux only.
+ */
+function sessionStdin(pid: number | undefined) {
+  if (process.platform !== "linux" || pid === undefined) return undefined;
+  try {
+    return readlinkSync(`/proc/${pid}/fd/0`);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Processes still running in a session's process group, so a result can show what it waits on. The
  * shell running the command is left out unless it waits for input, and subshells it forked are
  * named as such rather than by the launcher's argv. Linux only.
  */
-function groupMembers(fs: FileSystem.FileSystem, pgid: number) {
+function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | undefined) {
   return Effect.gen(function* () {
     const members: Member[] = [];
     for (const stat of yield* groupStats(fs, pgid)) {
@@ -383,14 +398,11 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number) {
         const name = channel.trim();
         if (name && name !== "0") state = WAIT_CHANNELS[name] ?? `${state} in ${name}`;
         // A program reading stdin waits for input that only the model can send. The session's
-        // stdin stays open, so the wait never ends otherwise. The leader's stdin stands for the
-        // session's unless the command redirected it with exec, after which a write reports the
-        // failure.
+        // stdin stays open, so the wait never ends otherwise.
         if (yield* readsStdin(fs, stat.pid)) {
-          const session = yield* fs.readLink(`/proc/${pgid}/fd/0`).pipe(Effect.option);
           const own = yield* fs.readLink(`/proc/${stat.pid}/fd/0`).pipe(Effect.option);
           state =
-            Option.isSome(session) && Option.isSome(own) && session.value === own.value
+            stdin !== undefined && Option.isSome(own) && own.value === stdin
               ? "waiting for input on the session's stdin, which process write sends and eof closes"
               : "waiting for input on its stdin";
         }
@@ -441,6 +453,8 @@ class Task {
     readonly child: ChildProcessWithoutNullStreams,
     readonly output: Output,
     private readonly fs: FileSystem.FileSystem,
+    /** See `sessionStdin`. */
+    private readonly stdin: string | undefined,
   ) {
     // Node resumes unread stdio on exit. Retain it until Effect attaches its readers.
     child.stdout.on("readable", preserveOutput);
@@ -571,7 +585,7 @@ class Task {
       if (!withProcesses || !live || pgid === undefined || process.platform !== "linux") {
         return result;
       }
-      return { ...result, processes: yield* groupMembers(this.fs, pgid) };
+      return { ...result, processes: yield* groupMembers(this.fs, pgid, this.stdin) };
     });
   }
 
@@ -589,6 +603,8 @@ class Task {
       let previous = yield* sampleActivity(this.fs, pgid);
       let since = previous.at;
       let outputBytes = this.output.totalBytes;
+      // Between waits, CPU use counts against the same share over the whole gap, so a brief burst
+      // that leaves the command idle again keeps its stretch; output or I/O ends it.
       const reported = this.reportedQuiet;
       if (
         reported &&
@@ -717,9 +733,18 @@ class Task {
       if (timeoutMs !== undefined) {
         // The limit covers the process group. Output still arriving from processes that left it,
         // e.g. through setsid, is not the command running past its limit.
+        // Group exit is polled, so the group may have exited just before the limit unnoticed.
+        const pid = child.pid;
+        const groupStillRuns =
+          pid === undefined || process.platform === "win32"
+            ? Effect.succeed(true)
+            : groupAlive(this.fs, pid);
         yield* Effect.forkChild(
           Effect.raceFirst(
-            Effect.sleep(timeoutMs).pipe(Effect.andThen(this.requestStop("timeout"))),
+            Effect.sleep(timeoutMs).pipe(
+              Effect.andThen(groupStillRuns),
+              Effect.flatMap((alive) => (alive ? this.requestStop("timeout") : Effect.void)),
+            ),
             Deferred.await(treeExited),
           ),
         );
@@ -942,7 +967,7 @@ export const makeProcesses = Effect.gen(function* () {
                 windowsHide: true,
                 stdio: ["pipe", "pipe", "pipe"],
               });
-              return new Task(id, command, child, output, fs);
+              return new Task(id, command, child, output, fs, sessionStdin(child.pid));
             }),
             (task) =>
               terminateTree(task.child, "SIGKILL").pipe(

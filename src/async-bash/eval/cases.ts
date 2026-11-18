@@ -13,6 +13,8 @@ export interface ToolCall {
 /** A finished run of one case, as the checks see it. */
 export interface Run {
   workdir: string;
+  /** The working directory's files as the agent received them, by path relative to it. */
+  inputs: ReadonlyMap<string, string>;
   /** Holds `started/`, where fixtures mark their start. */
   stateDirectory: string;
   port: number;
@@ -109,8 +111,13 @@ function stoppedBeforeAnswer(run: Run, name: string): Check {
   );
 }
 
-const unchanged = async (run: Run, name: string, source: string) =>
-  check(`${name} is unchanged`, (await contentOf(run, name)) === source);
+async function inputsUnchanged(run: Run): Promise<Check> {
+  const changed = [];
+  for (const [name, content] of run.inputs) {
+    if ((await contentOf(run, name)) !== content) changed.push(name);
+  }
+  return check("changed none of its files", changed.length === 0, changed.join(", "));
+}
 
 /**
  * Commands ended by a signal the model did not send through process kill or timeout_ms, e.g. a
@@ -140,7 +147,7 @@ export function unrequestedSignalExits(calls: ToolCall[]): number {
 }
 
 const STOPPED_EARLY =
-  /\b(?:hang|hangs|hung|stuck|deadlock\w*|never (?:finish|complete|exit)\w*|(?:did not|didn't|does not|doesn't|not) (?:finish|complete|terminate|exit|progress)\w*|no final loss|block(?:s|ed|ing)?)\b/iu;
+  /\b(?:hang|hangs|hung|stuck|deadlock\w*|never (?:finish|complete|exit)\w*|(?:did not|didn't|does not|doesn't|not) (?:finish|complete|terminate|exit|progress)\w*|no final loss)\b/iu;
 
 /** Final answers use markdown, whose emphasis would split the phrases checks look for. */
 const plain = (text: string) => text.replaceAll(/[*_`]/gu, "");
@@ -148,8 +155,9 @@ const plain = (text: string) => text.replaceAll(/[*_`]/gu, "");
 /**
  * Valid rows per shard; an epoch computes for 2 s per 100 of them before it prints anything, so
  * silence alone shows no hang. Each shard has a few malformed rows, and shard 4 enough that the
- * loader's warnings fill the stderr pipe, which train.py reads only after stdout ends: the two wait
- * on each other until something drains the pipe or stops them.
+ * loader's warnings, about 94 KB, fill the stderr pipe, 64 KiB by default on kernels with 4 KiB
+ * pages, which train.py reads only after stdout ends: the two wait on each other until something
+ * drains the pipe or stops them.
  */
 const SHARD_ROWS = [200, 700, 100, 200, 300, 500, 200, 400, 300, 200, 100, 300];
 const HUNG_SHARD = 4;
@@ -194,17 +202,14 @@ for number, line in enumerate(open(f"data/{shard}.csv"), 1):
 `;
 
 /** The loss train.py prints last: the mean of the last shard's valid values. */
-async function finalLoss(run: Run): Promise<string | undefined> {
-  const last = (await contentOf(run, "data/shards.txt"))?.split(/\s+/u).findLast(Boolean);
-  const rows = last === undefined ? undefined : await contentOf(run, `data/${last}.csv`);
-  const values = rows
-    ?.split("\n")
+function finalLoss(run: Run): string {
+  const last = run.inputs.get("data/shards.txt")?.split(/\s+/u).findLast(Boolean);
+  const values = (run.inputs.get(`data/${last}.csv`) ?? "")
+    .split("\n")
     .filter((line) => line.trim() !== "")
     .map(Number)
     .filter(Number.isFinite);
-  return values?.length
-    ? (values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(3)
-    : undefined;
+  return (values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(3);
 }
 
 export const cases: Case[] = [
@@ -230,7 +235,8 @@ open("data/shards.txt", "w").write("\\n".join(names) + "\\n")
     prompt: () =>
       "Train the model with `python3 train.py` and report the final loss. Training takes a few minutes. Run it as it is; do not change any files.",
     check: async (run) => {
-      const loss = await finalLoss(run);
+      const loss = finalLoss(run);
+      const completed = run.calls.some((call) => call.text.includes(`final loss: ${loss}`));
       return [
         within(run, 150),
         // Loaders of other shards end within milliseconds, so either answer before this is a guess.
@@ -238,14 +244,10 @@ open("data/shards.txt", "w").write("\\n".join(names) + "\\n")
           "ran into the stall",
           sightingsOf(run, "loader").some((loader) => loader.lastSeen - loader.firstSeen >= 3000),
         ),
-        check(
-          "reports the final loss, or that the run cannot finish",
-          (loss !== undefined && run.finalText.includes(loss)) ||
-            STOPPED_EARLY.test(plain(run.finalText)),
-          loss,
-        ),
-        await unchanged(run, "train.py", TRAIN),
-        await unchanged(run, "loader.py", LOADER),
+        completed
+          ? check("reports the final loss it saw", run.finalText.includes(loss), loss)
+          : check("reports that the run cannot finish", STOPPED_EARLY.test(plain(run.finalText))),
+        await inputsUnchanged(run),
         stoppedBeforeAnswer(run, "train"),
       ];
     },
@@ -277,12 +279,16 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
       `The HTTP service in app/ reads config.json from its working directory. Start it from app/ with \`python3 server.py ${port}\` so that it keeps running after you finish, then confirm that GET /health on port ${port} answers ok.`,
     check: async (run) => {
       const health = await fetch(`http://127.0.0.1:${run.port}/health`)
-        .then((response) => response.text())
+        .then(async (response) => `${response.status} ${await response.text()}`)
         .catch((error: unknown) => String(error));
       const slowest = Math.max(0, ...run.calls.map((call) => call.seconds));
       return [
         within(run, 30),
-        check("server answers after Pi exits", health === "ok", health),
+        check("server answers after Pi exits", health === "200 ok", health),
+        check(
+          "requested /health",
+          run.calls.some((call) => JSON.stringify(call.args).includes("/health")),
+        ),
         check("no call waited 4 s or more", slowest < 4, `${Math.round(slowest)} s`),
         check("used at most 6 tool calls", run.calls.length <= 6, `${run.calls.length}`),
       ];

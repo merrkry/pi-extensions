@@ -2,14 +2,14 @@ import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { Duration, Effect, Fiber, FileSystem, Option, Stream } from "effect";
 import { ChildProcess } from "effect/process";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { readdir, readFile, readlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { createServer } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { type Agent, apiKey, codex, type Invocation, pi } from "./agents.ts";
+import { type Agent, codex, type Invocation, pi, providerKey } from "./agents.ts";
 import {
   type Case,
   cases,
@@ -145,6 +145,17 @@ const fixtureRuns = (
     return runs;
   });
 
+/** A directory's files by path relative to it. */
+const snapshot = (fs: FileSystem.FileSystem, directory: string) =>
+  Effect.gen(function* () {
+    const files = new Map<string, string>();
+    for (const path of yield* fs.readDirectory(directory, { recursive: true })) {
+      const info = yield* fs.stat(join(directory, path));
+      if (info.type === "File") files.set(path, yield* fs.readFileString(join(directory, path)));
+    }
+    return files;
+  });
+
 const killAll = (pids: number[]) =>
   Effect.sync(() => {
     for (const pid of pids) {
@@ -156,23 +167,22 @@ const killAll = (pids: number[]) =>
     }
   });
 
+/** Attempts run under bubblewrap, so that scores never come from an agent that read the cases. */
 const bubblewrap = (() => {
-  if (process.platform !== "linux") return undefined;
   try {
-    return execFileSync("sh", ["-c", "command -v bwrap"], { encoding: "utf8" }).trim() || undefined;
+    return execFileSync("sh", ["-c", "command -v bwrap"], { encoding: "utf8" }).trim();
   } catch {
-    return undefined;
+    throw new Error("The eval runs attempts under bubblewrap; install bwrap (Linux only).");
   }
 })();
 
 const nodeInstallation = resolve(process.execPath, "../..");
 
 /**
- * Hides the home directory, /tmp, the eval's own sources, and results, including `out` wherever it
- * is, from the agent, so an attempt sees neither the cases' answers, earlier attempts, nor
+ * Hides the home directory, /tmp, the eval's sources and Git history, and results, including `out`
+ * wherever it is, from the agent, so an attempt sees neither the cases' answers, earlier attempts, nor
  * credentials beyond its own, which models otherwise go looking for. The attempt's directory, the
  * repository and Node installation the agent runs from, and the extension under test stay visible.
- * Linux with bubblewrap only; elsewhere attempts run as is.
  */
 function sandboxed(
   invocation: Invocation,
@@ -180,11 +190,15 @@ function sandboxed(
   extension: string,
   out: string,
 ): Invocation {
-  if (!bubblewrap) return invocation;
   const hidden = [
-    ...["src/async-bash/eval", ".eval", ".dev"].map((path) => join(repository, path)),
+    ...["src/async-bash/eval", ".eval", ".dev", ".git"].map((path) => join(repository, path)),
     out,
-  ].filter((path) => existsSync(path));
+  ]
+    .filter((path) => existsSync(path))
+    // A worktree's .git is a file.
+    .flatMap((path) =>
+      statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path],
+    );
   return {
     ...invocation,
     command: bubblewrap,
@@ -202,7 +216,7 @@ function sandboxed(
       "--ro-bind",
       nodeInstallation,
       nodeInstallation,
-      ...hidden.flatMap((path) => ["--tmpfs", path]),
+      ...hidden,
       "--ro-bind",
       dirname(extension),
       dirname(extension),
@@ -216,6 +230,13 @@ function sandboxed(
     ],
   };
 }
+
+/** What agents see of the host's environment: enough to run programs, and none of its credentials. */
+const hostEnvironment = Object.fromEntries(
+  ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM", "TZ", "LOCALE_ARCHIVE"]
+    .map((name) => [name, process.env[name]])
+    .filter((entry): entry is [string, string] => entry[1] !== undefined),
+);
 
 /** Runs one agent turn within `budget`; the result says whether it exited on its own. */
 const invoke = (
@@ -231,7 +252,7 @@ const invoke = (
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
-        env: { ...process.env, ...env, ...invocation.env },
+        env: { ...hostEnvironment, ...env, ...invocation.env },
         extendEnv: false,
       });
       const stdout = yield* Stream.mkString(Stream.decodeText(child.stdout)).pipe(
@@ -291,6 +312,7 @@ function attempt(
         );
       }
 
+      const inputs = yield* snapshot(fs, workdir);
       const sightings = new Map<number, Sighting>();
       // Fixtures are stopped even when the attempt fails or is interrupted, including those meant
       // to outlive the agent. Finalizers run in reverse, so the watcher has stopped by then.
@@ -327,6 +349,7 @@ function attempt(
       yield* Effect.sleep(Duration.seconds(1));
       const run: Run = {
         workdir,
+        inputs,
         stateDirectory,
         port,
         finished: turn.finished,
@@ -402,11 +425,14 @@ const main = Effect.gen(function* () {
     if (file.endsWith(".js")) yield* fs.copyFile(join(dirname(built), file), join(staged, file));
   }
   const extension = join(staged, basename(built));
+  const modelsCache = yield* fs.makeTempDirectoryScoped({ prefix: "async-bash-eval-models-" });
   const agentOptions = {
     provider: options.provider,
     model: options.model,
     thinking: options.thinking,
-    auth: resolve(options.auth),
+    key: yield* Effect.promise(() =>
+      providerKey(resolve(options.auth), options.provider, join(modelsCache, "models.json")),
+    ),
     extension,
     baseUrl: options["base-url"],
     codexTemplate: options["codex-template"],
@@ -424,8 +450,7 @@ const main = Effect.gen(function* () {
   const out = resolve(options.out ?? join(repository, ".eval/async-bash", stamp));
   yield* fs.makeDirectory(out, { recursive: true });
 
-  const key = apiKey(agentOptions);
-  const redact: Redact = (text) => text.replaceAll(key, "[API key]");
+  const redact: Redact = (text) => text.replaceAll(agentOptions.key, "[API key]");
   const attempts = chosen.flatMap((testCase) =>
     Array.from({ length: Number(options.repeat) }, (_, index) => ({ testCase, index: index + 1 })),
   );
@@ -440,7 +465,7 @@ const main = Effect.gen(function* () {
     // Attempts share the process table, e.g. pkill in one would stop another's fixtures.
     { concurrency: 1 },
   );
-  const { auth: _auth, ...recorded } = { ...agentOptions, extension: built };
+  const { key: _key, ...recorded } = { ...agentOptions, extension: built };
   const report = { agent: options.agent, ...recorded, results };
   yield* fs.writeFileString(
     join(out, "results.json"),

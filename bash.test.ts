@@ -561,6 +561,23 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
         yield_time_ms: 2000,
       });
       assert.equal(answered.output, "got yes");
+
+      // Input the command redirected from elsewhere is not the session's to send.
+      const fifo = join(directory, "redirected-input");
+      const redirected = await start(
+        `mkfifo '${fifo}'; exec 3<>'${fifo}'; read -r line <'${fifo}'`,
+      );
+      await vi.waitFor(
+        async () => {
+          const result = await poll(redirected, { yield_time_ms: 0 });
+          assert.match(
+            result.processes?.map((member) => member.state).join() ?? "",
+            /^waiting for input on its stdin$/u,
+          );
+        },
+        { timeout: 3000 },
+      );
+      await processAction({ action: "kill", session_id: redirected.session_id });
     },
   );
 

@@ -1,6 +1,6 @@
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Effect, FileSystem } from "effect";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ToolCall } from "./cases.ts";
@@ -26,8 +26,8 @@ export interface AgentOptions {
   provider: string;
   model: string;
   thinking: string;
-  /** Pi's auth.json, holding the provider's API key. */
-  auth: string;
+  /** The provider's API key, the only credential agents get. */
+  key: string;
   /** Pi: the extension entry point to load. */
   extension: string;
   /** Codex: the provider's Responses API base URL. */
@@ -74,17 +74,18 @@ const onlyFile = (fs: FileSystem.FileSystem, directory: string) =>
     return join(directory, files[0]!);
   });
 
-/** The provider's entry in Pi's auth.json; agents get only this one. */
-function credential(options: AgentOptions): { key: string } {
-  const entry = (
-    JSON.parse(readFileSync(options.auth, "utf8")) as Record<string, { key?: string }>
-  )[options.provider];
-  if (!entry?.key) throw new Error(`${options.auth} has no API key for ${options.provider}`);
-  return { ...entry, key: entry.key };
+/** The provider's API key from Pi's auth.json, resolved as Pi resolves it, e.g. from a command. */
+export async function providerKey(auth: string, provider: string, modelsCache: string) {
+  const runtime = await ModelRuntime.create({
+    authPath: auth,
+    modelsPath: null,
+    modelsStorePath: modelsCache,
+    refreshOnCreate: false,
+  });
+  const key = (await runtime.getAuth(provider))?.auth.apiKey;
+  if (!key) throw new Error(`${auth} has no API key for ${provider}`);
+  return key;
 }
-
-/** The API key the agent uses, which results replace wherever the model printed it. */
-export const apiKey = (options: AgentOptions) => credential(options).key;
 
 export function pi(options: AgentOptions): Agent {
   const cli = fileURLToPath(
@@ -120,7 +121,7 @@ export function pi(options: AgentOptions): Agent {
         yield* fs.makeDirectory(join(home, "sessions"), { mode: 0o700 });
         yield* fs.writeFileString(
           join(home, "agent", "auth.json"),
-          JSON.stringify({ [options.provider]: credential(options) }),
+          JSON.stringify({ [options.provider]: { type: "api_key", key: options.key } }),
           { mode: 0o600 },
         );
       }),
@@ -198,8 +199,7 @@ export function pi(options: AgentOptions): Agent {
 }
 
 export function codex(options: AgentOptions): Agent {
-  const key = apiKey(options);
-  const env = (home: string) => ({ CODEX_HOME: home, EVAL_API_KEY: key });
+  const env = (home: string) => ({ CODEX_HOME: home, EVAL_API_KEY: options.key });
   const shared = [
     "--skip-git-repo-check",
     "--dangerously-bypass-approvals-and-sandbox",
