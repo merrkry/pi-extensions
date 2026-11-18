@@ -9,7 +9,7 @@ import { createServer } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { type Agent, codex, type Invocation, pi } from "./agents.ts";
+import { type Agent, apiKey, codex, type Invocation, pi } from "./agents.ts";
 import {
   type Case,
   cases,
@@ -165,19 +165,26 @@ const bubblewrap = (() => {
   }
 })();
 
-/**
- * Hides the home directory, /tmp, and the eval's own sources and results from the agent, so an
- * attempt sees neither the cases' answers, earlier attempts, nor credentials beyond its own, which
- * models otherwise go looking for. The attempt's directory, the repository and Node installation the
- * agent runs from, and the extension under test stay visible. Linux with bubblewrap only; elsewhere attempts run as is.
- */
 const nodeInstallation = resolve(process.execPath, "../..");
 
-function sandboxed(invocation: Invocation, root: string, extension: string): Invocation {
+/**
+ * Hides the home directory, /tmp, the eval's own sources, and results, including `out` wherever it
+ * is, from the agent, so an attempt sees neither the cases' answers, earlier attempts, nor
+ * credentials beyond its own, which models otherwise go looking for. The attempt's directory, the
+ * repository and Node installation the agent runs from, and the extension under test stay visible.
+ * Linux with bubblewrap only; elsewhere attempts run as is.
+ */
+function sandboxed(
+  invocation: Invocation,
+  root: string,
+  extension: string,
+  out: string,
+): Invocation {
   if (!bubblewrap) return invocation;
-  const hidden = ["src/async-bash/eval", ".eval", ".dev"]
-    .map((path) => join(repository, path))
-    .filter((path) => existsSync(path));
+  const hidden = [
+    ...["src/async-bash/eval", ".eval", ".dev"].map((path) => join(repository, path)),
+    out,
+  ].filter((path) => existsSync(path));
   return {
     ...invocation,
     command: bubblewrap,
@@ -245,7 +252,17 @@ const invoke = (
     }),
   );
 
-function attempt(agent: Agent, testCase: Case, index: number, out: string, extension: string) {
+/** Results never hold the API key, even where the model printed it, e.g. after reading auth.json. */
+type Redact = (text: string) => string;
+
+function attempt(
+  agent: Agent,
+  testCase: Case,
+  index: number,
+  out: string,
+  extension: string,
+  redact: Redact,
+) {
   return Effect.scoped(
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -287,7 +304,7 @@ function attempt(agent: Agent, testCase: Case, index: number, out: string, exten
 
       const started = performance.now();
       const turn = yield* invoke(
-        sandboxed(agent.start(home, workdir, testCase.prompt(port)), root, extension),
+        sandboxed(agent.start(home, workdir, testCase.prompt(port)), root, extension, out),
         workdir,
         env,
         Duration.seconds(testCase.budgetSeconds),
@@ -302,7 +319,10 @@ function attempt(agent: Agent, testCase: Case, index: number, out: string, exten
             (error) => new Error(`${name}: no transcript (${String(error)})\n${turn.stderr}`),
           ),
         );
-      yield* fs.copyFile(transcript.file, join(out, `${name}.jsonl`));
+      yield* fs.writeFileString(
+        join(out, `${name}.jsonl`),
+        redact(yield* fs.readFileString(transcript.file)),
+      );
       // Let processes the agent stopped on exit finish dying before checks look at them.
       yield* Effect.sleep(Duration.seconds(1));
       const run: Run = {
@@ -330,7 +350,7 @@ function attempt(agent: Agent, testCase: Case, index: number, out: string, exten
       if (options.debrief) {
         const invocation = agent.debrief(home, transcript, DEBRIEF_PROMPT);
         const reply = yield* invoke(
-          sandboxed(invocation, root, extension),
+          sandboxed(invocation, root, extension, out),
           workdir,
           env,
           DEBRIEF_BUDGET,
@@ -404,13 +424,15 @@ const main = Effect.gen(function* () {
   const out = resolve(options.out ?? join(repository, ".eval/async-bash", stamp));
   yield* fs.makeDirectory(out, { recursive: true });
 
+  const key = apiKey(agentOptions);
+  const redact: Redact = (text) => text.replaceAll(key, "[API key]");
   const attempts = chosen.flatMap((testCase) =>
     Array.from({ length: Number(options.repeat) }, (_, index) => ({ testCase, index: index + 1 })),
   );
   const results = yield* Effect.forEach(
     attempts,
     ({ testCase, index }) =>
-      attempt(agent, testCase, index, out, extension).pipe(
+      attempt(agent, testCase, index, out, extension, redact).pipe(
         Effect.tap((result) =>
           Effect.sync(() => console.error(summarize([result]).split("\n")[0])),
         ),
@@ -420,7 +442,10 @@ const main = Effect.gen(function* () {
   );
   const { auth: _auth, ...recorded } = { ...agentOptions, extension: built };
   const report = { agent: options.agent, ...recorded, results };
-  yield* fs.writeFileString(join(out, "results.json"), `${JSON.stringify(report, null, 2)}\n`);
+  yield* fs.writeFileString(
+    join(out, "results.json"),
+    redact(`${JSON.stringify(report, null, 2)}\n`),
+  );
   yield* Effect.sync(() => console.log(`${summarize(results)}\nResults: ${out}`));
 });
 

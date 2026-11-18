@@ -21,7 +21,8 @@ mise run eval:async-bash -- --agent codex --debrief
 
 The eval builds the extension, gives each attempt a temporary home for the
 agent and its own working directory, and reads the API key from `auth.json` in
-`.dev/agent`. Options:
+`.dev/agent`. The agent gets only the selected provider's key, and results
+replace it wherever the model printed it. Options:
 
 - `--agent pi|codex`: the agent to run. Defaults to `pi`.
 - `--extension <path>`: Pi only; the built entry point to load, to compare
@@ -74,14 +75,17 @@ nothing.
 - **Source:** vpp-loss-divergence, where a run deadlocked and ignored TERM inside
   `timeout 900`, with a 900 s wait, blocking for 15 minutes; chess-best-move,
   where a hung analysis was polled blind for 6 minutes.
-- **Checks:** within 150 s, reports the final loss or that the run cannot
-  finish, edits nothing, stopped it before answering.
+- **Checks:** within 150 s, ran into the stall, reports the final loss or that
+  the run cannot finish, edits nothing, stopped it before answering.
 
 ### `server`
 
 - **Program:** a service that must keep running after the agent exits, started
-  from its own directory, which leaves a background process behind once its
-  shell exits.
+  from its own directory. Models launch it as `cd app && setsid server &`,
+  which leaves the wrapper subshell in the session's process group after the
+  shell exits. A launch that detaches fully, e.g. `setsid -f` with its output
+  redirected, passes with any tools; the case measures the launch models
+  choose.
 - **Tools:** a wait ends 2 s after the shell exits and leaves the remaining
   processes draining, listed with what they wait on.
 - **Source:** hf-model-inference and kv-store-grpc, where

@@ -233,6 +233,11 @@ open("data/shards.txt", "w").write("\\n".join(names) + "\\n")
       const loss = await finalLoss(run);
       return [
         within(run, 150),
+        // Loaders of other shards end within milliseconds, so either answer before this is a guess.
+        check(
+          "ran into the stall",
+          sightingsOf(run, "loader").some((loader) => loader.lastSeen - loader.firstSeen >= 3000),
+        ),
         check(
           "reports the final loss, or that the run cannot finish",
           (loss !== undefined && run.finalText.includes(loss)) ||

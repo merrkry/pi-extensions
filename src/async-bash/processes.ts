@@ -111,7 +111,10 @@ export type ProcessResult = TaskSummary &
   Page & {
     /** Why this write call wrote nothing. */
     input_refused?: string;
-    /** Up to a few processes still running in the group, where procfs shows them. */
+    /**
+     * Up to a few processes still running in the group, on Linux, where procfs shows them, in
+     * results a call returns; empty once the group has exited.
+     */
     processes?: Member[];
     /** Set when the wait ended early because the command was quiet this long; see QUIET_WAKE_MS. */
     quiet_seconds?: number;
@@ -348,11 +351,10 @@ function readsStdin(fs: FileSystem.FileSystem, pid: number) {
 
 /**
  * Processes still running in a session's process group, so a result can show what it waits on. The
- * shell running the command is left out, and subshells it forked are named as such rather than by
- * the launcher's argv. Linux only.
+ * shell running the command is left out unless it waits for input, and subshells it forked are
+ * named as such rather than by the launcher's argv. Linux only.
  */
 function groupMembers(fs: FileSystem.FileSystem, pgid: number) {
-  if (process.platform !== "linux") return Effect.succeed([] as Member[]);
   return Effect.gen(function* () {
     const members: Member[] = [];
     for (const stat of yield* groupStats(fs, pgid)) {
@@ -363,10 +365,12 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number) {
       const argv = cmdline.split("\0").filter(Boolean).join(" ");
       let command = argv || stat.name;
       if (argv.includes(COMMAND_VARIABLE)) {
-        // The group leader still running the launcher is the shell; one a command replaced with
-        // exec is the program and is listed.
-        if (stat.pid === pgid) continue;
-        command = `${stat.name} (subshell of the command)`;
+        // The group leader still running the launcher is the shell, listed only when it waits for
+        // input itself, e.g. in `read`; one a command replaced with exec is the program and is
+        // listed.
+        if (stat.pid !== pgid) command = `${stat.name} (subshell of the command)`;
+        else if (yield* readsStdin(fs, stat.pid)) command = `${stat.name} (the command's shell)`;
+        else continue;
       }
       if (command.length > MAX_MEMBER_COMMAND_CHARS) {
         command = `${command.slice(0, MAX_MEMBER_COMMAND_CHARS)} …`;
@@ -379,7 +383,9 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number) {
         const name = channel.trim();
         if (name && name !== "0") state = WAIT_CHANNELS[name] ?? `${state} in ${name}`;
         // A program reading stdin waits for input that only the model can send. The session's
-        // stdin stays open, so the wait never ends otherwise.
+        // stdin stays open, so the wait never ends otherwise. The leader's stdin stands for the
+        // session's unless the command redirected it with exec, after which a write reports the
+        // failure.
         if (yield* readsStdin(fs, stat.pid)) {
           const session = yield* fs.readLink(`/proc/${pgid}/fd/0`).pipe(Effect.option);
           const own = yield* fs.readLink(`/proc/${stat.pid}/fd/0`).pipe(Effect.option);
@@ -423,8 +429,11 @@ class Task {
   private shown = 0;
   /** Bytes written to stdin and not yet flushed; Bun leaves `writableLength` at zero. */
   queuedInput = 0;
-  /** Whether a wait already ended for the quiet stretch the command is in; see QUIET_WAKE_MS. */
-  private quietReported = false;
+  /**
+   * Where the last wait that ended early for a quiet stretch saw it end; see QUIET_WAKE_MS. Until
+   * output or activity follows, including between waits, no other wait ends early.
+   */
+  private reportedQuiet: { activity: Activity; outputBytes: number } | undefined;
 
   constructor(
     readonly id: string,
@@ -558,10 +567,11 @@ class Task {
       const page = yield* this.output.page(cursor, from);
       const pgid = this.child.pid;
       const live = summary.state === "running" || summary.state === "draining";
-      const processes =
-        withProcesses && live && pgid !== undefined ? yield* groupMembers(this.fs, pgid) : [];
       const result: ProcessResult = { ...summary, ...page };
-      return processes.length ? { ...result, processes } : result;
+      if (!withProcesses || !live || pgid === undefined || process.platform !== "linux") {
+        return result;
+      }
+      return { ...result, processes: yield* groupMembers(this.fs, pgid) };
     });
   }
 
@@ -579,17 +589,24 @@ class Task {
       let previous = yield* sampleActivity(this.fs, pgid);
       let since = previous.at;
       let outputBytes = this.output.totalBytes;
+      const reported = this.reportedQuiet;
+      if (
+        reported &&
+        (reported.outputBytes !== outputBytes || active(reported.activity, previous))
+      ) {
+        this.reportedQuiet = undefined;
+      }
       while (true) {
         yield* Effect.sleep(ACTIVITY_SAMPLE_INTERVAL_MS);
         const sample = yield* sampleActivity(this.fs, pgid);
         if (this.output.totalBytes !== outputBytes || active(previous, sample)) {
           outputBytes = this.output.totalBytes;
           since = sample.at;
-          this.quietReported = false;
+          this.reportedQuiet = undefined;
         }
         previous = sample;
-        if (!this.quietReported && sample.at - since >= QUIET_WAKE_MS) {
-          this.quietReported = true;
+        if (this.reportedQuiet === undefined && sample.at - since >= QUIET_WAKE_MS) {
+          this.reportedQuiet = { activity: sample, outputBytes };
           return seconds(sample.at - since);
         }
       }
@@ -795,7 +812,8 @@ const COMMAND_VARIABLE = "PI_BASH_COMMAND";
 /**
  * How to start a command. The shell evaluates the command from the environment, so the command's
  * text stays out of every argv: `pgrep -f` and `pkill -f` patterns written in a command would
- * otherwise match the shell running it.
+ * otherwise match the shell running it. The launcher is POSIX shell syntax, which the Bash that
+ * `shellPath` names accepts.
  */
 function launcher(shell: { shell: string; args: string[] }, command: Command) {
   const text = command.shellCommandPrefix

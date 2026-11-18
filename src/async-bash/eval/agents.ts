@@ -74,13 +74,17 @@ const onlyFile = (fs: FileSystem.FileSystem, directory: string) =>
     return join(directory, files[0]!);
   });
 
-function apiKey(options: AgentOptions): string {
+/** The provider's entry in Pi's auth.json; agents get only this one. */
+function credential(options: AgentOptions): { key: string } {
   const entry = (
     JSON.parse(readFileSync(options.auth, "utf8")) as Record<string, { key?: string }>
   )[options.provider];
   if (!entry?.key) throw new Error(`${options.auth} has no API key for ${options.provider}`);
-  return entry.key;
+  return { ...entry, key: entry.key };
 }
+
+/** The API key the agent uses, which results replace wherever the model printed it. */
+export const apiKey = (options: AgentOptions) => credential(options).key;
 
 export function pi(options: AgentOptions): Agent {
   const cli = fileURLToPath(
@@ -114,7 +118,11 @@ export function pi(options: AgentOptions): Agent {
         const fs = yield* FileSystem.FileSystem;
         yield* fs.makeDirectory(join(home, "agent"), { recursive: true, mode: 0o700 });
         yield* fs.makeDirectory(join(home, "sessions"), { mode: 0o700 });
-        yield* fs.copyFile(options.auth, join(home, "agent", "auth.json"));
+        yield* fs.writeFileString(
+          join(home, "agent", "auth.json"),
+          JSON.stringify({ [options.provider]: credential(options) }),
+          { mode: 0o600 },
+        );
       }),
     start: (home, _workdir, prompt) => ({
       command: process.execPath,

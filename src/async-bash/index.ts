@@ -113,7 +113,12 @@ function status(value: Status): string {
       return notes.join(", ");
     }
     case "draining": {
-      const remaining = value.processes?.length
+      // An empty list means the group has exited, and only output from processes outside it, e.g.
+      // started with setsid, is still being captured, which kill cannot stop.
+      if (value.processes?.length === 0) {
+        return `${stopped}shell exited with ${code} after ${runtime}; its process group has exited, and output from processes that left the group is still being captured (poll waits for capture to end)`;
+      }
+      const remaining = value.processes
         ? describeMembers(value.processes)
         : "processes it started in the background";
       const quiet =
@@ -166,8 +171,8 @@ function inputNotes(value: Pick<ProcessResult, "input_error" | "input_refused">)
 
 /**
  * Thins lines redrawn with carriage returns, such as progress bars, which otherwise fill a page with
- * frames, to a few frames spread from the first to the last: a single frame would hide whether the
- * line still moves. The log keeps every byte; terminal line ends stay.
+ * frames, to a few frames spread from the first to the last: a single frame, all a terminal shows,
+ * would hide whether the line still moves. The log keeps every byte; terminal line ends stay.
  */
 function collapseRedraws(text: string): string {
   if (!text.includes("\r")) return text;

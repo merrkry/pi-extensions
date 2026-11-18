@@ -522,15 +522,46 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
         text(silent),
         /no output for 3\d s, no CPU or I\/O for 3\d s, which ended this wait early, processes: pid \d+ cat \(waiting for input on the session's stdin, which process write sends and eof closes\)/u,
       );
+      // Output between waits starts a new quiet stretch, which ends the next long wait early too.
+      const task = silent.structuredContent as ProcessResult;
+      await processAction({ action: "write", session_id: task.session_id, chars: "x\n" });
+      const restarted = performance.now();
+      const quietAgain = await poll(task, { yield_time_ms: 80_000 });
+      assert.ok(performance.now() - restarted < 40_000);
+      assert.ok(quietAgain.quiet_seconds !== undefined);
       const closed = await processAction({
         action: "write",
-        session_id: (silent.structuredContent as ProcessResult).session_id,
+        session_id: task.session_id,
         eof: true,
       });
       assert.equal(closed.state, "exited");
     },
-    // A wait ends early after 30 s without output or activity.
-    45_000,
+    // Each wait ends early after 30 s without output or activity.
+    80_000,
+  );
+
+  test.skipIf(process.platform !== "linux")(
+    "lists the command's own shell while it reads the session's stdin",
+    async () => {
+      const reading = await start("read -r line; printf 'got %s' \"$line\"");
+      await vi.waitFor(
+        async () => {
+          const result = await poll(reading, { yield_time_ms: 0 });
+          assert.match(
+            result.processes?.map((member) => `${member.command}: ${member.state}`).join() ?? "",
+            /\(the command's shell\): waiting for input on the session's stdin/u,
+          );
+        },
+        { timeout: 3000 },
+      );
+      const answered = await processAction({
+        action: "write",
+        session_id: reading.session_id,
+        chars: "yes\n",
+        yield_time_ms: 2000,
+      });
+      assert.equal(answered.output, "got yes");
+    },
   );
 
   test(
