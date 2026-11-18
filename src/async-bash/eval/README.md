@@ -2,10 +2,14 @@
 
 Runs a coding agent with a model on tasks distilled from tool-use failures seen
 in a [Frontier Harness](https://frontierharness.org/) run with `deepseek-flash`
-at thinking `max`, and checks the outcome and how the model got there. A case
-belongs here only if the tools decide it: a model that overcomes weaker tools
-on its own makes the case measure the model instead. The agent is Pi with this extension, or Codex as a reference for another
-harness's shell tools.
+at thinking `max`, and checks the outcome and how the model got there. The agent
+is Pi with this extension, or Codex as a reference for another harness's shell
+tools.
+
+Each case pairs a way a program behaves, as the tools observe it, with what the
+tools give the model to handle it. Why the program behaves that way is fixture
+detail. A case belongs here only if the tools decide it: a model that
+overcomes weaker tools on its own makes the case measure the model instead.
 
 ## Run
 
@@ -59,10 +63,32 @@ runner last saw it before the last tool result preceding the final answer: Pi
 stops its sessions when it exits, so a fixture being gone at check time proves
 nothing.
 
-| Case       | Source                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Checks                                                                                                          |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `hung-run` | vpp-loss-divergence: a run deadlocked and ignored TERM inside `timeout 900`, with a 900 s wait, blocking for 15 minutes. chess-best-move: a hung analysis was polled blind for 6 minutes. The prompt, like those tasks, expects a run of minutes. Epochs compute silently for up to 14 s, so silence alone shows no hang, and the hang shows only at run time: one shard's warnings fill the loader's stderr pipe, which `train.py` reads only after stdout ends. | Within 150 s, reports the final loss or that the run cannot finish, edits nothing, stopped it before answering. |
-| `server`   | hf-model-inference, kv-store-grpc: `cd /app && setsid nohup server &` left a wrapper subshell that held each call for its whole wait, followed by turns spent on the session's state. The service must start from its directory.                                                                                                                                                                                                                                  | Within 30 s and 6 calls, no call of 4 s or more, the server answers after the agent exits.                      |
+### `hung-run`
+
+- **Program:** a training run that the prompt says takes minutes. It computes
+  silently for up to 14 s at a time, then goes silent and idle for good partway
+  through, and ignores TERM. Nothing in its files shows the stall before the
+  run reaches it.
+- **Tools:** a long wait returns once the command has been silent and idle for
+  30 s, and results name what each remaining process waits on.
+- **Source:** vpp-loss-divergence, where a run deadlocked and ignored TERM inside
+  `timeout 900`, with a 900 s wait, blocking for 15 minutes; chess-best-move,
+  where a hung analysis was polled blind for 6 minutes.
+- **Checks:** within 150 s, reports the final loss or that the run cannot
+  finish, edits nothing, stopped it before answering.
+
+### `server`
+
+- **Program:** a service that must keep running after the agent exits, started
+  from its own directory, which leaves a background process behind once its
+  shell exits.
+- **Tools:** a wait ends 2 s after the shell exits and leaves the remaining
+  processes draining, listed with what they wait on.
+- **Source:** hf-model-inference and kv-store-grpc, where
+  `cd /app && setsid nohup server &` left a wrapper subshell that held each call
+  for its whole wait, followed by turns spent on the session's state.
+- **Checks:** within 30 s and 6 calls, no call of 4 s or more, the server
+  answers after the agent exits.
 
 `results.json` also records metrics per attempt: wall time, tool calls, shell
 and session calls, the slowest call, kilobytes of tool results, uses of the
