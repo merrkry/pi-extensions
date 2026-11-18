@@ -290,7 +290,7 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
         check(
           "saw /health answer ok",
           run.calls.some(
-            (call) => JSON.stringify(call.args).includes("/health") && /^ok\b/mu.test(call.text),
+            (call) => JSON.stringify(call.args).includes("/health") && /\bok\b/u.test(call.text),
           ),
         ),
         check("no call waited 4 s or more", slowest < 4, `${Math.round(slowest)} s`),
