@@ -2,8 +2,11 @@ import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { Duration, Effect, Fiber, FileSystem, Option, Stream } from "effect";
 import { ChildProcess } from "effect/process";
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { readdir, readFile, readlink } from "node:fs/promises";
+import { homedir } from "node:os";
 import { createServer } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { type Agent, codex, type Invocation, pi } from "./agents.ts";
@@ -11,10 +14,11 @@ import {
   type Case,
   cases,
   type Check,
-  registered,
   type Run,
   SESSION_TOOLS,
   SHELL_TOOLS,
+  SIGHTING_INTERVAL_MS,
+  type Sighting,
   unrequestedSignalExits,
 } from "./cases.ts";
 
@@ -89,6 +93,58 @@ function metrics(run: Run): Record<string, number> {
   };
 }
 
+/**
+ * Records processes running one of the case's scripts from `workdir`, so checks need nothing from
+ * the fixtures themselves. Only Python processes count, so a tracer or shell naming the script in
+ * its arguments is not taken for it. Linux only.
+ */
+function watchFixtures(scripts: Set<string>, workdir: string, sightings: Map<number, Sighting>) {
+  const look = async () => {
+    const now = Date.now();
+    for (const entry of await readdir("/proc").catch(() => [])) {
+      if (!/^\d+$/u.test(entry)) continue;
+      const pid = Number(entry);
+      const known = sightings.get(pid);
+      const stat = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => undefined);
+      if (!stat || stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z")) continue;
+      if (known) {
+        known.lastSeen = now;
+        continue;
+      }
+      if (!stat.slice(stat.indexOf("(") + 1, stat.lastIndexOf(")")).startsWith("python")) continue;
+      const argv = (await readFile(`/proc/${pid}/cmdline`, "utf8").catch(() => ""))
+        .split("\0")
+        .filter(Boolean);
+      const cwd = await readlink(`/proc/${pid}/cwd`).catch(() => undefined);
+      const script = argv.slice(1).find((arg) => scripts.has(basename(arg)));
+      if (!script || !cwd || !resolve(cwd, script).startsWith(`${workdir}/`)) continue;
+      sightings.set(pid, { name: basename(script, ".py"), pid, firstSeen: now, lastSeen: now });
+    }
+  };
+  return Effect.promise(look).pipe(
+    Effect.andThen(Effect.sleep(SIGHTING_INTERVAL_MS)),
+    Effect.forever,
+  );
+}
+
+/** Every fixture run: those the runner saw, and those that marked their start but ended unseen. */
+const fixtureRuns = (
+  fs: FileSystem.FileSystem,
+  stateDirectory: string,
+  sightings: Map<number, Sighting>,
+) =>
+  Effect.gen(function* () {
+    const runs = [...sightings.values()].map((sighting) => ({ ...sighting }));
+    for (const entry of yield* fs.readDirectory(join(stateDirectory, "started"))) {
+      const pid = Number(entry.slice(entry.lastIndexOf(".") + 1));
+      if (sightings.has(pid)) continue;
+      const info = yield* fs.stat(join(stateDirectory, "started", entry));
+      const at = Option.getOrElse(info.mtime, () => new Date(0)).getTime();
+      runs.push({ name: entry.slice(0, entry.lastIndexOf(".")), pid, firstSeen: at, lastSeen: at });
+    }
+    return runs;
+  });
+
 const killAll = (pids: number[]) =>
   Effect.sync(() => {
     for (const pid of pids) {
@@ -99,6 +155,60 @@ const killAll = (pids: number[]) =>
       }
     }
   });
+
+const bubblewrap = (() => {
+  if (process.platform !== "linux") return undefined;
+  try {
+    return execFileSync("sh", ["-c", "command -v bwrap"], { encoding: "utf8" }).trim() || undefined;
+  } catch {
+    return undefined;
+  }
+})();
+
+/**
+ * Hides the home directory, /tmp, and the eval's own sources and results from the agent, so an
+ * attempt sees neither the cases' answers, earlier attempts, nor credentials beyond its own, which
+ * models otherwise go looking for. The attempt's directory, the repository and Node installation the
+ * agent runs from, and the extension under test stay visible. Linux with bubblewrap only; elsewhere attempts run as is.
+ */
+const nodeInstallation = resolve(process.execPath, "../..");
+
+function sandboxed(invocation: Invocation, root: string, extension: string): Invocation {
+  if (!bubblewrap) return invocation;
+  const hidden = ["src/async-bash/eval", ".eval", ".dev"]
+    .map((path) => join(repository, path))
+    .filter((path) => existsSync(path));
+  return {
+    ...invocation,
+    command: bubblewrap,
+    args: [
+      "--dev-bind",
+      "/",
+      "/",
+      "--tmpfs",
+      "/tmp",
+      "--tmpfs",
+      homedir(),
+      "--ro-bind",
+      repository,
+      repository,
+      "--ro-bind",
+      nodeInstallation,
+      nodeInstallation,
+      ...hidden.flatMap((path) => ["--tmpfs", path]),
+      "--ro-bind",
+      dirname(extension),
+      dirname(extension),
+      "--bind",
+      root,
+      root,
+      "--die-with-parent",
+      "--",
+      invocation.command,
+      ...invocation.args,
+    ],
+  };
+}
 
 /** Runs one agent turn within `budget`; the result says whether it exited on its own. */
 const invoke = (
@@ -135,7 +245,7 @@ const invoke = (
     }),
   );
 
-function attempt(agent: Agent, testCase: Case, index: number, out: string) {
+function attempt(agent: Agent, testCase: Case, index: number, out: string, extension: string) {
   return Effect.scoped(
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -146,15 +256,12 @@ function attempt(agent: Agent, testCase: Case, index: number, out: string) {
       for (const directory of [workdir, stateDirectory, home]) {
         yield* fs.makeDirectory(directory, { mode: 0o700 });
       }
-      yield* fs.makeDirectory(join(stateDirectory, "pids"));
       yield* fs.makeDirectory(join(stateDirectory, "secrets"));
+      yield* fs.makeDirectory(join(stateDirectory, "started"));
       yield* agent.prepare(home);
       for (const [name, content] of Object.entries(testCase.files)) {
         yield* fs.makeDirectory(dirname(join(workdir, name)), { recursive: true });
         yield* fs.writeFileString(join(workdir, name), content);
-      }
-      for (const name of testCase.fifos ?? []) {
-        yield* Effect.sync(() => execFileSync("mkfifo", [join(workdir, name)]));
       }
       const port = yield* freePort;
       const env = { EVAL_STATE: stateDirectory };
@@ -168,39 +275,20 @@ function attempt(agent: Agent, testCase: Case, index: number, out: string) {
         );
       }
 
-      // Fixtures are stopped even when the attempt fails or is interrupted.
-      yield* Effect.addFinalizer(() =>
-        Effect.promise(() => registered(stateDirectory)).pipe(
-          Effect.flatMap(killAll),
-          Effect.ignore,
-        ),
-      );
-      // The attempt's scope owns each fixture's process group from the start, so an attempt
-      // interrupted before a fixture registers still stops it.
-      for (const script of testCase.setup ?? []) {
-        yield* ChildProcess.make("python3", [script], {
-          cwd: workdir,
-          env: { ...process.env, ...env },
-          extendEnv: false,
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-          forceKillAfter: Duration.seconds(1),
-        });
-      }
-      const setupPids = yield* Effect.promise(async () => {
-        const expected = testCase.setup?.length ?? 0;
-        for (let tries = 0; tries < 50; tries++) {
-          const pids = await registered(stateDirectory);
-          if (pids.length >= expected) return pids;
-          await new Promise((wake) => setTimeout(wake, 100));
-        }
-        throw new Error(`${testCase.name}: setup fixtures did not start`);
-      });
+      const sightings = new Map<number, Sighting>();
+      // Fixtures are stopped even when the attempt fails or is interrupted, including those meant
+      // to outlive the agent. Finalizers run in reverse, so the watcher has stopped by then.
+      yield* Effect.addFinalizer(() => killAll([...sightings.keys()]));
+      const scripts = new Set(Object.keys(testCase.files).filter((file) => file.endsWith(".py")));
+      yield* watchFixtures(
+        new Set([...scripts].map((file) => basename(file))),
+        workdir,
+        sightings,
+      ).pipe(Effect.forkScoped);
 
       const started = performance.now();
       const turn = yield* invoke(
-        agent.start(home, workdir, testCase.prompt(port)),
+        sandboxed(agent.start(home, workdir, testCase.prompt(port)), root, extension),
         workdir,
         env,
         Duration.seconds(testCase.budgetSeconds),
@@ -216,19 +304,19 @@ function attempt(agent: Agent, testCase: Case, index: number, out: string) {
           ),
         );
       yield* fs.copyFile(transcript.file, join(out, `${name}.jsonl`));
+      // Let processes the agent stopped on exit finish dying before checks look at them.
+      yield* Effect.sleep(Duration.seconds(1));
       const run: Run = {
         workdir,
         stateDirectory,
         port,
         finished: turn.finished,
         wallSeconds,
-        setupPids,
+        fixtures: yield* fixtureRuns(fs, stateDirectory, sightings),
         calls: transcript.calls,
         finalText: transcript.finalText,
         answerStartedAt: transcript.answerStartedAt,
       };
-      // Let processes the agent stopped on exit finish dying before checks look at them.
-      yield* Effect.sleep(Duration.seconds(1));
       // Checks read files the agent left behind, so a malformed one fails the attempt, not the eval.
       const checks = yield* Effect.tryPromise({
         try: () => testCase.check(run),
@@ -242,7 +330,12 @@ function attempt(agent: Agent, testCase: Case, index: number, out: string) {
       let debrief: string | undefined;
       if (options.debrief) {
         const invocation = agent.debrief(home, transcript, DEBRIEF_PROMPT);
-        const reply = yield* invoke(invocation, workdir, env, DEBRIEF_BUDGET);
+        const reply = yield* invoke(
+          sandboxed(invocation, root, extension),
+          workdir,
+          env,
+          DEBRIEF_BUDGET,
+        );
         debrief = invocation.answerFile
           ? yield* fs.readFileString(invocation.answerFile).pipe(Effect.orElseSucceed(() => ""))
           : reply.stdout.trim();
@@ -283,12 +376,19 @@ const main = Effect.gen(function* () {
   if (unknown.length) {
     return yield* Effect.fail(new Error(`Unknown cases: ${unknown.join(", ")}`));
   }
+  // Agents load a copy under a neutral name, so its path does not tell them which build it is.
+  const built = resolve(options.extension);
+  const staged = yield* fs.makeTempDirectoryScoped({ prefix: "pi-extension-" });
+  for (const file of yield* fs.readDirectory(dirname(built))) {
+    if (file.endsWith(".js")) yield* fs.copyFile(join(dirname(built), file), join(staged, file));
+  }
+  const extension = join(staged, basename(built));
   const agentOptions = {
     provider: options.provider,
     model: options.model,
     thinking: options.thinking,
     auth: resolve(options.auth),
-    extension: resolve(options.extension),
+    extension,
     baseUrl: options["base-url"],
     codexTemplate: options["codex-template"],
   };
@@ -311,7 +411,7 @@ const main = Effect.gen(function* () {
   const results = yield* Effect.forEach(
     attempts,
     ({ testCase, index }) =>
-      attempt(agent, testCase, index, out).pipe(
+      attempt(agent, testCase, index, out, extension).pipe(
         Effect.tap((result) =>
           Effect.sync(() => console.error(summarize([result]).split("\n")[0])),
         ),
@@ -319,10 +419,10 @@ const main = Effect.gen(function* () {
     // Attempts share the process table, e.g. pkill in one would stop another's fixtures.
     { concurrency: 1 },
   );
-  const { auth: _auth, ...recorded } = agentOptions;
+  const { auth: _auth, ...recorded } = { ...agentOptions, extension: built };
   const report = { agent: options.agent, ...recorded, results };
   yield* fs.writeFileString(join(out, "results.json"), `${JSON.stringify(report, null, 2)}\n`);
   yield* Effect.sync(() => console.log(`${summarize(results)}\nResults: ${out}`));
 });
 
-NodeRuntime.runMain(main.pipe(Effect.provide(NodeServices.layer)));
+NodeRuntime.runMain(main.pipe(Effect.scoped, Effect.provide(NodeServices.layer)));

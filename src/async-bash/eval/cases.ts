@@ -1,4 +1,4 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 
@@ -14,7 +14,7 @@ export interface ToolCall {
 /** A finished run of one case, as the checks see it. */
 export interface Run {
   workdir: string;
-  /** Holds `pids/` and `secrets/`, which fixtures write and checks read. */
+  /** Holds `secrets/` and `started/`, which fixtures write and checks read. */
   stateDirectory: string;
   port: number;
   /** Whether the agent exited on its own within the case's budget. */
@@ -28,9 +28,24 @@ export interface Run {
    * returned before the answer.
    */
   answerStartedAt: number | undefined;
-  /** Fixture processes the runner started before the agent. */
-  setupPids: number[];
+  /** The fixture processes the runner saw while the agent ran. */
+  fixtures: Sighting[];
 }
+
+/**
+ * A process running one of a case's Python scripts, from the first to the last time the runner saw
+ * it, in milliseconds since the epoch. The runner looks every `SIGHTING_INTERVAL_MS`; a run that
+ * ended before it looked counts as seen once, when it started.
+ */
+export interface Sighting {
+  /** The script's name without `.py`. */
+  name: string;
+  pid: number;
+  firstSeen: number;
+  lastSeen: number;
+}
+
+export const SIGHTING_INTERVAL_MS = 200;
 
 export interface Check {
   name: string;
@@ -43,45 +58,28 @@ export interface Case {
   name: string;
   budgetSeconds: number;
   files: Record<string, string>;
-  /** Named pipes to create in the working directory; nothing writes to them. */
-  fifos?: string[];
   /** Python run to completion in the working directory before the agent starts. */
   prepare?: string;
   prompt: (port: number) => string;
-  /** Fixture scripts to start before the agent, outside its process groups. */
-  setup?: string[];
   check: (run: Run) => Promise<Check[]>;
 }
-
-const BEAT_MS = 100;
 
 /** Agents name their shell tools differently. */
 export const SHELL_TOOLS = new Set(["bash", "exec_command"]);
 export const SESSION_TOOLS = new Set(["process", "write_stdin"]);
 
 /**
- * Fixtures record their pids, so checks can tell which are alive and cleanup can stop them, and
- * record digests of per-run values that answers must contain. Digests keep the values useless to
- * a model that finds the state directory. While a fixture runs, a thread touches its pid file every
- * `BEAT_MS`, so checks can tell when it stopped, even when it is blocked or Pi stopped it on exit.
+ * Fixtures record digests of per-run values that answers must contain. Digests keep the values
+ * useless to a model that finds the state directory. Each also marks that it started, for runs too
+ * short for the runner to see; the runner tracks longer ones itself.
  */
-const register = (name: string) => `import hashlib, os, threading, time
-_STATE = os.environ["EVAL_STATE"]
-_PID_FILE = os.path.join(_STATE, "pids", f"${name}.{os.getpid()}")
-open(_PID_FILE, "w").close()
+const RECORDER = `import hashlib, os, sys, time
 
-
-def _beat():
-    while True:
-        os.utime(_PID_FILE)
-        time.sleep(${BEAT_MS / 1000})
-
-
-threading.Thread(target=_beat, daemon=True).start()
+open(os.path.join(os.environ["EVAL_STATE"], "started", f"{os.path.basename(sys.argv[0])[:-3]}.{os.getpid()}"), "w").close()
 
 
 def record(key, value):
-    with open(os.path.join(_STATE, "secrets", key), "w") as file:
+    with open(os.path.join(os.environ["EVAL_STATE"], "secrets", key), "w") as file:
         file.write(hashlib.sha256(str(value).encode()).hexdigest())
 
 
@@ -99,18 +97,12 @@ export async function alive(pid: number): Promise<boolean> {
   return status.slice(status.lastIndexOf(")") + 2).split(" ")[0] !== "Z";
 }
 
-/** Pids registered by fixtures named `name`, or by all fixtures. */
-export async function registered(stateDirectory: string, name?: string): Promise<number[]> {
-  const entries = await readdir(join(stateDirectory, "pids"));
-  return entries
-    .filter((entry) => name === undefined || entry.startsWith(`${name}.`))
-    .map((entry) => Number(entry.slice(entry.lastIndexOf(".") + 1)));
-}
+const sightingsOf = (run: Run, name: string) =>
+  run.fixtures.filter((fixture) => fixture.name === name);
 
 async function livePids(run: Run, name: string): Promise<number[]> {
-  const pids = await registered(run.stateDirectory, name);
   const live = [];
-  for (const pid of pids) if (await alive(pid)) live.push(pid);
+  for (const { pid } of sightingsOf(run, name)) if (await alive(pid)) live.push(pid);
   return live;
 }
 
@@ -125,6 +117,15 @@ async function matches(run: Run, key: string, text: string | undefined): Promise
   if (expected === undefined || text === undefined) return false;
   const words = [text.trim(), ...text.split(/[^\w.-]+/u)];
   return words.some((word) => word && digest(word) === expected);
+}
+
+/** Whether `text` holds a value recorded under any key starting with `prefix`. */
+async function someMatches(run: Run, prefix: string, text: string): Promise<boolean> {
+  const keys = await readdir(join(run.stateDirectory, "secrets"));
+  for (const key of keys.filter((entry) => entry.startsWith(prefix))) {
+    if (await matches(run, key, text)) return true;
+  }
+  return false;
 }
 
 const contentOf = (run: Run, name: string) =>
@@ -143,19 +144,19 @@ const within = (run: Run, seconds: number) =>
 /**
  * Whether the model ran fixture `name` and every run of it had stopped before the model started
  * its answer. Pi stops its sessions when it exits, after the answer, so being gone at check time
- * proves nothing. A fixture still running when the answer starts beats again before Pi exits:
- * generating an answer takes far longer than `BEAT_MS`, at least 0.8 s in recorded runs.
+ * proves nothing. The runner sees a fixture still running when the answer starts again before Pi
+ * exits: generating an answer takes far longer than `SIGHTING_INTERVAL_MS`, at least 0.8 s in
+ * recorded runs.
  */
-async function stoppedBeforeAnswer(run: Run, name: string): Promise<Check> {
+function stoppedBeforeAnswer(run: Run, name: string): Check {
   const label = `ran ${name} and stopped it before answering`;
-  const files = await readdir(join(run.stateDirectory, "pids"));
-  const beats: number[] = [];
-  for (const file of files.filter((entry) => entry.startsWith(`${name}.`))) {
-    beats.push((await stat(join(run.stateDirectory, "pids", file))).mtimeMs);
-  }
-  if (beats.length === 0) return check(label, false, "never ran");
+  const sightings = sightingsOf(run, name);
+  if (sightings.length === 0) return check(label, false, "never ran");
   const answer = run.answerStartedAt;
-  return check(label, answer !== undefined && beats.every((beat) => beat < answer));
+  return check(
+    label,
+    answer !== undefined && sightings.every((fixture) => fixture.lastSeen < answer),
+  );
 }
 
 const unchanged = async (run: Run, name: string, source: string) =>
@@ -194,7 +195,35 @@ const STOPPED_EARLY =
 /** Final answers use markdown, whose emphasis would split the phrases checks look for. */
 const plain = (text: string) => text.replaceAll(/[*_`]/gu, "");
 
-const SERVICE = `${register("service")}import secrets
+const TRAINING_SHARDS = 40;
+const HUNG_SHARD = 4;
+
+const TRAIN = `${RECORDER}import signal, subprocess
+
+
+def on_term(signum, frame):
+    print("SIGTERM received; finishing the current epoch first", flush=True)
+
+
+def load(parts):
+    paths = [f"data/{part}" for part in parts]
+    return [float(value) for value in subprocess.run(["zcat", *paths], stdout=subprocess.PIPE, check=True).stdout.split()]
+
+
+signal.signal(signal.SIGTERM, on_term)
+manifest = [line.split(":") for line in open("data/manifest.txt").read().splitlines()]
+print(f"training on {len(manifest)} shards", flush=True)
+for epoch, (shard, parts) in enumerate(manifest, 1):
+    values = load(parts.split())
+    deadline = time.time() + 4
+    while time.time() < deadline:
+        sum(index * index for index in range(10_000))
+    loss = sum(values) / len(values)
+    print(f"epoch {epoch}/{len(manifest)} {shard} loss={loss:.3f}", flush=True)
+print(f"final loss: {loss:.3f}", flush=True)
+`;
+
+const SERVICE = `${RECORDER}import secrets
 
 
 def handshake():
@@ -213,7 +242,7 @@ def handshake():
 handshake()
 `;
 
-const CONSOLE = `${register("console")}import os, random, sys, termios, tty
+const CONSOLE = `${RECORDER}import os, random, sys, termios, tty
 
 if not (os.isatty(0) and os.isatty(1)):
     print("console.py: stdin and stdout must be a terminal", file=sys.stderr)
@@ -237,41 +266,40 @@ export const cases: Case[] = [
     name: "hung-run",
     budgetSeconds: 300,
     files: {
-      "train.py": `${register("train")}import glob, signal, time
-
-
-def on_term(signum, frame):
-    print("SIGTERM received; finishing the current epoch first", flush=True)
-
-
-signal.signal(signal.SIGTERM, on_term)
-shards = sorted(glob.glob("data/shard-*.txt"))
-for epoch, shard in enumerate(shards, 1):
-    with open(shard) as data:
-        values = [float(value) for value in data.read().split()]
-    time.sleep(2)
-    loss = sum(values) / len(values)
-    print(f"epoch {epoch}/{len(shards)} loss={loss:.3f}")
-print(f"final loss: {loss:.3f}")
-`,
-      "data/shard-1.txt": "0.95 0.85\n",
-      "data/shard-2.txt": "0.55 0.35\n",
+      "train.py": TRAIN,
     },
-    // The last shard's producer never starts, so reading it blocks forever.
-    fifos: ["data/shard-3.txt"],
+    // The manifest lists no parts for one shard, so zcat reads the command's stdin, which stays
+    // open; TERM only makes train.py print.
+    prepare: `import gzip, os
+os.makedirs("data")
+lines = []
+for shard in range(1, ${TRAINING_SHARDS + 1}):
+    name = f"shard-{shard:02d}"
+    parts = [] if shard == ${HUNG_SHARD} else [f"{name}-{half}.gz" for half in "ab"]
+    for index, part in enumerate(parts):
+        with gzip.open(f"data/{part}", "wt") as file:
+            file.write(f"{(1 - index / 10) / shard:.3f}\\n")
+    lines.append(f"{name}: {' '.join(parts)}".rstrip())
+open("data/manifest.txt", "w").write("\\n".join(lines) + "\\n")
+`,
     prompt: () =>
-      "Run `python3 train.py` in this directory. It normally finishes within 20 seconds, and its last line is the final loss. Report the final loss.",
+      "Train the model with `python3 train.py` and report the final loss. Training takes a few minutes. Run it as it is; do not change any files.",
     check: async (run) => [
-      within(run, 90),
-      check("reports that the run hangs", STOPPED_EARLY.test(plain(run.finalText))),
-      await stoppedBeforeAnswer(run, "train"),
+      within(run, 120),
+      check(
+        "reports that the run cannot finish",
+        STOPPED_EARLY.test(plain(run.finalText)) ||
+          /\b(?:crash\w*|fail\w*)\b/iu.test(run.finalText),
+      ),
+      await unchanged(run, "train.py", TRAIN),
+      stoppedBeforeAnswer(run, "train"),
     ],
   },
   {
     name: "watch-and-stop",
     budgetSeconds: 300,
     files: {
-      "emulator.py": `${register("emulator")}time.sleep(4)
+      "emulator.py": `${RECORDER}time.sleep(4)
 while True:
     with open("frame.ppm", "wb") as frame:
         frame.write(b"P6 1 1 255\\n\\0\\0\\0")
@@ -290,7 +318,7 @@ while True:
           "reports 3 to 6 seconds",
           numbers.some((value) => value >= 3 && value <= 6),
         ),
-        await stoppedBeforeAnswer(run, "emulator"),
+        stoppedBeforeAnswer(run, "emulator"),
       ];
     },
   },
@@ -298,12 +326,14 @@ while True:
     name: "server",
     budgetSeconds: 300,
     files: {
-      "server.py": `${register("server")}import http.server, sys
+      "app/server.py": `${RECORDER}import http.server, json, sys
+
+config = json.load(open("config.json"))
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b"ok" if self.path == "/health" else b"not found"
+        body = config["health"].encode() if self.path == "/health" else b"not found"
         self.send_response(200 if self.path == "/health" else 404)
         self.end_headers()
         self.wfile.write(body)
@@ -313,9 +343,10 @@ port = int(sys.argv[1])
 print(f"listening on {port}", flush=True)
 http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
 `,
+      "app/config.json": '{"health": "ok"}\n',
     },
     prompt: (port) =>
-      `Start the HTTP service in server.py so that it listens on port ${port} and keeps running after you finish; it takes the port as its only argument. Then confirm that GET /health answers ok.`,
+      `The HTTP service in app/ reads config.json from its working directory. Start it from app/ with \`python3 server.py ${port}\` so that it keeps running after you finish, then confirm that GET /health on port ${port} answers ok.`,
     check: async (run) => {
       const health = await fetch(`http://127.0.0.1:${run.port}/health`)
         .then((response) => response.text())
@@ -330,10 +361,71 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
     },
   },
   {
+    name: "service-cycle",
+    budgetSeconds: 400,
+    files: {
+      "app/server.py": `${RECORDER}import http.server, json, secrets, sys
+
+config = json.load(open("config.json"))
+stuck = f"/{secrets.token_hex(3)}"
+record(f"stuck.{os.getpid()}", stuck.lstrip("/"))
+record(f"greeting.{os.getpid()}", config["greeting"])
+open("routes.txt", "w").write("\\n".join(["/health", "/greet", stuck, "/version"]) + "\\n")
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == stuck:
+            time.sleep(10**6)
+        bodies = {"/health": "ok", "/greet": config["greeting"], "/version": "1.4"}
+        body = bodies.get(self.path, "not found").encode()
+        self.send_response(200 if self.path in bodies else 404)
+        self.end_headers()
+        self.wfile.write(body)
+
+
+port = int(sys.argv[1])
+print(f"listening on {port}", flush=True)
+http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+`,
+      "app/config.json": '{"greeting": "hello"}\n',
+      "check.py": `${RECORDER}import sys, urllib.request
+
+port = sys.argv[1]
+for route in open("app/routes.txt").read().split():
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}{route}") as response:
+        print(f"{route}: {response.status} {response.read().decode()}", flush=True)
+print("all routes answered")
+`,
+    },
+    prompt: (port) =>
+      `The service in app/ reads config.json from its working directory and writes the routes it serves to app/routes.txt. Start it from app/ with \`python3 server.py ${port}\` so that it keeps running after you finish, then run \`python3 check.py ${port}\` from this directory, which requests every route. Report any route that does not answer. Finally set greeting to "hi" in app/config.json and restart the service so that it serves the new greeting.`,
+    check: async (run) => {
+      const greeting = await fetch(`http://127.0.0.1:${run.port}/greet`, {
+        signal: AbortSignal.timeout(3000),
+      })
+        .then((response) => response.text())
+        .catch((error: unknown) => String(error));
+      const live = await livePids(run, "server");
+      const selfKills = unrequestedSignalExits(run.calls);
+      return [
+        within(run, 180),
+        check(
+          "names the route that does not answer",
+          await someMatches(run, "stuck.", run.finalText),
+        ),
+        check("restarted service answers hi after Pi exits", greeting === "hi", greeting),
+        check("one service runs", live.length === 1, `${live.length} running`),
+        check("no command killed its own shell", selfKills === 0, `${selfKills}`),
+        stoppedBeforeAnswer(run, "check"),
+      ];
+    },
+  },
+  {
     name: "silent-stage",
     budgetSeconds: 300,
     files: {
-      "bench.py": `${register("bench")}import os, time
+      "bench.py": `${RECORDER}import os, time
 
 LOCK = ".index.lock"
 
@@ -370,34 +462,113 @@ for stage in (parse, index, query, report):
     check: async (run) => [
       within(run, 60),
       check("names the stage that does not finish", /\bquery\b/iu.test(run.finalText)),
-      await stoppedBeforeAnswer(run, "bench"),
+      stoppedBeforeAnswer(run, "bench"),
     ],
   },
   {
     name: "restart-worker",
     budgetSeconds: 300,
     files: {
-      "worker.py": `${register("worker")}import time
+      "worker.py": `${RECORDER}import json, os, time
 
+mode = json.load(open("config.json"))["mode"]
+record(f"mode.{os.getpid()}", mode)
+with open("worker.log", "a") as log:
+    log.write(f"worker started, mode={mode}\\n")
 while True:
     time.sleep(1)
 `,
+      "config.json": '{"mode": "slow"}\n',
     },
-    setup: ["worker.py"],
     prompt: () =>
-      "A `python3 worker.py` process started from this directory is running. Restart it: stop it, then start a new one from this directory that keeps running after you finish.",
+      "Start the worker with `python3 worker.py` so that it keeps running after you finish, and confirm from worker.log that it started. Then switch it to fast mode: set `mode` to `fast` in config.json and restart the worker so that the running worker uses it.",
     check: async (run) => {
+      const workers = sightingsOf(run, "worker");
       const live = await livePids(run, "worker");
-      const oldAlive = run.setupPids.filter((pid) => live.includes(pid));
-      const fresh = live.filter((pid) => !run.setupPids.includes(pid));
+      const fast = [];
+      for (const pid of live) if (await matches(run, `mode.${pid}`, "fast")) fast.push(pid);
       const selfKills = unrequestedSignalExits(run.calls);
       return [
-        within(run, 45),
-        check("stopped the old worker", oldAlive.length === 0),
-        check("new worker runs after Pi exits", fresh.length === 1, `${fresh.length} running`),
+        within(run, 60),
+        check("restarted the worker it started", workers.length >= 2, `${workers.length} started`),
+        check(
+          "one worker, in fast mode, runs after Pi exits",
+          live.length === 1 && fast.length === 1,
+          `${live.length} running, ${fast.length} fast`,
+        ),
         check("no command killed its own shell", selfKills === 0, `${selfKills}`),
       ];
     },
+  },
+  {
+    name: "test-timeout",
+    budgetSeconds: 300,
+    files: {
+      "run_tests.sh": `rm -f db.sock
+python3 fake_db.py &
+while [ ! -S db.sock ]; do sleep 0.1; done
+python3 tests.py
+status=$?
+kill $! 2>/dev/null
+exit $status
+`,
+      // Like a database's smart shutdown, TERM stops it only once its clients have disconnected.
+      "fake_db.py": `${RECORDER}import select, signal, socket
+
+stopping = False
+
+
+def on_term(signum, frame):
+    global stopping
+    stopping = True
+    print("fake_db: SIGTERM received; shutting down once clients disconnect", flush=True)
+
+
+signal.signal(signal.SIGTERM, on_term)
+server = socket.socket(socket.AF_UNIX)
+server.bind("db.sock")
+server.listen()
+clients = []
+while not (stopping and not clients):
+    readable, _, _ = select.select([server, *clients], [], [], 0.5)
+    for ready in readable:
+        if ready is server:
+            clients.append(server.accept()[0])
+        elif not ready.recv(1024):
+            clients.remove(ready)
+            ready.close()
+`,
+      "tests.py": `${RECORDER}import random, secrets, signal, socket, time
+
+
+def on_term(signum, frame):
+    print("SIGTERM received; waiting for the running test to finish", flush=True)
+
+
+signal.signal(signal.SIGTERM, on_term)
+names = [f"test_{secrets.token_hex(3)}" for _ in range(8)]
+hung = random.randrange(3, 7)
+record("hung", names[hung])
+for index, name in enumerate(names):
+    print(f"{name} ...", end=" ", flush=True)
+    if index == hung:
+        db = socket.socket(socket.AF_UNIX)
+        db.connect("db.sock")
+        db.sendall(b"sync\\n")
+        db.recv(1)
+    time.sleep(0.5)
+    print("ok", flush=True)
+print(f"{len(names)} passed")
+`,
+    },
+    prompt: () =>
+      "Run the test suite with `sh run_tests.sh` and report the result. CI gives the suite 30 seconds; if it runs longer, report which test hangs.",
+    check: async (run) => [
+      within(run, 90),
+      check("names the hanging test", await matches(run, "hung", run.finalText)),
+      stoppedBeforeAnswer(run, "tests"),
+      stoppedBeforeAnswer(run, "fake_db"),
+    ],
   },
   {
     name: "debugger-repl",
@@ -413,7 +584,7 @@ while True:
         check("reached service ready", ready !== undefined && failed === undefined),
         check("reports the token", await matches(run, "token", run.finalText)),
         await unchanged(run, "service.py", SERVICE),
-        await stoppedBeforeAnswer(run, "service"),
+        stoppedBeforeAnswer(run, "service"),
       ];
     },
   },
@@ -421,7 +592,7 @@ while True:
     name: "overwrite-prompt",
     budgetSeconds: 300,
     files: {
-      "unarc.py": `${register("unarc")}import hashlib, json, os, sys
+      "unarc.py": `${RECORDER}import hashlib, json, os, sys
 
 archive = json.load(open(sys.argv[1]))
 while True:
@@ -466,7 +637,7 @@ open(os.path.join(os.environ["EVAL_STATE"], "secrets", "content"), "w").write(ha
           await matches(run, "content", answer),
           answer,
         ),
-        await stoppedBeforeAnswer(run, "unarc"),
+        stoppedBeforeAnswer(run, "unarc"),
       ];
     },
   },
@@ -482,7 +653,7 @@ open(os.path.join(os.environ["EVAL_STATE"], "secrets", "content"), "w").write(ha
         within(run, 90),
         check("code.txt holds the unlock code", await matches(run, "code", written), written),
         await unchanged(run, "console.py", CONSOLE),
-        await stoppedBeforeAnswer(run, "console"),
+        stoppedBeforeAnswer(run, "console"),
       ];
     },
   },
@@ -490,7 +661,7 @@ open(os.path.join(os.environ["EVAL_STATE"], "secrets", "content"), "w").write(ha
     name: "ctrl-c-summary",
     budgetSeconds: 300,
     files: {
-      "collector.py": `${register("collector")}import json, random, secrets, time
+      "collector.py": `${RECORDER}import json, random, secrets, time
 
 nonce = secrets.token_hex(4)
 record("nonce", nonce)
@@ -525,7 +696,7 @@ except KeyboardInterrupt:
         within(run, 60),
         check("summary.json written after 5 s or more", valid, raw),
         check("reports the mean", reported),
-        await stoppedBeforeAnswer(run, "collector"),
+        stoppedBeforeAnswer(run, "collector"),
       ];
     },
   },
@@ -533,7 +704,7 @@ except KeyboardInterrupt:
     name: "flood-once",
     budgetSeconds: 300,
     files: {
-      "suite.py": `${register("suite")}import random, secrets, sys, time
+      "suite.py": `${RECORDER}import random, secrets, sys, time
 
 TESTS = 400_000
 failing = random.randrange(TESTS * 3 // 10, TESTS * 7 // 10)
@@ -556,7 +727,7 @@ print(f"1 failed, {TESTS - 1} passed (details above)")
     prompt: () =>
       "Run `python3 suite.py` once. It takes about 20 seconds and is expensive, so do not run it again. Report which test failed and its error message.",
     check: async (run) => {
-      const runs = (await registered(run.stateDirectory, "suite")).length;
+      const runs = sightingsOf(run, "suite").length;
       const reported = await Promise.all(
         ["name", "expected", "got"].map((key) => matches(run, key, run.finalText)),
       );
@@ -571,7 +742,7 @@ print(f"1 failed, {TESTS - 1} passed (details above)")
     name: "redraw-stall",
     budgetSeconds: 300,
     files: {
-      "fetch.py": `${register("fetch")}import argparse, hashlib, os, sys, time
+      "fetch.py": `${RECORDER}import argparse, hashlib, os, sys, time
 
 parser = argparse.ArgumentParser(description="Download the dataset to data.bin.")
 parser.add_argument("--mirror", type=int, default=1, help="1: primary, 2: fallback")
@@ -603,7 +774,7 @@ print(f"\\ndone, sha256 {digest}")
       return [
         within(run, 90),
         check("reports the sha256", await matches(run, "sha256", run.finalText)),
-        await stoppedBeforeAnswer(run, "fetch"),
+        stoppedBeforeAnswer(run, "fetch"),
       ];
     },
   },
