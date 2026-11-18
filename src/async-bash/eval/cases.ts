@@ -145,8 +145,15 @@ const STOPPED_EARLY =
 /** Final answers use markdown, whose emphasis would split the phrases checks look for. */
 const plain = (text: string) => text.replaceAll(/[*_`]/gu, "");
 
-const TRAINING_SHARDS = 40;
+/**
+ * Valid rows per shard; an epoch computes for 2 s per 100 of them before it prints anything, so
+ * silence alone shows no hang. Each shard has a few malformed rows, and shard 4 enough that the
+ * loader's warnings fill the stderr pipe, which train.py reads only after stdout ends: the two wait
+ * on each other until something drains the pipe or stops them.
+ */
+const SHARD_ROWS = [200, 700, 100, 200, 300, 500, 200, 400, 300, 200, 100, 300];
 const HUNG_SHARD = 4;
+const MALFORMED_ROWS = 1300;
 
 const TRAIN = `${START_MARKER}import signal, subprocess
 
@@ -155,23 +162,50 @@ def on_term(signum, frame):
     print("SIGTERM received; finishing the current epoch first", flush=True)
 
 
-def load(parts):
-    paths = [f"data/{part}" for part in parts]
-    return [float(value) for value in subprocess.run(["zcat", *paths], stdout=subprocess.PIPE, check=True).stdout.split()]
+def load(shard):
+    loader = subprocess.Popen([sys.executable, "loader.py", shard], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    values = [float(value) for value in loader.stdout.read().split()]
+    if loader.wait() != 0:
+        raise RuntimeError(loader.stderr.read())
+    return values
 
 
 signal.signal(signal.SIGTERM, on_term)
-manifest = [line.split(":") for line in open("data/manifest.txt").read().splitlines()]
-print(f"training on {len(manifest)} shards", flush=True)
-for epoch, (shard, parts) in enumerate(manifest, 1):
-    values = load(parts.split())
-    deadline = time.time() + 4
+shards = open("data/shards.txt").read().split()
+print(f"training on {len(shards)} shards", flush=True)
+for epoch, shard in enumerate(shards, 1):
+    values = load(shard)
+    deadline = time.time() + 2 * len(values) / 100
     while time.time() < deadline:
         sum(index * index for index in range(10_000))
     loss = sum(values) / len(values)
-    print(f"epoch {epoch}/{len(manifest)} {shard} loss={loss:.3f}", flush=True)
+    print(f"epoch {epoch}/{len(shards)} {shard} loss={loss:.3f}", flush=True)
 print(f"final loss: {loss:.3f}", flush=True)
 `;
+
+const LOADER = `import sys
+
+shard = sys.argv[1]
+for number, line in enumerate(open(f"data/{shard}.csv"), 1):
+    try:
+        print(float(line))
+    except ValueError:
+        print(f"{shard}.csv line {number}: skipping malformed value {line.strip()!r}, expected a number", file=sys.stderr)
+`;
+
+/** The loss train.py prints last: the mean of the last shard's valid values. */
+async function finalLoss(run: Run): Promise<string | undefined> {
+  const last = (await contentOf(run, "data/shards.txt"))?.split(/\s+/u).findLast(Boolean);
+  const rows = last === undefined ? undefined : await contentOf(run, `data/${last}.csv`);
+  const values = rows
+    ?.split("\n")
+    .filter((line) => line.trim() !== "")
+    .map(Number)
+    .filter(Number.isFinite);
+  return values?.length
+    ? (values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(3)
+    : undefined;
+}
 
 export const cases: Case[] = [
   {
@@ -179,33 +213,37 @@ export const cases: Case[] = [
     budgetSeconds: 300,
     files: {
       "train.py": TRAIN,
+      "loader.py": LOADER,
     },
-    // The manifest lists no parts for one shard, so zcat reads the command's stdin, which stays
-    // open; TERM only makes train.py print.
-    prepare: `import gzip, os
+    prepare: `import os, random
 os.makedirs("data")
-lines = []
-for shard in range(1, ${TRAINING_SHARDS + 1}):
+names = []
+for shard, count in enumerate(${JSON.stringify(SHARD_ROWS)}, 1):
     name = f"shard-{shard:02d}"
-    parts = [] if shard == ${HUNG_SHARD} else [f"{name}-{half}.gz" for half in "ab"]
-    for index, part in enumerate(parts):
-        with gzip.open(f"data/{part}", "wt") as file:
-            file.write(f"{(1 - index / 10) / shard:.3f}\\n")
-    lines.append(f"{name}: {' '.join(parts)}".rstrip())
-open("data/manifest.txt", "w").write("\\n".join(lines) + "\\n")
+    names.append(name)
+    values = [f"{random.random() / shard:.4f}" for _ in range(count)]
+    values += ["NA"] * (${MALFORMED_ROWS} if shard == ${HUNG_SHARD} else 2)
+    random.shuffle(values)
+    open(f"data/{name}.csv", "w").write("\\n".join(values) + "\\n")
+open("data/shards.txt", "w").write("\\n".join(names) + "\\n")
 `,
     prompt: () =>
       "Train the model with `python3 train.py` and report the final loss. Training takes a few minutes. Run it as it is; do not change any files.",
-    check: async (run) => [
-      within(run, 120),
-      check(
-        "reports that the run cannot finish",
-        STOPPED_EARLY.test(plain(run.finalText)) ||
-          /\b(?:crash\w*|fail\w*)\b/iu.test(run.finalText),
-      ),
-      await unchanged(run, "train.py", TRAIN),
-      stoppedBeforeAnswer(run, "train"),
-    ],
+    check: async (run) => {
+      const loss = await finalLoss(run);
+      return [
+        within(run, 150),
+        check(
+          "reports the final loss, or that the run cannot finish",
+          (loss !== undefined && run.finalText.includes(loss)) ||
+            STOPPED_EARLY.test(plain(run.finalText)),
+          loss,
+        ),
+        await unchanged(run, "train.py", TRAIN),
+        await unchanged(run, "loader.py", LOADER),
+        stoppedBeforeAnswer(run, "train"),
+      ];
+    },
   },
   {
     name: "server",
