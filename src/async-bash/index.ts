@@ -6,6 +6,7 @@ import {
   getAgentDir,
   type ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { Cause, Effect, Exit } from "effect";
 import { constants } from "node:os";
 import { delimiter, join } from "node:path";
@@ -116,7 +117,9 @@ function status(value: Status): string {
       }
       // A silent run is where the processes tell a hang from slow work; a read of the session's
       // stdin waits for the model, whatever else prints meanwhile.
-      const awaitsInput = value.processes?.some((member) => member.state === SESSION_INPUT_STATE);
+      const awaitsInput = value.processes?.some((member) =>
+        member.state.startsWith(SESSION_INPUT_STATE),
+      );
       if ((silent || awaitsInput) && value.processes?.length) {
         notes.push(`processes: ${describeMembers(value.processes)}`);
       }
@@ -198,13 +201,6 @@ function inputNotes(value: Pick<ProcessResult, "input_error" | "input_refused">)
 }
 
 /**
- * Columns a frame covers on a terminal, roughly: escape sequences, such as colors, take none. One
- * that erases, such as `ESC [ K`, then counts as covering less, so thinning keeps more frames.
- */
-const ESCAPE_SEQUENCE = new RegExp(String.raw`\u001b\[[0-?]*[ -/]*[@-~]`, "gu");
-const visibleWidth = (frame: string) => frame.replaceAll(ESCAPE_SEQUENCE, "").length;
-
-/**
  * Thins lines redrawn with carriage returns, such as progress bars, which otherwise fill a page with
  * frames, to a few frames spread from the first to the last: a single frame would hide whether the
  * line still moves. A frame longer than every later one stays too, since a terminal still shows its
@@ -224,7 +220,8 @@ function collapseRedraws(text: string): string {
           Math.round((index * last) / (MAX_REDRAW_FRAMES - 1)),
         ),
       );
-      const widths = frames.map(visibleWidth);
+      // Terminal columns: wide characters take two, escape sequences such as colors none.
+      const widths = frames.map((frame) => visibleWidth(frame));
       const longestAfter: number[] = [];
       for (let index = last, longest = 0; index >= 0; index--) {
         longestAfter[index] = longest;

@@ -565,6 +565,28 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
         assert.equal(answered.output, "got yes");
       }
 
+      // A thread other than the main one may be the reader.
+      const threaded = await start(
+        "exec python3 -c 'import threading; t = threading.Thread(target=input); t.start(); t.join()'",
+      );
+      await vi.waitFor(
+        async () => {
+          const result = await poll(threaded, { yield_time_ms: 0 });
+          assert.match(
+            result.processes?.[0]?.state ?? "",
+            /^waiting for input on the session's stdin/u,
+          );
+        },
+        { timeout: 3000 },
+      );
+      const fed = await processAction({
+        action: "write",
+        session_id: threaded.session_id,
+        chars: "hello\n",
+        yield_time_ms: 2000,
+      });
+      assert.equal(fed.state, "exited");
+
       // The listing limit does not hide the process that waits for input.
       const crowded = await start("sleep 30 & sleep 30 & sleep 30 & sleep 30 & cat; wait");
       await vi.waitFor(
@@ -809,6 +831,11 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     const styled = [...failed.slice(0, 7), "\x1b[38;5;196m8/9\x1b[0m", "9/9"];
     const colored = await execute("bash", { command: `printf '${styled.join("\r")}'` });
     assert.match(text(colored), /6\/9 FAILED: detail/u);
+    // Wide characters take two columns: four of them outlast four narrow ones.
+    const wide = Array.from({ length: 9 }, (_, index) => `0${index + 1}/9`);
+    wide[5] = "进度异常";
+    const cjk = await execute("bash", { command: `printf '${wide.join("\r")}'` });
+    assert.match(text(cjk), /进度异常/u);
   });
 
   test.skipIf(process.platform !== "linux")(

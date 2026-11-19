@@ -206,7 +206,11 @@ function groupAlive(fs: FileSystem.FileSystem, pgid: number) {
     const before = listed.value;
     for (const pid of before) {
       const fields = yield* stat(pid);
-      if (Option.isSome(fields) && Number(fields.value[2]) === pgid && fields.value[0] !== "Z") {
+      if (
+        Option.isSome(fields) &&
+        Number(fields.value[2]) === pgid &&
+        !(yield* exited(fs, Number(pid), fields.value[0]!))
+      ) {
         return true;
       }
     }
@@ -224,7 +228,8 @@ function groupAlive(fs: FileSystem.FileSystem, pgid: number) {
 
 const MAX_LISTED_MEMBERS = 4;
 const MAX_MEMBER_COMMAND_CHARS = 80;
-// Linux process states, as /proc/<pid>/stat reports them.
+// Linux process states, as /proc/<pid>/stat reports them for the main thread. A zombie that is
+// listed has threads left; see `exited`.
 const PROCESS_STATES: Record<string, string> = {
   R: "running",
   S: "sleeping",
@@ -232,14 +237,15 @@ const PROCESS_STATES: Record<string, string> = {
   T: "stopped",
   t: "stopped",
   I: "idle",
+  Z: "main thread exited",
 };
 
 /**
  * A process's kernel wait channel, without the suffixes compiler optimizations add to function
  * names, such as `.constprop.0`, so the tables below match; empty when it runs or is unreadable.
  */
-function waitChannel(fs: FileSystem.FileSystem, pid: number) {
-  return fs.readFileString(`/proc/${pid}/wchan`).pipe(
+function waitChannel(fs: FileSystem.FileSystem, pid: number, thread = pid) {
+  return fs.readFileString(`/proc/${pid}/task/${thread}/wchan`).pipe(
     Effect.map((text) => {
       const name = text.trim();
       return name === "0"
@@ -413,17 +419,24 @@ function active(before: Activity, after: Activity) {
  * any descriptor, `stdin` when it reads other input on descriptor 0, such as a file or FIFO the
  * command redirected. Linux on x64 and arm64 only.
  */
-function inputWait(fs: FileSystem.FileSystem, pid: number, sessionStdin: string | undefined) {
+function inputWait(
+  fs: FileSystem.FileSystem,
+  pid: number,
+  thread: number,
+  sessionStdin: string | undefined,
+) {
   return Effect.gen(function* () {
     const calls = INPUT_SYSCALLS[process.arch];
     if (calls === undefined) return undefined;
-    const text = yield* fs.readFileString(`/proc/${pid}/syscall`).pipe(Effect.option);
+    const text = yield* fs
+      .readFileString(`/proc/${pid}/task/${thread}/syscall`)
+      .pipe(Effect.option);
     if (Option.isNone(text)) return undefined;
     const [number, first, readSet] = text.value.trim().split(" ").map(Number);
     let fd: number | undefined;
     if (calls.reads.has(number!)) fd = first;
     else if (calls.splices.has(number!)) {
-      if (READ_WAIT_CHANNELS.has(yield* waitChannel(fs, pid))) fd = first;
+      if (READ_WAIT_CHANNELS.has(yield* waitChannel(fs, pid, thread))) fd = first;
     } else if (calls.selects.has(number!) && first === 1 && readSet) fd = 0;
     if (fd === undefined) return undefined;
     const target = yield* fs.readLink(`/proc/${pid}/fd/${fd}`).pipe(Effect.option);
@@ -452,19 +465,40 @@ function sessionStdin(pid: number | undefined) {
   }
 }
 
-/** Whether a thread other than a process's main thread is running or ready to run. */
-function otherThreadRuns(fs: FileSystem.FileSystem, pid: number) {
+/**
+ * What a process's threads wait for, beyond the main thread procfs reports for the process: the
+ * input any of them reads, and whether a thread other than the main one is running.
+ */
+function threadWaits(fs: FileSystem.FileSystem, pid: number, stdin: string | undefined) {
   return Effect.gen(function* () {
+    let input: "session" | "stdin" | undefined;
+    let otherRuns = false;
     const threads = yield* fs
       .readDirectory(`/proc/${pid}/task`)
-      .pipe(Effect.orElseSucceed(() => []));
+      .pipe(Effect.orElseSucceed(() => [String(pid)]));
     for (const thread of threads) {
-      if (thread === String(pid)) continue;
       const text = yield* fs.readFileString(`/proc/${pid}/task/${thread}/stat`).pipe(Effect.option);
-      if (Option.isSome(text) && parseStat(Number(thread), text.value).state === "R") return true;
+      if (Option.isNone(text)) continue;
+      const state = parseStat(Number(thread), text.value).state;
+      if (state === "R" && thread !== String(pid)) otherRuns = true;
+      if ((state === "S" || state === "D") && input !== "session") {
+        input = (yield* inputWait(fs, pid, Number(thread), stdin)) ?? input;
+      }
     }
-    return false;
+    return { input, otherRuns };
   });
+}
+
+/**
+ * Whether a process has exited, leaving a zombie for its parent to reap. A main thread that ended
+ * with pthread_exit also shows as a zombie, while the process's other threads still run.
+ */
+function exited(fs: FileSystem.FileSystem, pid: number, state: string) {
+  if (state !== "Z") return Effect.succeed(false);
+  return fs.readDirectory(`/proc/${pid}/task`).pipe(
+    Effect.map((threads) => threads.length <= 1),
+    Effect.orElseSucceed(() => true),
+  );
 }
 
 /**
@@ -475,20 +509,17 @@ function otherThreadRuns(fs: FileSystem.FileSystem, pid: number) {
 function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | undefined) {
   return Effect.gen(function* () {
     // A zombie has exited; only its parent's wait remains, which kill cannot shorten.
-    const live = (yield* groupStats(fs, pgid)).filter((stat) => stat.state !== "Z");
-    const waits = [];
-    for (const stat of live) {
-      const blocked = stat.state === "S" || stat.state === "D";
-      waits.push({
-        stat,
-        blocked,
-        input: blocked ? yield* inputWait(fs, stat.pid, stdin) : undefined,
-      });
+    const live: ProcStat[] = [];
+    for (const stat of yield* groupStats(fs, pgid)) {
+      if (!(yield* exited(fs, stat.pid, stat.state))) live.push(stat);
     }
+    const waits = [];
+    for (const stat of live) waits.push({ stat, ...(yield* threadWaits(fs, stat.pid, stdin)) });
     // Processes waiting for the model's input come first, so the listing limit never hides them.
     waits.sort((a, b) => Number(b.input === "session") - Number(a.input === "session"));
     const members: Member[] = [];
-    for (const { stat, blocked, input } of waits) {
+    for (const { stat, input, otherRuns } of waits) {
+      const blocked = stat.state === "S" || stat.state === "D";
       if (members.length === MAX_LISTED_MEMBERS) break;
       const cmdline = yield* fs
         .readFileString(`/proc/${stat.pid}/cmdline`)
@@ -507,14 +538,14 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | u
         command = `${command.slice(0, MAX_MEMBER_COMMAND_CHARS)} …`;
       }
       let state = PROCESS_STATES[stat.state] ?? stat.state;
+      if (channel) state = WAIT_CHANNELS[channel] ?? `${state} in ${channel}`;
+      // procfs reports the main thread's state; another thread may be the one computing, and any
+      // may read input.
+      if (otherRuns && stat.state !== "R")
+        state = `running in another thread; main thread ${state}`;
       // A program reading the session's stdin waits for input that only the model can send. The
       // session's stdin stays open, so the wait never ends otherwise.
-      if (input) state = INPUT_STATES[input];
-      else if (channel) state = WAIT_CHANNELS[channel] ?? `${state} in ${channel}`;
-      // procfs reports the main thread's state; another thread may be the one computing.
-      if (blocked && !input && (yield* otherThreadRuns(fs, stat.pid))) {
-        state = `running in another thread; main thread ${state}`;
-      }
+      if (input) state = `${INPUT_STATES[input]}${otherRuns ? "; another thread is running" : ""}`;
       members.push({ pid: stat.pid, command, state });
     }
     return members;
