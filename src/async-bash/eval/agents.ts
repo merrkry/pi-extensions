@@ -1,5 +1,5 @@
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { Effect, FileSystem } from "effect";
+import { Effect, FileSystem, Schema } from "effect";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -56,11 +56,14 @@ const textOf = (content: unknown) =>
         .join("")
     : "";
 
+const JsonObject = Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown));
+
+/**
+ * A JSONL transcript's records. A malformed line, e.g. one an agent stopped at its budget left
+ * half written, fails only the attempt that read it.
+ */
 const parseLines = (content: string) =>
-  content
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as Record<string, unknown>);
+  Schema.decodeUnknownEffect(Schema.Array(JsonObject))(content.split("\n").filter(Boolean));
 
 const onlyFile = (fs: FileSystem.FileSystem, directory: string) =>
   Effect.gen(function* () {
@@ -148,7 +151,7 @@ export function pi(options: AgentOptions): Agent {
         let finalText = "";
         let answerStartedAt: number | undefined;
         let lastResultAt: number | undefined;
-        for (const entry of parseLines(yield* fs.readFileString(file))) {
+        for (const entry of yield* parseLines(yield* fs.readFileString(file))) {
           const message = entry["message"] as Record<string, unknown> | undefined;
           if (entry["type"] !== "message" || !message || !Array.isArray(message["content"])) {
             continue;
@@ -273,7 +276,7 @@ export function codex(options: AgentOptions): Agent {
         let finalText = "";
         let answerStartedAt: number | undefined;
         let lastResultAt: number | undefined;
-        for (const line of parseLines(yield* fs.readFileString(file))) {
+        for (const line of yield* parseLines(yield* fs.readFileString(file))) {
           if (line["type"] !== "response_item") continue;
           const item = line["payload"] as Record<string, unknown>;
           const type = item["type"];
@@ -281,7 +284,7 @@ export function codex(options: AgentOptions): Agent {
             const raw = item["arguments"] ?? item["input"];
             let args: Record<string, unknown> = { input: raw };
             if (typeof raw === "string" && type === "function_call") {
-              args = JSON.parse(raw) as Record<string, unknown>;
+              args = yield* Schema.decodeUnknownEffect(JsonObject)(raw);
             }
             calls.set(String(item["call_id"]), {
               name: String(item["name"]),
