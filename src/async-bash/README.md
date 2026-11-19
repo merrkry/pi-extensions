@@ -51,7 +51,8 @@ stopped.
   costs half a minute instead of the wait sized for slow work, as in recorded
   runs that blocked for 15 minutes. It returns early once per quiet stretch, so
   a wait repeated on purpose, e.g. on a sleeping job, runs its full length.
-  Linux only, where procfs shows CPU time and I/O.
+  Linux only, where procfs shows CPU time and I/O; a command whose I/O procfs
+  hides, e.g. one run with sudo, never counts as quiet.
 - **`timeout_ms` stops the process group.** Models expect a time limit, and the
   `timeout` utility moves the command into a process group of its own, which
   the session no longer tracks, and escalates to KILL only with `-k`: a

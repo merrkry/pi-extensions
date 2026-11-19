@@ -565,6 +565,23 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
         assert.equal(answered.output, "got yes");
       }
 
+      // Output from elsewhere in the command does not hide that it waits for input.
+      const prompted = await start(
+        "(while :; do echo beat; sleep 0.2; done) & read -r answer; kill $!; printf 'got %s' \"$answer\"",
+      );
+      await vi.waitFor(
+        async () => {
+          const response = await execute("process", {
+            action: "poll",
+            session_id: prompted.session_id,
+            yield_time_ms: 0,
+          });
+          assert.match(text(response), /processes: .*waiting for input on the session's stdin/u);
+        },
+        { timeout: 3000 },
+      );
+      await processAction({ action: "kill", session_id: prompted.session_id });
+
       // Input the command redirected from elsewhere is not the session's to send.
       const fifo = join(directory, "redirected-input");
       const redirected = await start(
@@ -664,6 +681,14 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
       assert.equal(killed.isError, undefined);
       assert.equal((killed.structuredContent as ProcessResult).stopped_by, "kill");
       assert.match(text(killed), /stopped by process kill, exited with code 143 \(SIGTERM\)/u);
+      // A failure the shell reported before the kill stays one.
+      const failing = await bash("sleep 30 & exit 7", 3000);
+      assert.equal(failing.state, "draining");
+      const stoppedAfterFailure = await execute("process", {
+        action: "kill",
+        session_id: failing.session_id,
+      });
+      assert.equal(stoppedAfterFailure.isError, true);
 
       const stubborn = await start("trap '' TERM; sleep 30");
       const stopping = await execute("process", {

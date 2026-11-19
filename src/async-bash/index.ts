@@ -7,6 +7,7 @@ import {
   type ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
 import { Cause, Effect, Exit } from "effect";
+import { constants } from "node:os";
 import { delimiter, join } from "node:path";
 import { Type, type Static } from "typebox";
 import {
@@ -14,6 +15,7 @@ import {
   type Member,
   makeProcesses,
   QUIET_WAKE_MS,
+  SESSION_INPUT_STATE,
   TERMINATION_GRACE_MS,
   type ProcessResult,
   type Processes,
@@ -102,13 +104,18 @@ function status(value: Status): string {
       } else if (value.timeout_seconds !== undefined) {
         notes.push(`timeout_ms stops it at ${value.timeout_seconds} s`);
       }
-      if (value.idle_seconds >= NOTABLE_IDLE_SECONDS) {
+      const silent = value.idle_seconds >= NOTABLE_IDLE_SECONDS;
+      if (silent) {
         notes.push(`no output for ${value.idle_seconds} s`);
         if (value.quiet_seconds !== undefined) {
           notes.push(`no CPU or I/O for ${value.quiet_seconds} s, which ended this wait early`);
         }
-        // A silent run is where the processes tell a hang from slow work.
-        if (value.processes?.length) notes.push(`processes: ${describeMembers(value.processes)}`);
+      }
+      // A silent run is where the processes tell a hang from slow work; a read of the session's
+      // stdin waits for the model, whatever else prints meanwhile.
+      const awaitsInput = value.processes?.some((member) => member.state === SESSION_INPUT_STATE);
+      if ((silent || awaitsInput) && value.processes?.length) {
+        notes.push(`processes: ${describeMembers(value.processes)}`);
       }
       if (value.stdin === "closed") notes.push("stdin closed");
       return notes.join(", ");
@@ -138,14 +145,24 @@ function status(value: Status): string {
   }
 }
 
+// Exit codes of a shell, or a program it ran, ended by the TERM or KILL that stops a session.
+const STOPPED_EXIT_CODES = new Set([
+  128 + constants.signals.SIGTERM,
+  128 + constants.signals.SIGKILL,
+]);
+
 /**
- * A requested kill is the outcome the model asked for, not a failure. A timeout is one even when
- * the shell exits cleanly, e.g. after backgrounding the work the limit stopped.
+ * A requested kill is the outcome the model asked for, not a failure; an exit code the command
+ * reported on its own still is one, e.g. from `cmd & exit 7` before the kill stopped `cmd`. A
+ * timeout is a failure even when the shell exits cleanly, e.g. after backgrounding the work the
+ * limit stopped.
  */
 function failed(value: Observation): boolean {
   if (value.error || value.input_error || value.input_refused) return true;
-  if (value.stopped_by) return value.stopped_by === "timeout";
-  return Boolean(value.exit_code);
+  if (value.stopped_by === "timeout") return true;
+  const code = value.exit_code ?? 0;
+  if (value.stopped_by === "kill") return code !== 0 && !STOPPED_EXIT_CODES.has(code);
+  return code !== 0;
 }
 
 function firstLine(command: string, limit = MAX_LISTED_COMMAND_CHARS): string {

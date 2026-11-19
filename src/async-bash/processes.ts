@@ -309,20 +309,27 @@ function groupStats(fs: FileSystem.FileSystem, pgid: number) {
   });
 }
 
-/** What a process group has done so far: which processes it has, their CPU time, and their I/O. */
-type Activity = { at: number; pids: string; cpuTicks: number; ioBytes: number };
+/**
+ * What a process group has done so far: which processes it has, their CPU time, and their I/O,
+ * undefined when procfs hides the I/O of a live member.
+ */
+type Activity = { at: number; pids: string; cpuTicks: number; ioBytes: number | undefined };
 
 function sampleActivity(fs: FileSystem.FileSystem, pgid: number) {
   return Effect.gen(function* () {
     const stats = yield* groupStats(fs, pgid);
-    let ioBytes = 0;
+    let ioBytes: number | undefined = 0;
     for (const stat of stats) {
       // rchar and wchar count bytes passed through read and write calls, including pipes and
-      // sockets; procfs hides them for processes the caller may not trace.
-      const io = yield* fs
-        .readFileString(`/proc/${stat.pid}/io`)
-        .pipe(Effect.orElseSucceed(() => ""));
-      for (const match of io.matchAll(/^[rw]char: (\d+)$/gmu)) ioBytes += Number(match[1]);
+      // sockets; procfs hides them for processes the caller may not trace, such as one run with
+      // sudo or one that made itself non-dumpable, like ssh.
+      const io = yield* fs.readFileString(`/proc/${stat.pid}/io`).pipe(Effect.option);
+      if (Option.isNone(io)) {
+        if (stat.state !== "Z") ioBytes = undefined;
+        continue;
+      }
+      if (ioBytes === undefined) continue;
+      for (const match of io.value.matchAll(/^[rw]char: (\d+)$/gmu)) ioBytes += Number(match[1]);
     }
     return {
       at: performance.now(),
@@ -333,11 +340,15 @@ function sampleActivity(fs: FileSystem.FileSystem, pgid: number) {
   });
 }
 
-/** Whether the group did anything between two samples, beyond the CPU use QUIET_CPU_SHARE allows. */
+/**
+ * Whether the group did anything between two samples, beyond the CPU use QUIET_CPU_SHARE allows.
+ * Hidden I/O counts as activity, so a group whose I/O cannot be seen never counts as quiet.
+ */
 function active(before: Activity, after: Activity) {
   const allowedTicks = ((after.at - before.at) / 1000) * CLOCK_TICKS_PER_SECOND * QUIET_CPU_SHARE;
   return (
     before.pids !== after.pids ||
+    after.ioBytes === undefined ||
     after.ioBytes !== before.ioBytes ||
     after.cpuTicks - before.cpuTicks > allowedTicks
   );
@@ -367,10 +378,9 @@ function inputWait(fs: FileSystem.FileSystem, pid: number, sessionStdin: string 
   });
 }
 
-const INPUT_STATES = {
-  session: "waiting for input on the session's stdin, which process write sends and eof closes",
-  stdin: "waiting for input on its stdin",
-};
+export const SESSION_INPUT_STATE =
+  "waiting for input on the session's stdin, which process write sends and eof closes";
+const INPUT_STATES = { session: SESSION_INPUT_STATE, stdin: "waiting for input on its stdin" };
 
 /**
  * The pipe a session's stdin is, as procfs names it, to tell it from other input a process reads,
@@ -612,8 +622,11 @@ class Task {
       ) {
         return result;
       }
-      // Group exit counts once the monitor has recorded it, so every view and kill agree on it.
+      // Group exit counts once the monitor has recorded it, also during this scan, so every view
+      // and kill agree on it.
       const members = yield* groupMembers(this.fs, pgid, this.stdin);
+      const exited = this.phase.tag === "draining" && this.phase.groupExited;
+      if (exited) return { ...result, processes: [] };
       return members.length ? { ...result, processes: members } : result;
     });
   }
