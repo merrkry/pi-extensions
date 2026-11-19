@@ -661,6 +661,40 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     LONG_TEST_TIMEOUT_MS,
   );
 
+  test.skipIf(process.platform !== "linux")(
+    "shows pending limits, ongoing stops, and busy threads while draining",
+    async () => {
+      const pending = await execute("bash", {
+        command: "sleep 8 >/dev/null 2>&1 & printf started",
+        timeout_ms: 6000,
+        yield_time_ms: 3000,
+      });
+      assert.match(text(pending), /still running: .*sleep 8.*; timeout_ms stops them at 6 s/u);
+
+      const stubborn = await execute("bash", {
+        command: "(trap '' TERM; sleep 9) >/dev/null 2>&1 & printf started",
+        timeout_ms: 300,
+        yield_time_ms: 3000,
+      });
+      assert.match(
+        text(stubborn),
+        /still running: .*; stopping them after timeout_ms at 0.3 s \(TERM, then KILL\)/u,
+      );
+
+      const worker = javascript(
+        "new (require('node:worker_threads').Worker)('for (;;) {}', { eval: true })",
+      );
+      const busy = await execute("bash", {
+        command: `${worker} >/dev/null 2>&1 & printf started`,
+        yield_time_ms: 3000,
+      });
+      assert.match(text(busy), /running in another thread; main thread /u);
+      const session = (busy.structuredContent as ProcessResult).session_id;
+      await processAction({ action: "kill", session_id: session });
+    },
+    LONG_TEST_TIMEOUT_MS,
+  );
+
   test(
     "stops commands at their time limit and reports requested kills as successful",
     async () => {
@@ -770,6 +804,11 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     const failed = [...frames.slice(0, 5), "6/9 FAILED: detail", ...frames.slice(6)];
     const residue = await execute("bash", { command: `printf '${failed.join("\r")}'` });
     assert.equal(text(residue), "1/9\r3/9\r5/9\r6/9 FAILED: detail\r7/9\r9/9");
+    // Escape sequences, such as colors, cover no columns.
+    // The colored frame is as long as the failure in characters, but covers three columns.
+    const styled = [...failed.slice(0, 7), "\x1b[38;5;196m8/9\x1b[0m", "9/9"];
+    const colored = await execute("bash", { command: `printf '${styled.join("\r")}'` });
+    assert.match(text(colored), /6\/9 FAILED: detail/u);
   });
 
   test.skipIf(process.platform !== "linux")(

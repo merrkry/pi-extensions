@@ -133,11 +133,17 @@ function status(value: Status): string {
       const remaining = value.processes
         ? describeMembers(value.processes)
         : "processes it started in the background";
+      // While the group runs, a stop is still under way and a time limit still pending.
+      let limit = "";
+      if (value.stopped_by) limit = `; stopping them after ${stopper(value)} (TERM, then KILL)`;
+      else if (value.timeout_seconds !== undefined) {
+        limit = `; timeout_ms stops them at ${value.timeout_seconds} s`;
+      }
       const quiet =
         value.quiet_seconds === undefined
           ? ""
           : `; no output, CPU, or read/write I/O for ${value.quiet_seconds} s, which ended this wait early`;
-      return `${stopped}shell exited with ${code}, session running for ${runtime}; still running: ${remaining} (poll waits for them, kill stops them)${quiet}`;
+      return `shell exited with ${code}, session running for ${runtime}; still running: ${remaining} (poll waits for them, kill stops them)${limit}${quiet}`;
     }
     case "exited":
       // A stopped session's group has exited too, so nothing it started is left to check for.
@@ -192,6 +198,13 @@ function inputNotes(value: Pick<ProcessResult, "input_error" | "input_refused">)
 }
 
 /**
+ * Columns a frame covers on a terminal, roughly: escape sequences, such as colors, take none. One
+ * that erases, such as `ESC [ K`, then counts as covering less, so thinning keeps more frames.
+ */
+const ESCAPE_SEQUENCE = new RegExp(String.raw`\u001b\[[0-?]*[ -/]*[@-~]`, "gu");
+const visibleWidth = (frame: string) => frame.replaceAll(ESCAPE_SEQUENCE, "").length;
+
+/**
  * Thins lines redrawn with carriage returns, such as progress bars, which otherwise fill a page with
  * frames, to a few frames spread from the first to the last: a single frame would hide whether the
  * line still moves. A frame longer than every later one stays too, since a terminal still shows its
@@ -211,13 +224,14 @@ function collapseRedraws(text: string): string {
           Math.round((index * last) / (MAX_REDRAW_FRAMES - 1)),
         ),
       );
+      const widths = frames.map(visibleWidth);
       const longestAfter: number[] = [];
       for (let index = last, longest = 0; index >= 0; index--) {
         longestAfter[index] = longest;
-        longest = Math.max(longest, frames[index]!.length);
+        longest = Math.max(longest, widths[index]!);
       }
       const kept = frames.filter(
-        (frame, index) => spread.has(index) || frame.length > longestAfter[index]!,
+        (_, index) => spread.has(index) || widths[index]! > longestAfter[index]!,
       );
       return `${kept.join("\r")}${ending}`;
     })

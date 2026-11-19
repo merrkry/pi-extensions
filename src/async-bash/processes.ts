@@ -173,19 +173,22 @@ function terminateTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Sig
  */
 function groupAlive(fs: FileSystem.FileSystem, pgid: number) {
   return Effect.gen(function* () {
-    const signalable = yield* Effect.try(() => {
+    const probe = yield* Effect.try(() => {
       process.kill(-pgid, 0);
-      return true;
+      return "signalable" as const;
     }).pipe(
       Effect.catchIf(
         (error) => {
           const code = errorCode(error.cause);
           return code === "ESRCH" || code === "EPERM";
         },
-        (error) => Effect.succeed(errorCode(error.cause) === "EPERM"),
+        (error) => Effect.succeed(errorCode(error.cause) === "EPERM" ? "foreign" : "gone"),
       ),
     );
-    if (!signalable || !PROCFS) return signalable;
+    // Only signalable groups can consist of zombies alone; procfs may hide another user's
+    // processes, e.g. when mounted with hidepid, so it cannot overrule EPERM.
+    if (probe !== "signalable") return probe === "foreign";
+    if (!PROCFS) return true;
     const pids = fs
       .readDirectory("/proc")
       .pipe(Effect.map((entries) => entries.filter((entry) => /^\d+$/u.test(entry))));
@@ -230,6 +233,22 @@ const PROCESS_STATES: Record<string, string> = {
   t: "stopped",
   I: "idle",
 };
+
+/**
+ * A process's kernel wait channel, without the suffixes compiler optimizations add to function
+ * names, such as `.constprop.0`, so the tables below match; empty when it runs or is unreadable.
+ */
+function waitChannel(fs: FileSystem.FileSystem, pid: number) {
+  return fs.readFileString(`/proc/${pid}/wchan`).pipe(
+    Effect.map((text) => {
+      const name = text.trim();
+      return name === "0"
+        ? ""
+        : name.replace(/(?:\.(?:constprop|isra|part|cold|lto_priv)\.\d+)+$/u, "");
+    }),
+    Effect.orElseSucceed(() => ""),
+  );
+}
 
 // Wait channels of a process blocked reading a pipe, socket, or terminal.
 const READ_WAIT_CHANNELS = new Set([
@@ -404,8 +423,7 @@ function inputWait(fs: FileSystem.FileSystem, pid: number, sessionStdin: string 
     let fd: number | undefined;
     if (calls.reads.has(number!)) fd = first;
     else if (calls.splices.has(number!)) {
-      const channel = yield* fs.readFileString(`/proc/${pid}/wchan`).pipe(Effect.option);
-      if (Option.isSome(channel) && READ_WAIT_CHANNELS.has(channel.value.trim())) fd = first;
+      if (READ_WAIT_CHANNELS.has(yield* waitChannel(fs, pid))) fd = first;
     } else if (calls.selects.has(number!) && first === 1 && readSet) fd = 0;
     if (fd === undefined) return undefined;
     const target = yield* fs.readLink(`/proc/${pid}/fd/${fd}`).pipe(Effect.option);
@@ -432,6 +450,21 @@ function sessionStdin(pid: number | undefined) {
   } catch {
     return undefined;
   }
+}
+
+/** Whether a thread other than a process's main thread is running or ready to run. */
+function otherThreadRuns(fs: FileSystem.FileSystem, pid: number) {
+  return Effect.gen(function* () {
+    const threads = yield* fs
+      .readDirectory(`/proc/${pid}/task`)
+      .pipe(Effect.orElseSucceed(() => []));
+    for (const thread of threads) {
+      if (thread === String(pid)) continue;
+      const text = yield* fs.readFileString(`/proc/${pid}/task/${thread}/stat`).pipe(Effect.option);
+      if (Option.isSome(text) && parseStat(Number(thread), text.value).state === "R") return true;
+    }
+    return false;
+  });
 }
 
 /**
@@ -462,11 +495,7 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | u
         .pipe(Effect.orElseSucceed(() => ""));
       const argv = cmdline.split("\0").filter(Boolean);
       let command = argv.join(" ") || stat.name;
-      const channel = blocked
-        ? (yield* fs
-            .readFileString(`/proc/${stat.pid}/wchan`)
-            .pipe(Effect.orElseSucceed(() => ""))).trim()
-        : "";
+      const channel = blocked ? yield* waitChannel(fs, stat.pid) : "";
       if (argv.at(-1) === LAUNCH_SCRIPT) {
         // The group leader still running the launcher is the shell, left out while it waits for
         // the other members it started; one a command replaced with exec is the program.
@@ -481,8 +510,11 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | u
       // A program reading the session's stdin waits for input that only the model can send. The
       // session's stdin stays open, so the wait never ends otherwise.
       if (input) state = INPUT_STATES[input];
-      else if (channel && channel !== "0")
-        state = WAIT_CHANNELS[channel] ?? `${state} in ${channel}`;
+      else if (channel) state = WAIT_CHANNELS[channel] ?? `${state} in ${channel}`;
+      // procfs reports the main thread's state; another thread may be the one computing.
+      if (blocked && !input && (yield* otherThreadRuns(fs, stat.pid))) {
+        state = `running in another thread; main thread ${state}`;
+      }
       members.push({ pid: stat.pid, command, state });
     }
     return members;
