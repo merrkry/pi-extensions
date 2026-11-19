@@ -520,7 +520,7 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
       assert.ok(performance.now() - started < 40_000);
       assert.match(
         text(silent),
-        /no output for 3\d s, no CPU or I\/O for 3\d s, which ended this wait early, processes: pid \d+ cat \(waiting for input on the session's stdin, which process write sends and eof closes\)/u,
+        /no output for 3\d s, no CPU or read\/write I\/O for 3\d s, which ended this wait early, processes: pid \d+ cat \(waiting for input on the session's stdin, which process write sends and eof closes\)/u,
       );
       // Output between waits starts a new quiet stretch, which ends the next long wait early too.
       const task = silent.structuredContent as ProcessResult;
@@ -645,6 +645,13 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
           ["sleep 4"],
         );
         assert.match(text(response), /still running: pid \d+ sleep 4 \(sleeping on a timer\)/u);
+        // Refused input still shows what remains.
+        const refused = await execute("process", {
+          action: "write",
+          session_id: server.session_id,
+          chars: "x",
+        });
+        assert.match(text(refused), /still running: pid \d+ sleep 4/u);
       }
       assert.ok(performance.now() - started < 3000);
       const finished = await poll(server as ProcessResult, { yield_time_ms: 20_000 });
@@ -758,6 +765,11 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
       (response.structuredContent as ProcessResult).output,
       `${frames.join("\r")}\nnext\r`,
     );
+
+    // A longer frame stays when shorter ones follow, as a terminal still shows its tail.
+    const failed = [...frames.slice(0, 5), "6/9 FAILED: detail", ...frames.slice(6)];
+    const residue = await execute("bash", { command: `printf '${failed.join("\r")}'` });
+    assert.equal(text(residue), "1/9\r3/9\r5/9\r6/9 FAILED: detail\r7/9\r9/9");
   });
 
   test.skipIf(process.platform !== "linux")(

@@ -127,6 +127,9 @@ export type ProcessResult = TaskSummary &
     quiet_seconds?: number;
   };
 
+const errorCode = (cause: unknown) =>
+  cause instanceof Error && "code" in cause ? cause.code : undefined;
+
 function terminateTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals) {
   if (process.platform === "win32") {
     return Effect.callback<void, Error>((resume) => {
@@ -147,19 +150,20 @@ function terminateTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Sig
       });
     });
   }
+  // ESRCH: the group has exited. EPERM: only another user's processes remain, which no signal
+  // reaches; like members KILL cannot end, they are left to the monitor.
   return Effect.try(() => {
     if (child.pid) process.kill(-child.pid, signal);
   }).pipe(
     Effect.catchIf(
-      (error) =>
-        error.cause instanceof Error && "code" in error.cause && error.cause.code === "ESRCH",
+      (error) => {
+        const code = errorCode(error.cause);
+        return code === "ESRCH" || code === "EPERM";
+      },
       () => Effect.void,
     ),
   );
 }
-
-const errorCode = (cause: unknown) =>
-  cause instanceof Error && "code" in cause ? cause.code : undefined;
 
 /**
  * Whether a process in the group can still run. A zombie keeps its group signalable until its
@@ -227,6 +231,17 @@ const PROCESS_STATES: Record<string, string> = {
   I: "idle",
 };
 
+// Wait channels of a process blocked reading a pipe, socket, or terminal.
+const READ_WAIT_CHANNELS = new Set([
+  "pipe_read",
+  "anon_pipe_read",
+  "pipe_wait_readable",
+  "sk_wait_data",
+  "unix_stream_read_generic",
+  "unix_stream_data_wait",
+  "n_tty_read",
+]);
+
 // Wait channels of a process waiting for a child to exit.
 const CHILD_WAIT_CHANNELS = new Set(["do_wait", "kernel_wait4"]);
 
@@ -268,16 +283,24 @@ const WAIT_CHANNELS: Record<string, string> = {
 
 /**
  * System calls that wait for input, by the numbers /proc/<pid>/syscall reports. `reads` read from
- * the file descriptor in their first argument: read, readv, pread64, splice, copy_file_range,
- * recvfrom, and recvmsg. `selects`, select and pselect6, take one more than the highest descriptor
+ * the file descriptor in their first argument: read, readv, pread64, recvfrom, and recvmsg.
+ * `splices`, splice, does too, as GNU cat does, but can also block on its output, so it counts only
+ * in a wait channel that reads. `selects`, select and pselect6, take one more than the highest descriptor
  * they watch, so 1 means stdin alone, as in Bash's `read -t`. Other architectures skip the check
  * for reads from stdin.
  */
 const INPUT_SYSCALLS: Partial<
-  Record<NodeJS.Architecture, { reads: ReadonlySet<number>; selects: ReadonlySet<number> }>
+  Record<
+    NodeJS.Architecture,
+    { reads: ReadonlySet<number>; splices: ReadonlySet<number>; selects: ReadonlySet<number> }
+  >
 > = {
-  x64: { reads: new Set([0, 19, 17, 275, 326, 45, 47]), selects: new Set([23, 270]) },
-  arm64: { reads: new Set([63, 65, 67, 76, 285, 207, 212]), selects: new Set([72]) },
+  x64: {
+    reads: new Set([0, 19, 17, 45, 47]),
+    splices: new Set([275]),
+    selects: new Set([23, 270]),
+  },
+  arm64: { reads: new Set([63, 65, 67, 207, 212]), splices: new Set([76]), selects: new Set([72]) },
 };
 
 type ProcStat = {
@@ -380,7 +403,10 @@ function inputWait(fs: FileSystem.FileSystem, pid: number, sessionStdin: string 
     const [number, first, readSet] = text.value.trim().split(" ").map(Number);
     let fd: number | undefined;
     if (calls.reads.has(number!)) fd = first;
-    else if (calls.selects.has(number!) && first === 1 && readSet) fd = 0;
+    else if (calls.splices.has(number!)) {
+      const channel = yield* fs.readFileString(`/proc/${pid}/wchan`).pipe(Effect.option);
+      if (Option.isSome(channel) && READ_WAIT_CHANNELS.has(channel.value.trim())) fd = first;
+    } else if (calls.selects.has(number!) && first === 1 && readSet) fd = 0;
     if (fd === undefined) return undefined;
     const target = yield* fs.readLink(`/proc/${pid}/fd/${fd}`).pipe(Effect.option);
     if (sessionStdin !== undefined && Option.getOrUndefined(target) === sessionStdin) {
@@ -1010,7 +1036,7 @@ export const makeProcesses = Effect.gen(function* () {
 
   const refuse = (task: Task, cursor: number, reason: string) =>
     task
-      .observe(cursor, "end")
+      .observe(cursor, "end", true)
       .pipe(Effect.map((result): ProcessResult => ({ ...result, input_refused: reason })));
 
   return {

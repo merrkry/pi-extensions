@@ -109,7 +109,9 @@ function status(value: Status): string {
       if (silent) {
         notes.push(`no output for ${value.idle_seconds} s`);
         if (value.quiet_seconds !== undefined) {
-          notes.push(`no CPU or I/O for ${value.quiet_seconds} s, which ended this wait early`);
+          notes.push(
+            `no CPU or read/write I/O for ${value.quiet_seconds} s, which ended this wait early`,
+          );
         }
       }
       // A silent run is where the processes tell a hang from slow work; a read of the session's
@@ -134,7 +136,7 @@ function status(value: Status): string {
       const quiet =
         value.quiet_seconds === undefined
           ? ""
-          : `; no output, CPU, or I/O for ${value.quiet_seconds} s, which ended this wait early`;
+          : `; no output, CPU, or read/write I/O for ${value.quiet_seconds} s, which ended this wait early`;
       return `${stopped}shell exited with ${code}, session running for ${runtime}; still running: ${remaining} (poll waits for them, kill stops them)${quiet}`;
     }
     case "exited":
@@ -191,8 +193,9 @@ function inputNotes(value: Pick<ProcessResult, "input_error" | "input_refused">)
 
 /**
  * Thins lines redrawn with carriage returns, such as progress bars, which otherwise fill a page with
- * frames, to a few frames spread from the first to the last: a single frame, all a terminal shows,
- * would hide whether the line still moves. The log keeps every byte; terminal line ends stay.
+ * frames, to a few frames spread from the first to the last: a single frame would hide whether the
+ * line still moves. A frame longer than every later one stays too, since a terminal still shows its
+ * tail past them. The log keeps every byte; terminal line ends stay.
  */
 function collapseRedraws(text: string): string {
   if (!text.includes("\r")) return text;
@@ -201,14 +204,21 @@ function collapseRedraws(text: string): string {
     .map((line) => {
       const ending = line.endsWith("\r") ? "\r" : "";
       const frames = (ending ? line.slice(0, -1) : line).split("\r").filter(Boolean);
+      if (frames.length <= MAX_REDRAW_FRAMES) return line;
       const last = frames.length - 1;
-      const kept =
-        frames.length <= MAX_REDRAW_FRAMES
-          ? frames
-          : Array.from(
-              { length: MAX_REDRAW_FRAMES },
-              (_, index) => frames[Math.round((index * last) / (MAX_REDRAW_FRAMES - 1))],
-            );
+      const spread = new Set(
+        Array.from({ length: MAX_REDRAW_FRAMES }, (_, index) =>
+          Math.round((index * last) / (MAX_REDRAW_FRAMES - 1)),
+        ),
+      );
+      const longestAfter: number[] = [];
+      for (let index = last, longest = 0; index >= 0; index--) {
+        longestAfter[index] = longest;
+        longest = Math.max(longest, frames[index]!.length);
+      }
+      const kept = frames.filter(
+        (frame, index) => spread.has(index) || frame.length > longestAfter[index]!,
+      );
       return `${kept.join("\r")}${ending}`;
     })
     .join("\n");
@@ -320,7 +330,7 @@ const processOutput = Type.Object({
   quiet_seconds: Type.Optional(
     Type.Number({
       description:
-        "Linux: set when the wait ended early because the command had no output, CPU, or I/O for this long.",
+        "Linux: set when the wait ended early because the command had no output, CPU, or I/O through read and write calls for this long.",
     }),
   ),
   input_refused: Type.Optional(
@@ -451,7 +461,7 @@ export default function (pi: ExtensionAPI): void {
     promptGuidelines: [
       ...(piBash.promptGuidelines ?? []),
       "A status reminder lists running bash sessions and finished ones whose final result you have not seen. Without a reminder no session needs attention, and finished sessions need no cleanup. Before finishing, handle the sessions it lists and report any you leave running on purpose.",
-      `yield_time_ms only sets how long a call waits before returning; the command keeps running in its session. The call returns as soon as the command finishes, so set it near the expected runtime.${PROCFS ? ` It also returns once the command has gone ${QUIET_WAKE_MS / 1000} s without output, I/O, or more than occasional CPU use, so a long wait does not hide a stalled command; this happens once per quiet stretch, and waiting again on a command that stays quiet runs the full time.` : ""} A call waits at most ${MAX_WAIT_MS / 60_000} minutes.`,
+      `yield_time_ms only sets how long a call waits before returning; the command keeps running in its session. The call returns as soon as the command finishes, so set it near the expected runtime.${PROCFS ? ` It also returns once the command has gone ${QUIET_WAKE_MS / 1000} s without output, I/O through read and write calls, or more than occasional CPU use, so a long wait does not hide a stalled command; this happens once per quiet stretch, and waiting again on a command that stays quiet runs the full time.` : ""} A call waits at most ${MAX_WAIT_MS / 60_000} minutes.`,
       `timeout_ms is a backstop for a command that must not run past a limit, e.g. a test suite with a time budget, or that you will not check on. It stops the whole process group, escalating from TERM to KILL after ${TERMINATION_GRACE_MS / 1000} s; use it instead of the timeout utility, which leaves processes that ignore TERM running. It is not a reason to keep waiting: once results show a command stalled or failing, stop it with process kill and act on what you saw.`,
       "To watch a long-running program, start it with a short yield_time_ms, poll its session, and stop it with process kill. The session keeps all output and poll shows it as it arrives, so do not pipe long commands through tail or redirect their output to a file just to follow it.",
       "Tool calls in one response run concurrently and return together: put dependent steps in one command, and keep yield_time_ms short for calls batched with others.",
