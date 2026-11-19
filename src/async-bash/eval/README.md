@@ -48,7 +48,10 @@ in one would reach another's processes. Each runs under bubblewrap, which the
 eval requires, so Linux only. The home directory, `/tmp`, the eval's sources,
 the Git history, and the results are hidden, and the environment holds no host
 variables beyond those that locate programs, so models cannot read the cases,
-earlier attempts, or other credentials.
+earlier attempts, or other credentials. Each attempt also has a process
+namespace and procfs of its own, since the host's procfs reaches hidden paths
+through other processes' root links. The namespace lasts until the checks have
+run, so processes meant to outlive the agent, such as a server, survive it.
 
 The runner tracks fixture processes itself, by looking every 200 ms for Python
 processes running a case's script from the working directory. Fixtures also

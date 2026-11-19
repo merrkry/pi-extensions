@@ -1,5 +1,5 @@
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
-import { Duration, Effect, Fiber, FileSystem, Option, Stream } from "effect";
+import { Duration, Effect, FileSystem, Option } from "effect";
 import { ChildProcess } from "effect/process";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync, statSync } from "node:fs";
@@ -205,6 +205,11 @@ function sandboxed(invocation: Invocation, root: string, sandbox: Sandbox): Invo
       "--dev-bind",
       "/",
       "/",
+      // The host's procfs reaches every path through other processes' root links, such as
+      // /proc/<runner pid>/root; attempts get a process namespace and procfs of their own.
+      "--unshare-pid",
+      "--proc",
+      "/proc",
       "--tmpfs",
       "/tmp",
       "--tmpfs",
@@ -237,45 +242,78 @@ const hostEnvironment = Object.fromEntries(
     .filter((entry): entry is [string, string] => entry[1] !== undefined),
 );
 
-/** Runs one agent turn within `budget`; the result says whether it exited on its own. */
+/**
+ * Wraps a sandboxed agent so that its sandbox outlives it: a process namespace ends with the
+ * command bubblewrap runs, and processes the agent started to keep running, such as a server, must
+ * survive until the checks have looked at them. The wrapper reports the agent's output and exit
+ * code in `files`, then waits until the attempt ends and stops the sandbox.
+ */
+function outliving(invocation: Invocation, files: { out: string; err: string; code: string }) {
+  return {
+    ...invocation,
+    command: "sh",
+    args: [
+      "-c",
+      'out=$1 err=$2 code=$3; shift 3; "$@" >"$out" 2>"$err"; echo $? >"$code.part"; mv "$code.part" "$code"; exec sleep infinity',
+      "sh",
+      files.out,
+      files.err,
+      files.code,
+      invocation.command,
+      ...invocation.args,
+    ],
+  };
+}
+
+/**
+ * Runs one agent turn within `budget`; the result says whether it exited on its own. The sandbox
+ * stays until the caller's scope closes; see `outliving`.
+ */
 const invoke = (
   invocation: Invocation,
+  root: string,
+  sandbox: Sandbox,
   cwd: string,
   env: Record<string, string>,
   budget: Duration.Duration,
 ) =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const child = yield* ChildProcess.make(invocation.command, invocation.args, {
-        cwd,
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "pipe",
-        env: { ...hostEnvironment, ...env, ...invocation.env },
-        extendEnv: false,
-      });
-      const stdout = yield* Stream.mkString(Stream.decodeText(child.stdout)).pipe(
-        Effect.forkScoped,
-      );
-      const stderr = yield* Stream.mkString(Stream.decodeText(child.stderr)).pipe(
-        Effect.forkScoped,
-      );
-      // A signal ends the agent without an exit code, which fails exitCode.
-      const exit = yield* child.exitCode.pipe(
-        Effect.map((code) => code === 0),
-        Effect.orElseSucceed(() => false),
-        Effect.timeoutOption(budget),
-      );
-      if (Option.isNone(exit)) {
-        yield* child.kill({ killSignal: "SIGTERM", forceKillAfter: AGENT_TERMINATION_GRACE });
-      }
-      return {
-        finished: Option.getOrElse(exit, () => false),
-        stdout: yield* Fiber.join(stdout),
-        stderr: yield* Fiber.join(stderr),
-      };
-    }),
-  );
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const directory = yield* fs.makeTempDirectory({ directory: root, prefix: "turn-" });
+    const files = {
+      out: join(directory, "stdout"),
+      err: join(directory, "stderr"),
+      code: join(directory, "exit-code"),
+    };
+    const sandboxedInvocation = sandboxed(outliving(invocation, files), root, sandbox);
+    const child = yield* ChildProcess.make(sandboxedInvocation.command, sandboxedInvocation.args, {
+      cwd,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+      env: { ...hostEnvironment, ...env, ...invocation.env },
+      extendEnv: false,
+    });
+    const exitCode = Effect.gen(function* () {
+      while (!(yield* fs.exists(files.code))) yield* Effect.sleep(Duration.millis(100));
+      return (yield* fs.readFileString(files.code)).trim();
+    });
+    // The sandbox ending first, e.g. when bubblewrap fails, ends the turn unfinished.
+    const sandboxEnded = child.exitCode.pipe(
+      Effect.as("sandbox"),
+      Effect.orElseSucceed(() => "sandbox"),
+    );
+    const exit = yield* Effect.raceFirst(exitCode, sandboxEnded).pipe(Effect.timeoutOption(budget));
+    if (Option.isNone(exit)) {
+      yield* child.kill({ killSignal: "SIGTERM", forceKillAfter: AGENT_TERMINATION_GRACE });
+    }
+    const read = (file: string) => fs.readFileString(file).pipe(Effect.orElseSucceed(() => ""));
+    return {
+      finished: Option.getOrElse(exit, () => "") === "0",
+      stdout: yield* read(files.out),
+      stderr: yield* read(files.err),
+    };
+  });
 
 /** Results never hold the API key, even where the model printed it, e.g. after reading auth.json. */
 type Redact = (text: string) => string;
@@ -330,7 +368,9 @@ function attempt(
 
       const started = performance.now();
       const turn = yield* invoke(
-        sandboxed(agent.start(home, workdir, testCase.prompt(port)), root, sandbox),
+        agent.start(home, workdir, testCase.prompt(port)),
+        root,
+        sandbox,
         workdir,
         env,
         Duration.seconds(testCase.budgetSeconds),
@@ -376,12 +416,7 @@ function attempt(
       let debrief: string | undefined;
       if (options.debrief) {
         const invocation = agent.debrief(home, transcript, DEBRIEF_PROMPT);
-        const reply = yield* invoke(
-          sandboxed(invocation, root, sandbox),
-          workdir,
-          env,
-          DEBRIEF_BUDGET,
-        );
+        const reply = yield* invoke(invocation, root, sandbox, workdir, env, DEBRIEF_BUDGET);
         debrief = invocation.answerFile
           ? yield* fs.readFileString(invocation.answerFile).pipe(Effect.orElseSucceed(() => ""))
           : reply.stdout.trim();
