@@ -154,7 +154,8 @@ function status(value: Status): string {
         ? `${stopped}exited with ${code} after ${runtime}; no processes remain`
         : `exited with ${code} after ${runtime}`;
     case "failed":
-      return "failed to start";
+      // Only a shell that survived KILL fails after starting; the error says so.
+      return value.stopped_by ? `${stopped}failed to exit` : "failed to start";
   }
 }
 
@@ -201,6 +202,17 @@ function inputNotes(value: Pick<ProcessResult, "input_error" | "input_refused">)
 }
 
 /**
+ * Terminal columns a frame drawn from the line start reaches: wide characters take two, escape
+ * sequences such as colors none, and tabs advance to the next multiple of eight.
+ */
+function columns(frame: string): number {
+  const [first = "", ...rest] = frame.split("\t");
+  let column = visibleWidth(first);
+  for (const segment of rest) column = (Math.floor(column / 8) + 1) * 8 + visibleWidth(segment);
+  return column;
+}
+
+/**
  * Thins lines redrawn with carriage returns, such as progress bars, which otherwise fill a page with
  * frames, to a few frames spread from the first to the last: a single frame would hide whether the
  * line still moves. A frame longer than every later one stays too, since a terminal still shows its
@@ -220,8 +232,7 @@ function collapseRedraws(text: string): string {
           Math.round((index * last) / (MAX_REDRAW_FRAMES - 1)),
         ),
       );
-      // Terminal columns: wide characters take two, escape sequences such as colors none.
-      const widths = frames.map((frame) => visibleWidth(frame));
+      const widths = frames.map(columns);
       const longestAfter: number[] = [];
       for (let index = last, longest = 0; index >= 0; index--) {
         longestAfter[index] = longest;

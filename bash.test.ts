@@ -587,6 +587,22 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
       });
       assert.equal(fed.state, "exited");
 
+      // A busy main thread shows next to a reader thread's wait.
+      const busy = await start(
+        "exec python3 -c 'import os, threading; threading.Thread(target=os.read, args=(0, 1), daemon=True).start()\nwhile True: pass'",
+      );
+      await vi.waitFor(
+        async () => {
+          const result = await poll(busy, { yield_time_ms: 0 });
+          assert.match(
+            result.processes?.[0]?.state ?? "",
+            /^waiting for input on the session's stdin.*; another thread is running$/u,
+          );
+        },
+        { timeout: 3000 },
+      );
+      await processAction({ action: "kill", session_id: busy.session_id });
+
       // The listing limit does not hide the process that waits for input.
       const crowded = await start("sleep 30 & sleep 30 & sleep 30 & sleep 30 & cat; wait");
       await vi.waitFor(
@@ -836,6 +852,10 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
     wide[5] = "进度异常";
     const cjk = await execute("bash", { command: `printf '${wide.join("\r")}'` });
     assert.match(text(cjk), /进度异常/u);
+    // A tab advances to the next multiple of eight columns.
+    const tabbed = ["short", "short", "short", "short", "short", "\tZ", "short", "short", "short"];
+    const tab = await execute("bash", { command: `printf '${tabbed.join("\r")}'` });
+    assert.match(text(tab), /\tZ/u);
   });
 
   test.skipIf(process.platform !== "linux")(

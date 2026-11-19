@@ -385,7 +385,7 @@ function sampleActivity(fs: FileSystem.FileSystem, pgid: number) {
       // sudo or one that made itself non-dumpable, like ssh.
       const io = yield* fs.readFileString(`/proc/${stat.pid}/io`).pipe(Effect.option);
       if (Option.isNone(io)) {
-        if (stat.state !== "Z") ioBytes = undefined;
+        if (!(yield* exited(fs, stat.pid, stat.state))) ioBytes = undefined;
         continue;
       }
       if (ioBytes === undefined) continue;
@@ -439,7 +439,8 @@ function inputWait(
       if (READ_WAIT_CHANNELS.has(yield* waitChannel(fs, pid, thread))) fd = first;
     } else if (calls.selects.has(number!) && first === 1 && readSet) fd = 0;
     if (fd === undefined) return undefined;
-    const target = yield* fs.readLink(`/proc/${pid}/fd/${fd}`).pipe(Effect.option);
+    // Through the thread, since the process's own link fails once its main thread has exited.
+    const target = yield* fs.readLink(`/proc/${pid}/task/${thread}/fd/${fd}`).pipe(Effect.option);
     if (sessionStdin !== undefined && Option.getOrUndefined(target) === sessionStdin) {
       return "session" as const;
     }
@@ -545,7 +546,10 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | u
         state = `running in another thread; main thread ${state}`;
       // A program reading the session's stdin waits for input that only the model can send. The
       // session's stdin stays open, so the wait never ends otherwise.
-      if (input) state = `${INPUT_STATES[input]}${otherRuns ? "; another thread is running" : ""}`;
+      if (input) {
+        const working = otherRuns || stat.state === "R";
+        state = `${INPUT_STATES[input]}${working ? "; another thread is running" : ""}`;
+      }
       members.push({ pid: stat.pid, command, state });
     }
     return members;
@@ -918,6 +922,22 @@ class Task {
             Option.isNone(exited) ? terminateTree(child, "SIGKILL") : Effect.void,
           ),
           Effect.ignore,
+          // A shell blocked in the kernel, e.g. on a hung network or FUSE mount, survives KILL;
+          // waiting for it would hold kill and shutdown forever.
+          Effect.andThen(
+            Deferred.await(this.exited).pipe(Effect.timeoutOption(TERMINATION_GRACE_MS)),
+          ),
+          Effect.tap((exit) =>
+            Option.isNone(exit)
+              ? Effect.sync(() =>
+                  this.exit({
+                    state: "failed",
+                    error:
+                      "The command's shell did not exit after KILL; it is blocked in the kernel, e.g. on a hung network or FUSE mount, and keeps running outside the session",
+                  }),
+                )
+              : Effect.void,
+          ),
           Effect.ensuring(Deferred.succeed(terminated, undefined)),
         ),
       );
