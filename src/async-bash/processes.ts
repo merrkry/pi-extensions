@@ -95,6 +95,11 @@ export type TaskSummary = {
   runtime_seconds: number;
   /** The time limit set with the command, if any. */
   timeout_seconds?: number;
+  /**
+   * Up to a few processes still running in the group, where procfs shows them, in results a call
+   * returns; empty once the group has exited, on every system.
+   */
+  processes?: Member[];
   /** Since the last output, or since the start when there was none. */
   idle_seconds: number;
   full_output_path: string;
@@ -112,11 +117,6 @@ export type ProcessResult = TaskSummary &
   Page & {
     /** Why this write call wrote nothing. */
     input_refused?: string;
-    /**
-     * Up to a few processes still running in the group, on Linux, where procfs shows them, in
-     * results a call returns; empty once the group has exited.
-     */
-    processes?: Member[];
     /** Set when the wait ended early because the command was quiet this long; see QUIET_WAKE_MS. */
     quiet_seconds?: number;
   };
@@ -252,13 +252,17 @@ const WAIT_CHANNELS: Record<string, string> = {
 };
 
 /**
- * System calls that read from the file descriptor in their first argument, by the numbers
- * /proc/<pid>/syscall reports: read, readv, pread64, splice, copy_file_range, recvfrom, and recvmsg.
- * Other architectures skip the check for reads from stdin.
+ * System calls that wait for input, by the numbers /proc/<pid>/syscall reports. `reads` read from
+ * the file descriptor in their first argument: read, readv, pread64, splice, copy_file_range,
+ * recvfrom, and recvmsg. `selects`, select and pselect6, take one more than the highest descriptor
+ * they watch, so 1 means stdin alone, as in Bash's `read -t`. Other architectures skip the check
+ * for reads from stdin.
  */
-const READ_SYSCALLS: Partial<Record<NodeJS.Architecture, ReadonlySet<number>>> = {
-  x64: new Set([0, 19, 17, 275, 326, 45, 47]),
-  arm64: new Set([63, 65, 67, 76, 285, 207, 212]),
+const INPUT_SYSCALLS: Partial<
+  Record<NodeJS.Architecture, { reads: ReadonlySet<number>; selects: ReadonlySet<number> }>
+> = {
+  x64: { reads: new Set([0, 19, 17, 275, 326, 45, 47]), selects: new Set([23, 270]) },
+  arm64: { reads: new Set([63, 65, 67, 76, 285, 207, 212]), selects: new Set([72]) },
 };
 
 type ProcStat = {
@@ -336,18 +340,34 @@ function active(before: Activity, after: Activity) {
   );
 }
 
-/** Whether a process is blocked in a read from file descriptor 0. Linux on x64 and arm64 only. */
-function readsStdin(fs: FileSystem.FileSystem, pid: number) {
-  const reads = READ_SYSCALLS[process.arch];
-  if (reads === undefined) return Effect.succeed(false);
-  return fs.readFileString(`/proc/${pid}/syscall`).pipe(
-    Effect.map((text) => {
-      const [number, fd] = text.trim().split(" ");
-      return reads.has(Number(number)) && Number(fd) === 0;
-    }),
-    Effect.orElseSucceed(() => false),
-  );
+/**
+ * Which input a blocked process waits for: `session` when it reads the session's stdin pipe through
+ * any descriptor, `stdin` when it reads other input on descriptor 0, such as a file or FIFO the
+ * command redirected. Linux on x64 and arm64 only.
+ */
+function inputWait(fs: FileSystem.FileSystem, pid: number, sessionStdin: string | undefined) {
+  return Effect.gen(function* () {
+    const calls = INPUT_SYSCALLS[process.arch];
+    if (calls === undefined) return undefined;
+    const text = yield* fs.readFileString(`/proc/${pid}/syscall`).pipe(Effect.option);
+    if (Option.isNone(text)) return undefined;
+    const [number, first, readSet] = text.value.trim().split(" ").map(Number);
+    let fd: number | undefined;
+    if (calls.reads.has(number!)) fd = first;
+    else if (calls.selects.has(number!) && first === 1 && readSet) fd = 0;
+    if (fd === undefined) return undefined;
+    const target = yield* fs.readLink(`/proc/${pid}/fd/${fd}`).pipe(Effect.option);
+    if (sessionStdin !== undefined && Option.getOrUndefined(target) === sessionStdin) {
+      return "session" as const;
+    }
+    return fd === 0 ? ("stdin" as const) : undefined;
+  });
 }
+
+const INPUT_STATES = {
+  session: "waiting for input on the session's stdin, which process write sends and eof closes",
+  stdin: "waiting for input on its stdin",
+};
 
 /**
  * The pipe a session's stdin is, as procfs names it, to tell it from other input a process reads,
@@ -365,48 +385,45 @@ function sessionStdin(pid: number | undefined) {
 
 /**
  * Processes still running in a session's process group, so a result can show what it waits on. The
- * shell running the command is left out unless it waits for input, and subshells it forked are
- * named as such rather than by the launcher's argv. Linux only.
+ * shell running the command is left out while it waits for other members, and subshells it forked
+ * are named as such rather than by the launcher's argv. Linux only.
  */
 function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | undefined) {
   return Effect.gen(function* () {
+    // A zombie has exited; only its parent's wait remains, which kill cannot shorten.
+    const live = (yield* groupStats(fs, pgid)).filter((stat) => stat.state !== "Z");
     const members: Member[] = [];
-    for (const stat of yield* groupStats(fs, pgid)) {
+    for (const stat of live) {
       if (members.length === MAX_LISTED_MEMBERS) break;
-      // A zombie has exited; only its parent's wait remains, which kill cannot shorten.
-      if (stat.state === "Z") continue;
       const cmdline = yield* fs
         .readFileString(`/proc/${stat.pid}/cmdline`)
         .pipe(Effect.orElseSucceed(() => ""));
-      const argv = cmdline.split("\0").filter(Boolean).join(" ");
-      let command = argv || stat.name;
-      if (argv.includes(COMMAND_VARIABLE)) {
-        // The group leader still running the launcher is the shell, listed only when it waits for
-        // input itself, e.g. in `read`; one a command replaced with exec is the program and is
-        // listed.
+      const argv = cmdline.split("\0").filter(Boolean);
+      let command = argv.join(" ") || stat.name;
+      const blocked = stat.state === "S" || stat.state === "D";
+      const input = blocked ? yield* inputWait(fs, stat.pid, stdin) : undefined;
+      if (argv.at(-1) === LAUNCH_SCRIPT) {
+        // The group leader still running the launcher is the shell, listed when it waits for input
+        // itself, e.g. in `read`, or on nothing in the group; one a command replaced with exec is
+        // the program and is listed.
         if (stat.pid !== pgid) command = `${stat.name} (subshell of the command)`;
-        else if (yield* readsStdin(fs, stat.pid)) command = `${stat.name} (the command's shell)`;
+        else if (input || live.length === 1) command = `${stat.name} (the command's shell)`;
         else continue;
       }
       if (command.length > MAX_MEMBER_COMMAND_CHARS) {
         command = `${command.slice(0, MAX_MEMBER_COMMAND_CHARS)} …`;
       }
       let state = PROCESS_STATES[stat.state] ?? stat.state;
-      if (stat.state === "S" || stat.state === "D") {
+      // A program reading the session's stdin waits for input that only the model can send. The
+      // session's stdin stays open, so the wait never ends otherwise.
+      if (input) {
+        state = INPUT_STATES[input];
+      } else if (blocked) {
         const channel = yield* fs
           .readFileString(`/proc/${stat.pid}/wchan`)
           .pipe(Effect.orElseSucceed(() => ""));
         const name = channel.trim();
         if (name && name !== "0") state = WAIT_CHANNELS[name] ?? `${state} in ${name}`;
-        // A program reading stdin waits for input that only the model can send. The session's
-        // stdin stays open, so the wait never ends otherwise.
-        if (yield* readsStdin(fs, stat.pid)) {
-          const own = yield* fs.readLink(`/proc/${stat.pid}/fd/0`).pipe(Effect.option);
-          state =
-            stdin !== undefined && Option.isSome(own) && own.value === stdin
-              ? "waiting for input on the session's stdin, which process write sends and eof closes"
-              : "waiting for input on its stdin";
-        }
       }
       members.push({ pid: stat.pid, command, state });
     }
@@ -416,11 +433,12 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | u
 
 /**
  * A session's lifecycle. Each step only moves forward, and only the session's monitor finishes it.
- * `draining`: the shell has exited, but its process group or output capture has not finished.
+ * `draining`: the shell has exited, but its process group or output capture has not finished;
+ * `groupExited` marks that only capture remains, of output from processes that left the group.
  */
 type Phase =
   | { tag: "running" }
-  | { tag: "draining"; outcome: Outcome }
+  | { tag: "draining"; outcome: Outcome; groupExited?: true }
   | {
       tag: "finished";
       outcome: Outcome;
@@ -529,7 +547,8 @@ class Task {
       runtime_seconds: seconds(now - this.startedAt),
       ...(this.command.timeoutMs === undefined
         ? {}
-        : { timeout_seconds: seconds(this.command.timeoutMs) }),
+        : { timeout_seconds: this.command.timeoutMs / 1000 }),
+      ...(phase.tag === "draining" && phase.groupExited ? { processes: [] } : {}),
       idle_seconds: seconds(Math.max(0, now - lastOutput)),
       full_output_path: this.output.path,
     };
@@ -694,10 +713,15 @@ class Task {
     return this.requestStop("kill").pipe(Effect.andThen(Deferred.await(this.finished)));
   }
 
-  /** The first request decides the reason; a finished session has nothing left to stop. */
+  /**
+   * The first request decides the reason; a session whose process group has exited has nothing
+   * left to stop.
+   */
   private requestStop(reason: StopReason) {
     return Effect.suspend(() => {
-      if (this.stopReason === undefined && this.phase.tag !== "finished") this.stopReason = reason;
+      const groupRuns =
+        this.phase.tag === "running" || (this.phase.tag === "draining" && !this.phase.groupExited);
+      if (this.stopReason === undefined && groupRuns) this.stopReason = reason;
       return Deferred.succeed(this.killRequested, undefined);
     });
   }
@@ -768,6 +792,7 @@ class Task {
           // cannot help.
           yield* Effect.raceFirst(this.waitForTreeExit(), Deferred.await(terminated));
           yield* Deferred.succeed(treeExited, undefined);
+          if (this.phase.tag === "draining") this.phase = { ...this.phase, groupExited: true };
           yield* Effect.sleep(MAX_CAPTURE_AFTER_TREE_EXIT_MS);
           yield* Deferred.succeed(captureDeadline, undefined);
         }),
@@ -834,6 +859,8 @@ class Task {
 
 // The shell reads the command from here, then removes it from the command's environment.
 const COMMAND_VARIABLE = "PI_BASH_COMMAND";
+// The shell's last argument, by which process listings recognize it and its subshells.
+const LAUNCH_SCRIPT = `__pi_bash_command=$${COMMAND_VARIABLE}; unset ${COMMAND_VARIABLE}; eval "unset __pi_bash_command; $__pi_bash_command"`;
 
 /**
  * How to start a command. The shell evaluates the command from the environment, so the command's
@@ -845,7 +872,6 @@ function launcher(shell: { shell: string; args: string[] }, command: Command) {
   const text = command.shellCommandPrefix
     ? `${command.shellCommandPrefix}\n${command.command}`
     : command.command;
-  const evaluate = `__pi_bash_command=$${COMMAND_VARIABLE}; unset ${COMMAND_VARIABLE}; eval "unset __pi_bash_command; $__pi_bash_command"`;
   const env: NodeJS.ProcessEnv = {
     ...command.env,
     TERM: "dumb",
@@ -853,7 +879,7 @@ function launcher(shell: { shell: string; args: string[] }, command: Command) {
     FORCE_COLOR: "0",
     [COMMAND_VARIABLE]: text,
   };
-  return { file: shell.shell, args: [...shell.args, evaluate], env };
+  return { file: shell.shell, args: [...shell.args, LAUNCH_SCRIPT], env };
 }
 
 export const makeProcesses = Effect.gen(function* () {

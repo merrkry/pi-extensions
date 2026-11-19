@@ -543,24 +543,27 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
   test.skipIf(process.platform !== "linux")(
     "lists the command's own shell while it reads the session's stdin",
     async () => {
-      const reading = await start("read -r line; printf 'got %s' \"$line\"");
-      await vi.waitFor(
-        async () => {
-          const result = await poll(reading, { yield_time_ms: 0 });
-          assert.match(
-            result.processes?.map((member) => `${member.command}: ${member.state}`).join() ?? "",
-            /\(the command's shell\): waiting for input on the session's stdin/u,
-          );
-        },
-        { timeout: 3000 },
-      );
-      const answered = await processAction({
-        action: "write",
-        session_id: reading.session_id,
-        chars: "yes\n",
-        yield_time_ms: 2000,
-      });
-      assert.equal(answered.output, "got yes");
+      // A read with a time limit waits in select rather than read.
+      for (const read of ["read -r line", "read -r -t 30 line"]) {
+        const reading = await start(`${read}; printf 'got %s' "$line"`);
+        await vi.waitFor(
+          async () => {
+            const result = await poll(reading, { yield_time_ms: 0 });
+            assert.match(
+              result.processes?.map((member) => `${member.command}: ${member.state}`).join() ?? "",
+              /\(the command's shell\): waiting for input on the session's stdin/u,
+            );
+          },
+          { timeout: 3000 },
+        );
+        const answered = await processAction({
+          action: "write",
+          session_id: reading.session_id,
+          chars: "yes\n",
+          yield_time_ms: 2000,
+        });
+        assert.equal(answered.output, "got yes");
+      }
 
       // Input the command redirected from elsewhere is not the session's to send.
       const fifo = join(directory, "redirected-input");
@@ -628,12 +631,12 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
       assert.equal(response.isError, true);
       assert.match(
         text(response),
-        /stopped by timeout_ms at 0 s, exited with code 143 \(SIGTERM\) after 0 s; no processes remain/u,
+        /stopped by timeout_ms at 0.3 s, exited with code 143 \(SIGTERM\) after 0 s; no processes remain/u,
       );
 
       const quick = await execute("bash", { command: "sleep 30", timeout_ms: 300 });
       assert.equal(quick.isError, true);
-      assert.match(text(quick), /Command stopped by timeout_ms at 0 s/u);
+      assert.match(text(quick), /Command stopped by timeout_ms at 0.3 s/u);
       // A command that exits cleanly on TERM still did not finish within its limit.
       const graceful = await execute("bash", {
         command: "trap 'exit 0' TERM; sleep 30 & wait",
@@ -717,6 +720,26 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
       assert.ok(performance.now() - started < 3000);
     },
     LONG_TEST_TIMEOUT_MS,
+  );
+
+  test.skipIf(process.platform !== "linux")(
+    "reports a session whose group has exited as only capturing output, which kill does not stop",
+    async () => {
+      const escaped = await bash(
+        "setsid -f sh -c 'while :; do printf .; sleep 0.02; done' & printf started",
+      );
+      // Capture of the escaped writer ends a second after the group exits.
+      await vi.waitFor(
+        async () => {
+          const listed = await execute("process", { action: "list" });
+          assert.match(text(listed), /its process group has exited/u);
+        },
+        { timeout: 900, interval: 20 },
+      );
+      const killed = await processAction({ action: "kill", session_id: escaped.session_id });
+      assert.equal(killed.state, "exited");
+      assert.equal(killed.stopped_by, undefined);
+    },
   );
 
   test.skipIf(process.platform === "win32")(

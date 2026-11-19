@@ -77,8 +77,9 @@ type Status = Pick<
   | "runtime_seconds"
   | "timeout_seconds"
   | "idle_seconds"
+  | "processes"
 > &
-  Pick<ProcessResult, "processes" | "quiet_seconds">;
+  Pick<ProcessResult, "quiet_seconds">;
 
 const describeMembers = (members: Member[]) =>
   members.map((member) => `pid ${member.pid} ${member.command} (${member.state})`).join(", ");
@@ -279,6 +280,12 @@ const summaryFields = {
   timeout_seconds: Type.Optional(
     Type.Number({ description: "The time limit timeout_ms set, when one was set." }),
   ),
+  processes: Type.Optional(
+    Type.Array(Type.Object({ pid: Type.Number(), command: Type.String(), state: Type.String() }), {
+      description:
+        "Up to a few processes still running in the session's process group, with what each waits on, where procfs shows them (Linux); empty once the group has exited.",
+    }),
+  ),
   total_bytes: Type.Number({ description: "UTF-8 bytes of combined output logged so far." }),
   runtime_seconds: Type.Number({ description: "Since the command started, until it finished." }),
   idle_seconds: Type.Number({
@@ -291,12 +298,6 @@ const summaryFields = {
 
 const processOutput = Type.Object({
   ...summaryFields,
-  processes: Type.Optional(
-    Type.Array(Type.Object({ pid: Type.Number(), command: Type.String(), state: Type.String() }), {
-      description:
-        "Linux: up to a few processes still running in the session's process group, with what each waits on; empty once the group has exited.",
-    }),
-  ),
   quiet_seconds: Type.Optional(
     Type.Number({
       description:
