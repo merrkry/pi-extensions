@@ -215,6 +215,9 @@ const PROCESS_STATES: Record<string, string> = {
   I: "idle",
 };
 
+// Wait channels of a process waiting for a child to exit.
+const CHILD_WAIT_CHANNELS = new Set(["do_wait", "kernel_wait4"]);
+
 /**
  * What common kernel wait channels mean for a blocked command; others show by their kernel name.
  * Names differ between kernel versions, so several map to one meaning.
@@ -371,8 +374,8 @@ const INPUT_STATES = {
 
 /**
  * The pipe a session's stdin is, as procfs names it, to tell it from other input a process reads,
- * such as a file or FIFO the command redirected. Read as the shell starts, before it has run any
- * of the command. Linux only.
+ * such as a file or FIFO the command redirected. Read synchronously once spawn returns, while the
+ * shell is still starting, well before it evaluates the command. Linux only.
  */
 function sessionStdin(pid: number | undefined) {
   if (process.platform !== "linux" || pid === undefined) return undefined;
@@ -385,8 +388,8 @@ function sessionStdin(pid: number | undefined) {
 
 /**
  * Processes still running in a session's process group, so a result can show what it waits on. The
- * shell running the command is left out while it waits for other members, and subshells it forked
- * are named as such rather than by the launcher's argv. Linux only.
+ * shell running the command is left out while it waits for a child, and subshells it forked are
+ * named as such rather than by the launcher's argv. Linux only.
  */
 function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | undefined) {
   return Effect.gen(function* () {
@@ -402,13 +405,17 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | u
       let command = argv.join(" ") || stat.name;
       const blocked = stat.state === "S" || stat.state === "D";
       const input = blocked ? yield* inputWait(fs, stat.pid, stdin) : undefined;
+      const channel = blocked
+        ? (yield* fs
+            .readFileString(`/proc/${stat.pid}/wchan`)
+            .pipe(Effect.orElseSucceed(() => ""))).trim()
+        : "";
       if (argv.at(-1) === LAUNCH_SCRIPT) {
-        // The group leader still running the launcher is the shell, listed when it waits for input
-        // itself, e.g. in `read`, or on nothing in the group; one a command replaced with exec is
-        // the program and is listed.
+        // The group leader still running the launcher is the shell, left out while it waits for
+        // the other members it started; one a command replaced with exec is the program.
         if (stat.pid !== pgid) command = `${stat.name} (subshell of the command)`;
-        else if (input || live.length === 1) command = `${stat.name} (the command's shell)`;
-        else continue;
+        else if (live.length > 1 && CHILD_WAIT_CHANNELS.has(channel)) continue;
+        else command = `${stat.name} (the command's shell)`;
       }
       if (command.length > MAX_MEMBER_COMMAND_CHARS) {
         command = `${command.slice(0, MAX_MEMBER_COMMAND_CHARS)} …`;
@@ -416,15 +423,9 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | u
       let state = PROCESS_STATES[stat.state] ?? stat.state;
       // A program reading the session's stdin waits for input that only the model can send. The
       // session's stdin stays open, so the wait never ends otherwise.
-      if (input) {
-        state = INPUT_STATES[input];
-      } else if (blocked) {
-        const channel = yield* fs
-          .readFileString(`/proc/${stat.pid}/wchan`)
-          .pipe(Effect.orElseSucceed(() => ""));
-        const name = channel.trim();
-        if (name && name !== "0") state = WAIT_CHANNELS[name] ?? `${state} in ${name}`;
-      }
+      if (input) state = INPUT_STATES[input];
+      else if (channel && channel !== "0")
+        state = WAIT_CHANNELS[channel] ?? `${state} in ${channel}`;
       members.push({ pid: stat.pid, command, state });
     }
     return members;
@@ -434,7 +435,7 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | u
 /**
  * A session's lifecycle. Each step only moves forward, and only the session's monitor finishes it.
  * `draining`: the shell has exited, but its process group or output capture has not finished;
- * `groupExited` marks that only capture remains, of output from processes that left the group.
+ * `groupExited` marks that the process group has exited and only output capture remains.
  */
 type Phase =
   | { tag: "running" }
@@ -602,10 +603,18 @@ class Task {
       const pgid = this.child.pid;
       const live = summary.state === "running" || summary.state === "draining";
       const result: ProcessResult = { ...summary, ...page };
-      if (!withProcesses || !live || pgid === undefined || process.platform !== "linux") {
+      if (
+        !withProcesses ||
+        !live ||
+        summary.processes !== undefined ||
+        pgid === undefined ||
+        process.platform !== "linux"
+      ) {
         return result;
       }
-      return { ...result, processes: yield* groupMembers(this.fs, pgid, this.stdin) };
+      // Group exit counts once the monitor has recorded it, so every view and kill agree on it.
+      const members = yield* groupMembers(this.fs, pgid, this.stdin);
+      return members.length ? { ...result, processes: members } : result;
     });
   }
 
@@ -721,7 +730,8 @@ class Task {
     return Effect.suspend(() => {
       const groupRuns =
         this.phase.tag === "running" || (this.phase.tag === "draining" && !this.phase.groupExited);
-      if (this.stopReason === undefined && groupRuns) this.stopReason = reason;
+      if (!groupRuns) return Effect.void;
+      this.stopReason ??= reason;
       return Deferred.succeed(this.killRequested, undefined);
     });
   }

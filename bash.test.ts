@@ -581,6 +581,20 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
         { timeout: 3000 },
       );
       await processAction({ action: "kill", session_id: redirected.session_id });
+
+      // The shell blocked on its own redirect is listed next to the child it started.
+      const opening = await start(`mkfifo '${fifo}-2'; sleep 30 & read -r line <'${fifo}-2'`);
+      await vi.waitFor(
+        async () => {
+          const result = await poll(opening, { yield_time_ms: 0 });
+          assert.match(
+            result.processes?.map((member) => `${member.command}: ${member.state}`).join() ?? "",
+            /\(the command's shell\): opening a FIFO that no process has opened from the other end/u,
+          );
+        },
+        { timeout: 3000 },
+      );
+      await processAction({ action: "kill", session_id: opening.session_id });
     },
   );
 
