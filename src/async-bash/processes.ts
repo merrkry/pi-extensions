@@ -3,7 +3,7 @@ import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { Cause, Deferred, Effect, Exit, FileSystem, Option, Scope, Stream } from "effect";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readlinkSync } from "node:fs";
+import { existsSync, readlinkSync } from "node:fs";
 import { constants } from "node:os";
 import { join } from "node:path";
 import { Output, type Page } from "./output.ts";
@@ -46,6 +46,12 @@ const CLOCK_TICKS_PER_SECOND = 100;
  * no call can leave a session half released. The prompt guidelines state the bound.
  */
 export const MAX_REPORTED_SESSIONS = 64;
+/**
+ * Whether procfs shows this process, and with it the sessions' processes: Linux, unless a sandbox
+ * or container left /proc unmounted or empty. Process lists, quiet wake, and exit checks that skip
+ * zombies rely on it.
+ */
+export const PROCFS = process.platform === "linux" && existsSync(`/proc/${process.pid}/stat`);
 // Remembers removed ids so later calls can tell them from mistyped ones.
 const MAX_REMOVED_IDS = 1024;
 // Bounds input queued for a command that is not reading stdin.
@@ -152,10 +158,14 @@ function terminateTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Sig
   );
 }
 
+const errorCode = (cause: unknown) =>
+  cause instanceof Error && "code" in cause ? cause.code : undefined;
+
 /**
  * Whether a process in the group can still run. A zombie keeps its group signalable until its
  * parent reaps it, and the reaper of an orphan, such as a container's PID 1, may never do so;
- * Linux exposes process states to skip zombies, while other systems count them as alive.
+ * Linux exposes process states to skip zombies, while other systems count them as alive. EPERM
+ * means the group exists but only has members of another user, e.g. after a setuid program.
  */
 function groupAlive(fs: FileSystem.FileSystem, pgid: number) {
   return Effect.gen(function* () {
@@ -164,12 +174,14 @@ function groupAlive(fs: FileSystem.FileSystem, pgid: number) {
       return true;
     }).pipe(
       Effect.catchIf(
-        (error) =>
-          error.cause instanceof Error && "code" in error.cause && error.cause.code === "ESRCH",
-        () => Effect.succeed(false),
+        (error) => {
+          const code = errorCode(error.cause);
+          return code === "ESRCH" || code === "EPERM";
+        },
+        (error) => Effect.succeed(errorCode(error.cause) === "EPERM"),
       ),
     );
-    if (!signalable || process.platform !== "linux") return signalable;
+    if (!signalable || !PROCFS) return signalable;
     const pids = fs
       .readDirectory("/proc")
       .pipe(Effect.map((entries) => entries.filter((entry) => /^\d+$/u.test(entry))));
@@ -388,7 +400,7 @@ const INPUT_STATES = { session: SESSION_INPUT_STATE, stdin: "waiting for input o
  * shell is still starting, well before it evaluates the command. Linux only.
  */
 function sessionStdin(pid: number | undefined) {
-  if (process.platform !== "linux" || pid === undefined) return undefined;
+  if (!PROCFS || pid === undefined) return undefined;
   try {
     return readlinkSync(`/proc/${pid}/fd/0`);
   } catch {
@@ -405,16 +417,25 @@ function groupMembers(fs: FileSystem.FileSystem, pgid: number, stdin: string | u
   return Effect.gen(function* () {
     // A zombie has exited; only its parent's wait remains, which kill cannot shorten.
     const live = (yield* groupStats(fs, pgid)).filter((stat) => stat.state !== "Z");
-    const members: Member[] = [];
+    const waits = [];
     for (const stat of live) {
+      const blocked = stat.state === "S" || stat.state === "D";
+      waits.push({
+        stat,
+        blocked,
+        input: blocked ? yield* inputWait(fs, stat.pid, stdin) : undefined,
+      });
+    }
+    // Processes waiting for the model's input come first, so the listing limit never hides them.
+    waits.sort((a, b) => Number(b.input === "session") - Number(a.input === "session"));
+    const members: Member[] = [];
+    for (const { stat, blocked, input } of waits) {
       if (members.length === MAX_LISTED_MEMBERS) break;
       const cmdline = yield* fs
         .readFileString(`/proc/${stat.pid}/cmdline`)
         .pipe(Effect.orElseSucceed(() => ""));
       const argv = cmdline.split("\0").filter(Boolean);
       let command = argv.join(" ") || stat.name;
-      const blocked = stat.state === "S" || stat.state === "D";
-      const input = blocked ? yield* inputWait(fs, stat.pid, stdin) : undefined;
       const channel = blocked
         ? (yield* fs
             .readFileString(`/proc/${stat.pid}/wchan`)
@@ -607,27 +628,30 @@ class Task {
    */
   observe(cursor: number, from: "cursor" | "end", withProcesses = false) {
     return Effect.gen({ self: this }, function* () {
-      // Observe state before output, so a finished state always comes with the final bytes.
-      const summary = this.summary();
-      const page = yield* this.output.page(cursor, from);
-      const pgid = this.child.pid;
-      const live = summary.state === "running" || summary.state === "draining";
-      const result: ProcessResult = { ...summary, ...page };
-      if (
-        !withProcesses ||
-        !live ||
-        summary.processes !== undefined ||
-        pgid === undefined ||
-        process.platform !== "linux"
-      ) {
-        return result;
+      while (true) {
+        // Observe state before output, so a finished state always comes with the final bytes.
+        const phase = this.phase;
+        const summary = this.summary();
+        const page = yield* this.output.page(cursor, from);
+        const pgid = this.child.pid;
+        const live = summary.state === "running" || summary.state === "draining";
+        const result: ProcessResult = { ...summary, ...page };
+        if (
+          !withProcesses ||
+          !live ||
+          summary.processes !== undefined ||
+          pgid === undefined ||
+          !PROCFS
+        ) {
+          return result;
+        }
+        const members = yield* groupMembers(this.fs, pgid, this.stdin);
+        // A lifecycle step during the scan, such as the group's exit, which every view and kill
+        // count only once the monitor records it, is observed again, so the result shows one
+        // moment. The lifecycle has few steps, so this repeats at most a few times.
+        if (this.phase !== phase) continue;
+        return members.length ? { ...result, processes: members } : result;
       }
-      // Group exit counts once the monitor has recorded it, also during this scan, so every view
-      // and kill agree on it.
-      const members = yield* groupMembers(this.fs, pgid, this.stdin);
-      const exited = this.phase.tag === "draining" && this.phase.groupExited;
-      if (exited) return { ...result, processes: [] };
-      return members.length ? { ...result, processes: members } : result;
     });
   }
 
@@ -638,7 +662,7 @@ class Task {
    */
   private quietStretch(waitMs: number) {
     const pgid = this.child.pid;
-    if (process.platform !== "linux" || pgid === undefined || waitMs <= QUIET_WAKE_MS) {
+    if (!PROCFS || pgid === undefined || waitMs <= QUIET_WAKE_MS) {
       return Effect.never;
     }
     return Effect.gen({ self: this }, function* () {

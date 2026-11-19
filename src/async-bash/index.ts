@@ -13,6 +13,7 @@ import { Type, type Static } from "typebox";
 import {
   MAX_REPORTED_SESSIONS,
   type Member,
+  PROCFS,
   makeProcesses,
   QUIET_WAKE_MS,
   SESSION_INPUT_STATE,
@@ -121,10 +122,11 @@ function status(value: Status): string {
       return notes.join(", ");
     }
     case "draining": {
+      // The runtime goes on while the session drains, so it is not when the shell exited.
       // An empty list means the group has exited, and only output capture remains, which ends
       // within a second and which kill cannot shorten.
       if (value.processes?.length === 0) {
-        return `${stopped}shell exited with ${code} after ${runtime}; its process group has exited, and output capture is ending (poll waits for it)`;
+        return `${stopped}shell exited with ${code}, session running for ${runtime}; its process group has exited, and output capture is ending (poll waits for it)`;
       }
       const remaining = value.processes
         ? describeMembers(value.processes)
@@ -133,7 +135,7 @@ function status(value: Status): string {
         value.quiet_seconds === undefined
           ? ""
           : `; no output, CPU, or I/O for ${value.quiet_seconds} s, which ended this wait early`;
-      return `${stopped}shell exited with ${code} after ${runtime}; still running: ${remaining} (poll waits for them, kill stops them)${quiet}`;
+      return `${stopped}shell exited with ${code}, session running for ${runtime}; still running: ${remaining} (poll waits for them, kill stops them)${quiet}`;
     }
     case "exited":
       // A stopped session's group has exited too, so nothing it started is left to check for.
@@ -449,7 +451,7 @@ export default function (pi: ExtensionAPI): void {
     promptGuidelines: [
       ...(piBash.promptGuidelines ?? []),
       "A status reminder lists running bash sessions and finished ones whose final result you have not seen. Without a reminder no session needs attention, and finished sessions need no cleanup. Before finishing, handle the sessions it lists and report any you leave running on purpose.",
-      `yield_time_ms only sets how long a call waits before returning; the command keeps running in its session. The call returns as soon as the command finishes, so set it near the expected runtime.${process.platform === "linux" ? ` It also returns once the command has gone ${QUIET_WAKE_MS / 1000} s without output, I/O, or more than occasional CPU use, so a long wait does not hide a stalled command; this happens once per quiet stretch, and waiting again on a command that stays quiet runs the full time.` : ""} A call waits at most ${MAX_WAIT_MS / 60_000} minutes.`,
+      `yield_time_ms only sets how long a call waits before returning; the command keeps running in its session. The call returns as soon as the command finishes, so set it near the expected runtime.${PROCFS ? ` It also returns once the command has gone ${QUIET_WAKE_MS / 1000} s without output, I/O, or more than occasional CPU use, so a long wait does not hide a stalled command; this happens once per quiet stretch, and waiting again on a command that stays quiet runs the full time.` : ""} A call waits at most ${MAX_WAIT_MS / 60_000} minutes.`,
       `timeout_ms is a backstop for a command that must not run past a limit, e.g. a test suite with a time budget, or that you will not check on. It stops the whole process group, escalating from TERM to KILL after ${TERMINATION_GRACE_MS / 1000} s; use it instead of the timeout utility, which leaves processes that ignore TERM running. It is not a reason to keep waiting: once results show a command stalled or failing, stop it with process kill and act on what you saw.`,
       "To watch a long-running program, start it with a short yield_time_ms, poll its session, and stop it with process kill. The session keeps all output and poll shows it as it arrives, so do not pipe long commands through tail or redirect their output to a file just to follow it.",
       "Tool calls in one response run concurrently and return together: put dependent steps in one command, and keep yield_time_ms short for calls batched with others.",

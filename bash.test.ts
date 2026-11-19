@@ -565,6 +565,20 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
         assert.equal(answered.output, "got yes");
       }
 
+      // The listing limit does not hide the process that waits for input.
+      const crowded = await start("sleep 30 & sleep 30 & sleep 30 & sleep 30 & cat; wait");
+      await vi.waitFor(
+        async () => {
+          const result = await poll(crowded, { yield_time_ms: 0 });
+          assert.match(
+            result.processes?.[0]?.state ?? "",
+            /^waiting for input on the session's stdin/u,
+          );
+        },
+        { timeout: 3000 },
+      );
+      await processAction({ action: "kill", session_id: crowded.session_id });
+
       // Output from elsewhere in the command does not hide that it waits for input.
       const prompted = await start(
         "(while :; do echo beat; sleep 0.2; done) & read -r answer; kill $!; printf 'got %s' \"$answer\"",
@@ -962,15 +976,19 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
       assert.equal(await reminder(), undefined);
 
       const concurrent = await Promise.all(
+        // The pause keeps the finish out of the result of the write that ends the input.
         Array.from({ length: MAX_REPORTED_SESSIONS + 2 }, () =>
-          start("IFS= read -r line; printf completed"),
+          start("IFS= read -r line; sleep 0.5; printf completed"),
         ),
       );
       const ids = concurrent.map((task) => task.session_id);
       // Concurrent starts register in completion order.
       const running = await reminder();
       assert.match(running ?? "", /^Bash sessions running: /u);
-      assert.match(running ?? "", /\(IFS= read -r line; printf completed, running for \d+ s\)/u);
+      assert.match(
+        running ?? "",
+        /\(IFS= read -r line; sleep 0.5; printf completed, running for \d+ s\)/u,
+      );
       assert.deepEqual(sessionIds(running).sort(), ids.toSorted());
 
       const [unreported, ...rest] = concurrent;
@@ -995,7 +1013,7 @@ describe(`bash tools under ${process.versions["bun"] ? "Bun" : "Node"}`, () => {
         assert.match(
           (await reminder()) ?? "",
           new RegExp(
-            `^Bash sessions finished since last checked: ${unreported!.session_id} \\(IFS= read -r line; printf completed, exited with code 0 after \\d+ s\\); poll them to see their final output\\.$`,
+            `^Bash sessions finished since last checked: ${unreported!.session_id} \\(IFS= read -r line; sleep 0.5; printf completed, exited with code 0 after \\d+ s\\); poll them to see their final output\\.$`,
             "u",
           ),
         ),
