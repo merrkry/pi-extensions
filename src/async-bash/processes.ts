@@ -1,21 +1,16 @@
-import { NodeFileSystem, NodeStream } from "@effect/platform-node";
+import { NodeFileSystem } from "@effect/platform-node";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
-import { Cause, Deferred, Effect, Exit, FileSystem, Option, Scope, Stream } from "effect";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { Deferred, Effect, Exit, FileSystem, Option, Scope } from "effect";
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { closeSync, openSync } from "node:fs";
 import { constants } from "node:os";
 import { join } from "node:path";
+import type { Writable } from "node:stream";
 import { Output, type Page } from "./output.ts";
 
 // Match Pi's bash output cadence to keep streaming updates inexpensive.
 const OUTPUT_UPDATE_INTERVAL_MS = 100;
-const OUTPUT_IDLE_AFTER_EXIT_MS = 100;
-/**
- * Bounds capture after the process group exits, for processes outside the group that still hold
- * the output pipes. No group member writes by then, and backpressure kept the backlog to the pipe
- * and stream buffers, which drain in milliseconds, so the deadline never cuts off group output.
- */
-const MAX_CAPTURE_AFTER_TREE_EXIT_MS = 1_000;
 const TERMINATION_GRACE_MS = 5_000;
 const TERMINATION_POLL_INTERVAL_MS = 100;
 /**
@@ -32,12 +27,19 @@ const MAX_QUEUED_INPUT_BYTES = 1024 * 1024;
 const EXIT_FAILURE = 1;
 // Bash represents signal termination as 128 + the signal number.
 const SHELL_SIGNAL_EXIT_BASE = 128;
+/**
+ * The command appends through the descriptors it inherits. A log it cannot open again keeps
+ * redirections to /dev/stdout or /dev/stderr, which would truncate it, failing as they do on the
+ * sockets of Pi's own bash. Privileged users bypass file modes.
+ */
+const LOG_MODE = 0o400;
 
 type Outcome =
   | { state: "exited"; exit_code: number; signal?: NodeJS.Signals }
   | { state: "failed"; error: string };
 
-const preserveOutput = () => {};
+/** A shell with a pipe for stdin; its stdout and stderr are the log. */
+type Child = ChildProcess & { readonly stdin: Writable };
 
 export interface Command {
   command: string;
@@ -45,10 +47,14 @@ export interface Command {
   env: NodeJS.ProcessEnv;
   shellPath?: string;
   shellCommandPrefix?: string;
+  /** Stops the command once it has run this long. */
+  timeoutMs?: number;
 }
 
-/** `draining`: the shell has exited, but its process group or output capture has not finished. */
-export type TaskState = "running" | "draining" | "exited" | "failed";
+export type TaskState = "running" | "exited" | "failed";
+
+/** Why Pi stopped a command. */
+export type StopReason = "kill" | "timeout";
 
 export type TaskSummary = {
   session_id: string;
@@ -61,7 +67,12 @@ export type TaskSummary = {
   error?: string;
   /** A pipe failure after stdin accepted input; part of that input may have been delivered. */
   input_error?: string;
+  stopped_by?: StopReason;
   stdin: "open" | "closed";
+  /** How long the shell has run, or ran. */
+  runtime_seconds: number;
+  /** While the shell runs, how long ago the log last grew. */
+  idle_seconds?: number;
   total_bytes: number;
   full_output_path: string;
 };
@@ -72,145 +83,118 @@ export type ProcessResult = TaskSummary &
     input_refused?: string;
   };
 
-function terminateTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals) {
-  if (process.platform === "win32") {
-    return Effect.callback<void, Error>((resume) => {
-      if (!child.pid) return resume(Effect.void);
-      const killer = spawn(
-        join(process.env["SystemRoot"] ?? "C:\\Windows", "System32", "taskkill.exe"),
-        ["/F", "/T", "/PID", String(child.pid)],
-        { stdio: "ignore", windowsHide: true },
-      );
-      killer.once("error", (error) => resume(Effect.fail(error)));
-      killer.once("close", (code) => {
-        // The command may have exited before taskkill reaches it.
-        resume(
-          code === 0 || child.exitCode !== null || child.signalCode !== null
-            ? Effect.void
-            : Effect.fail(new Error(`taskkill failed for PID ${child.pid}: exit code ${code}`)),
-        );
-      });
-    });
+/** What a result returned to the caller showed. */
+type Shown = Pick<TaskSummary, "state" | "input_error"> & { cursor_bytes?: number };
+
+const seconds = (milliseconds: number) => Math.max(0, Math.round(milliseconds / 1000));
+
+/** Whether the signal reached the process group; signal 0 only asks whether one would. */
+function signalGroup(pgid: number, signal: NodeJS.Signals | 0) {
+  try {
+    process.kill(-pgid, signal);
+    return true;
+  } catch {
+    // The group is empty, or holds only processes Pi may not signal.
+    return false;
   }
-  return Effect.try(() => {
-    if (child.pid) process.kill(-child.pid, signal);
-  }).pipe(
-    Effect.catchIf(
-      (error) =>
-        error.cause instanceof Error && "code" in error.cause && error.cause.code === "ESRCH",
-      () => Effect.void,
-    ),
-  );
 }
 
-/**
- * Whether a process in the group can still run. A zombie keeps its group signalable until its
- * parent reaps it, and the reaper of an orphan, such as a container's PID 1, may never do so;
- * Linux exposes process states to skip zombies, while other systems count them as alive.
- */
-function groupAlive(fs: FileSystem.FileSystem, pgid: number) {
-  return Effect.gen(function* () {
-    const signalable = yield* Effect.try(() => {
-      process.kill(-pgid, 0);
-      return true;
-    }).pipe(
-      Effect.catchIf(
-        (error) =>
-          error.cause instanceof Error && "code" in error.cause && error.cause.code === "ESRCH",
-        () => Effect.succeed(false),
-      ),
+function stopWindowsTree(child: Child, pid: number) {
+  return Effect.callback<void, Error>((resume) => {
+    const killer = spawn(
+      join(process.env["SystemRoot"] ?? "C:\\Windows", "System32", "taskkill.exe"),
+      ["/F", "/T", "/PID", String(pid)],
+      { stdio: "ignore", windowsHide: true },
     );
-    if (!signalable || process.platform !== "linux") return signalable;
-    const pids = fs
-      .readDirectory("/proc")
-      .pipe(Effect.map((entries) => entries.filter((entry) => /^\d+$/u.test(entry))));
-    // The fields after the parenthesized command name start with state, ppid, and pgrp.
-    const stat = (pid: string) =>
-      fs
-        .readFileString(`/proc/${pid}/stat`)
-        .pipe(
-          Effect.option,
-          Effect.map(Option.map((text) => text.slice(text.lastIndexOf(")") + 2).split(" "))),
-        );
-    // Without procfs, e.g. in some containers, zombies count as alive as on other systems.
-    const listed = yield* Effect.option(pids);
-    if (Option.isNone(listed)) return true;
-    const before = listed.value;
-    for (const pid of before) {
-      const fields = yield* stat(pid);
-      if (Option.isSome(fields) && Number(fields.value[2]) === pgid && fields.value[0] !== "Z") {
-        return true;
-      }
-    }
-    // A member alive after the scan was either listed before it, and so found live, or appeared
-    // during it. Count any process that appeared and is in the group, or has already gone, as live.
-    const known = new Set(before);
-    for (const pid of yield* pids.pipe(Effect.orElseSucceed(() => [] as string[]))) {
-      if (known.has(pid)) continue;
-      const fields = yield* stat(pid);
-      if (Option.isNone(fields) || Number(fields.value[2]) === pgid) return true;
-    }
-    return false;
+    killer.once("error", (error) => resume(Effect.fail(error)));
+    killer.once("close", (code) => {
+      // The command may have exited before taskkill reaches it.
+      resume(
+        code === 0 || child.exitCode !== null || child.signalCode !== null
+          ? Effect.void
+          : Effect.fail(new Error(`taskkill failed for PID ${pid}: exit code ${code}`)),
+      );
+    });
   });
 }
 
 /**
- * A session's lifecycle. Each step only moves forward, and only the session's monitor finishes it.
- * `draining`: the shell has exited, but its process group or output capture has not finished.
+ * Stops a command: TERM for its process group, then KILL for whatever is left of the group after
+ * the grace period. Windows has no process groups and stops the shell's process tree at once.
+ *
+ * The group ID stays reserved while the group has members, so the signals reach only this
+ * command; the probes end with the group. A probe counts exited processes that nothing has
+ * reaped, so the wait lasts the whole grace period where orphans stay unreaped, e.g. in a
+ * container without an init process.
  */
+function stop(child: Child) {
+  const pid = child.pid;
+  if (pid === undefined) return Effect.void;
+  if (process.platform === "win32") return stopWindowsTree(child, pid).pipe(Effect.ignore);
+  return Effect.gen(function* () {
+    if (!signalGroup(pid, "SIGTERM")) return;
+    const deadline = performance.now() + TERMINATION_GRACE_MS;
+    while (performance.now() < deadline) {
+      yield* Effect.sleep(TERMINATION_POLL_INTERVAL_MS);
+      if (!signalGroup(pid, 0)) return;
+    }
+    signalGroup(pid, "SIGKILL");
+  });
+}
+
+/** A session lasts as long as its shell: only the shell's exit finishes it. */
 type Phase =
   | { tag: "running" }
-  | { tag: "draining"; outcome: Outcome }
-  | { tag: "finished"; outcome: Outcome; captureError?: string; seenAt?: number };
+  | { tag: "finished"; outcome: Outcome; finishedAt: number; seenAt?: number };
 
 class Task {
   private phase: Phase = { tag: "running" };
-  private readonly exited = Deferred.makeUnsafe<Outcome>();
-  private readonly finished = Deferred.makeUnsafe<void>();
-  private readonly killRequested = Deferred.makeUnsafe<void>();
+  private readonly startedAt = performance.now();
+  private readonly exited = Deferred.makeUnsafe<void>();
+  private readonly stopRequested = Deferred.makeUnsafe<void>();
+  /** Done once the shell has exited and a stop Pi began has run its course. */
+  private readonly settled = Deferred.makeUnsafe<void>();
+  private stoppedBy: StopReason | undefined;
   /** A stdin failure after a write call accepted input, until a returned result shows it. */
   private inputError: string | undefined;
+  /** End of the output that returned results showed, where reads continue by default. */
+  private shown = 0;
   /** Bytes written to stdin and not yet flushed; Bun leaves `writableLength` at zero. */
   queuedInput = 0;
+
+  readonly output: Output;
 
   constructor(
     readonly id: string,
     readonly command: Command,
-    readonly child: ChildProcessWithoutNullStreams,
-    readonly output: Output,
+    readonly child: Child,
+    fs: FileSystem.FileSystem,
+    logPath: string,
   ) {
-    // Node resumes unread stdio on exit. Retain it until Effect attaches its readers.
-    child.stdout.on("readable", preserveOutput);
-    child.stderr.on("readable", preserveOutput);
+    this.output = new Output(fs, logPath, () => this.isFinished);
     child.once("exit", (code, signal) => {
-      let exitCode = code ?? EXIT_FAILURE;
-      if (code === null && signal) {
-        const signalNumber = constants.signals[signal];
-        if (signalNumber !== undefined) exitCode = SHELL_SIGNAL_EXIT_BASE + signalNumber;
-      }
-      this.exit(
-        signal
-          ? { state: "exited", exit_code: exitCode, signal }
-          : { state: "exited", exit_code: exitCode },
-      );
+      if (!signal) return this.finish({ state: "exited", exit_code: code ?? EXIT_FAILURE });
+      const exitCode = SHELL_SIGNAL_EXIT_BASE + (constants.signals[signal] ?? 0);
+      return this.finish({ state: "exited", exit_code: exitCode, signal });
     });
-    child.once("error", (error) => this.exit({ state: "failed", error: error.message }));
+    child.once("error", (error) => this.finish({ state: "failed", error: error.message }));
     // A failed write destroys stdin, which then reports as closed.
     child.stdin.on("error", () => {});
   }
 
-  private exit(outcome: Outcome) {
+  private finish(outcome: Outcome) {
     if (this.phase.tag !== "running") return;
-    this.phase = { tag: "draining", outcome };
-    Deferred.doneUnsafe(this.exited, Effect.succeed(outcome));
+    this.phase = { tag: "finished", outcome, finishedAt: performance.now() };
+    this.child.stdin.destroy();
+    Deferred.doneUnsafe(this.exited, Exit.void);
   }
 
   get isFinished() {
     return this.phase.tag === "finished";
   }
 
-  get state(): TaskState {
-    return this.phase.tag === "finished" ? this.phase.outcome.state : this.phase.tag;
+  get isSettled() {
+    return Deferred.isDoneUnsafe(this.settled);
   }
 
   get stdinOpen() {
@@ -220,46 +204,56 @@ class Task {
     );
   }
 
-  summary(): TaskSummary {
-    const phase = this.phase;
-    const outcome = phase.tag === "running" ? undefined : phase.outcome;
-    const error =
-      outcome?.state === "failed"
-        ? outcome.error
-        : phase.tag === "finished" &&
-          phase.captureError &&
-          `Output capture failed: ${phase.captureError}`;
-    return {
-      session_id: this.id,
-      state: this.state,
-      command: this.command.command,
-      cwd: this.command.cwd,
-      ...(this.child.pid ? { pid: this.child.pid } : {}),
-      ...(outcome?.state === "exited"
-        ? {
-            exit_code: outcome.exit_code,
-            ...(outcome.signal ? { signal: outcome.signal } : {}),
-          }
-        : {}),
-      ...(error ? { error } : {}),
-      ...(this.inputError ? { input_error: this.inputError } : {}),
-      stdin: this.stdinOpen ? "open" : "closed",
-      total_bytes: this.output.totalBytes,
-      full_output_path: this.output.path,
-    };
+  summary() {
+    return Effect.suspend(() => {
+      // Read the state before the log, so a final state comes with the final length.
+      const phase = this.phase;
+      const stdin = this.stdinOpen ? ("open" as const) : ("closed" as const);
+      return this.output.status().pipe(
+        Effect.map(({ totalBytes, modifiedAt }): TaskSummary => {
+          const outcome = phase.tag === "finished" ? phase.outcome : undefined;
+          const endedAt = phase.tag === "finished" ? phase.finishedAt : performance.now();
+          return {
+            session_id: this.id,
+            state: outcome?.state ?? "running",
+            command: this.command.command,
+            cwd: this.command.cwd,
+            ...(this.child.pid ? { pid: this.child.pid } : {}),
+            ...(outcome?.state === "exited" ? { exit_code: outcome.exit_code } : {}),
+            ...(outcome?.state === "exited" && outcome.signal ? { signal: outcome.signal } : {}),
+            ...(outcome?.state === "failed" ? { error: outcome.error } : {}),
+            ...(this.inputError ? { input_error: this.inputError } : {}),
+            ...(this.stoppedBy ? { stopped_by: this.stoppedBy } : {}),
+            stdin,
+            runtime_seconds: seconds(endedAt - this.startedAt),
+            ...(outcome ? {} : { idle_seconds: seconds(Date.now() - modifiedAt) }),
+            total_bytes: totalBytes,
+            full_output_path: this.output.path,
+          };
+        }),
+      );
+    });
   }
 
   /**
    * Marks what a result returned to the caller showed. Only the caller knows whether a result
    * reaches it: streaming updates, cancelled calls, and cleanup observe without returning.
+   * Calls that overlap on a session therefore start from the same place and can return the same
+   * output; none is skipped.
    */
-  acknowledge(shown: Pick<TaskSummary, "state" | "input_error">) {
-    if (this.phase.tag === "finished" && (shown.state === "exited" || shown.state === "failed")) {
+  acknowledge(shown: Shown) {
+    if (shown.cursor_bytes !== undefined) this.shown = Math.max(this.shown, shown.cursor_bytes);
+    if (this.phase.tag === "finished" && shown.state !== "running") {
       this.phase.seenAt ??= performance.now();
     }
     if (shown.input_error !== undefined && this.inputError === shown.input_error) {
       this.inputError = undefined;
     }
+  }
+
+  /** Where output continues after what returned results showed. */
+  get shownCursor() {
+    return this.shown;
   }
 
   stdinFailed(message: string) {
@@ -281,16 +275,15 @@ class Task {
 
   /** Reads without marking anything as shown; see `acknowledge`. */
   observe(cursor: number, from: "cursor" | "end") {
-    return Effect.suspend(() => {
-      // Observe state before output, so a finished state always comes with the final bytes.
-      const summary = this.summary();
-      return this.output
-        .page(cursor, from)
-        .pipe(Effect.map((page): ProcessResult => ({ ...summary, ...page })));
+    return Effect.gen({ self: this }, function* () {
+      // Summarize before reading, so a final state comes with the output written until then.
+      const summary = yield* this.summary();
+      const page = yield* this.output.page(cursor, from);
+      return { ...summary, ...page } satisfies ProcessResult;
     });
   }
 
-  /** Waits until the command finishes, `until` completes, or `waitMs` elapses. */
+  /** Waits until the shell exits, `until` completes, or `waitMs` elapses. */
   wait(
     waitMs: number,
     cursor: number,
@@ -298,21 +291,20 @@ class Task {
     until: Effect.Effect<unknown> = Effect.never,
   ) {
     return Effect.gen({ self: this }, function* () {
-      const finished = Effect.raceFirst(Deferred.await(this.finished), until).pipe(
+      const finished = Effect.raceFirst(Deferred.await(this.exited), until).pipe(
         Effect.timeoutOption(waitMs),
       );
       if (!onUpdate) {
         yield* finished;
       } else {
-        const output = this.output;
-        const observe = () => this.observe(cursor, "end");
-        const updates = Effect.gen(function* () {
-          let reported = output.totalBytes;
+        const updates = Effect.gen({ self: this }, function* () {
+          let reported = (yield* this.output.status()).totalBytes;
           while (true) {
             yield* Effect.sleep(OUTPUT_UPDATE_INTERVAL_MS);
-            if (output.totalBytes === reported) continue;
-            reported = output.totalBytes;
-            onUpdate(yield* observe());
+            const { totalBytes } = yield* this.output.status();
+            if (totalBytes === reported) continue;
+            reported = totalBytes;
+            onUpdate(yield* this.observe(cursor, "end"));
           }
         });
         yield* Effect.raceFirst(finished, updates);
@@ -321,120 +313,59 @@ class Task {
     });
   }
 
-  /**
-   * Requests termination and waits until the session finishes. The monitor carries the
-   * termination out, so cancelling this wait never stops a TERM from escalating to KILL.
-   */
-  kill() {
-    return Deferred.succeed(this.killRequested, undefined).pipe(
-      Effect.andThen(Deferred.await(this.finished)),
-    );
+  private requestStop(reason: StopReason) {
+    if (this.phase.tag !== "running" || this.stoppedBy) return;
+    this.stoppedBy = reason;
+    Deferred.doneUnsafe(this.stopRequested, Exit.void);
   }
 
   /**
-   * Waits for every process in the shell's process group. Processes that leave the group, e.g.
-   * through setsid, escape both this wait and group signals, as they do in Pi's own bash; only
-   * their hold on the output pipes is bounded, by MAX_CAPTURE_AFTER_TREE_EXIT_MS.
+   * Requests a stop and waits until it has run its course. The supervisor carries the stop out,
+   * so cancelling this wait never keeps a TERM from escalating to KILL.
    */
-  private waitForTreeExit(fs: FileSystem.FileSystem) {
-    if (process.platform === "win32") return Deferred.await(this.exited).pipe(Effect.asVoid);
-    const pid = this.child.pid;
-    return Effect.gen(function* () {
-      while (pid && (yield* groupAlive(fs, pid))) {
-        yield* Effect.sleep(TERMINATION_POLL_INTERVAL_MS);
-      }
+  kill() {
+    return Effect.suspend(() => {
+      this.requestStop("kill");
+      return Deferred.await(this.settled);
     });
   }
 
-  /**
-   * The only driver of the lifecycle: captures output, carries out a requested termination, and
-   * finishes the session once its process group has exited and capture has ended. It then closes
-   * `scope`, which holds the child process.
-   */
-  monitor(fs: FileSystem.FileSystem, scope: Scope.Closeable) {
+  /** For exit handlers, which must be synchronous: ends what Pi still manages of the command. */
+  killNow() {
+    const pid = this.child.pid;
+    if (this.isSettled || pid === undefined) return;
+    if (process.platform !== "win32") {
+      signalGroup(pid, "SIGKILL");
+      return;
+    }
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
+
+  /** Carries out the time limit and requested stops; nothing else signals the command. */
+  supervise() {
     return Effect.gen({ self: this }, function* () {
-      const { child, output } = this;
-      const terminated = Deferred.makeUnsafe<void>();
-      const treeExited = Deferred.makeUnsafe<void>();
-      const captureDeadline = Deferred.makeUnsafe<void>();
-
-      yield* Effect.forkChild(
-        Deferred.await(this.killRequested).pipe(
-          Effect.andThen(terminateTree(child, "SIGTERM")),
-          Effect.andThen(this.waitForTreeExit(fs).pipe(Effect.timeoutOption(TERMINATION_GRACE_MS))),
-          Effect.flatMap((exited) =>
-            Option.isNone(exited) ? terminateTree(child, "SIGKILL") : Effect.void,
+      const { timeoutMs } = this.command;
+      if (timeoutMs !== undefined) {
+        yield* Effect.forkChild(
+          Effect.sleep(timeoutMs).pipe(
+            Effect.andThen(Effect.sync(() => this.requestStop("timeout"))),
           ),
-          Effect.ignore,
-          Effect.ensuring(Deferred.succeed(terminated, undefined)),
-        ),
+        );
+      }
+      const stopping = yield* Effect.raceFirst(
+        Deferred.await(this.stopRequested).pipe(Effect.as(true)),
+        Deferred.await(this.exited).pipe(Effect.as(false)),
       );
-      yield* Effect.forkChild(
-        Effect.gen({ self: this }, function* () {
-          yield* Deferred.await(this.exited);
-          // After KILL, members still in the group are zombies or unkillable; waiting longer
-          // cannot help.
-          yield* Effect.raceFirst(this.waitForTreeExit(fs), Deferred.await(terminated));
-          yield* Deferred.succeed(treeExited, undefined);
-          yield* Effect.sleep(MAX_CAPTURE_AFTER_TREE_EXIT_MS);
-          yield* Deferred.succeed(captureDeadline, undefined);
-        }),
-      );
-
-      const chunks = Stream.merge(
-        NodeStream.fromReadable({
-          evaluate: () => {
-            child.stdout.off("readable", preserveOutput);
-            return child.stdout;
-          },
-        }).pipe(Stream.map((data) => ({ data, channel: "stdout" as const }))),
-        NodeStream.fromReadable({
-          evaluate: () => {
-            child.stderr.off("readable", preserveOutput);
-            return child.stderr;
-          },
-        }).pipe(Stream.map((data) => ({ data, channel: "stderr" as const }))),
-      );
-      // Once the process group has exited, an idle pull or the deadline ends capture. Both only
-      // stop waiting for writers outside the group; see MAX_CAPTURE_AFTER_TREE_EXIT_MS.
-      const read = Stream.transformPull(chunks, (pull) =>
-        Effect.succeed(
-          Effect.raceFirst(
-            pull,
-            Effect.raceFirst(
-              Deferred.await(treeExited).pipe(
-                Effect.andThen(Effect.sleep(OUTPUT_IDLE_AFTER_EXIT_MS)),
-              ),
-              Deferred.await(captureDeadline),
-            ).pipe(Effect.andThen(Cause.done())),
-          ),
-        ),
-      ).pipe(Stream.runForEach(({ data, channel }) => output.append(data, channel)));
-
-      const captureError = yield* Effect.gen(function* () {
-        yield* read;
-        // Background processes that closed their output still keep the session draining.
-        yield* Deferred.await(treeExited);
-        yield* output.finish();
-        return undefined;
-      }).pipe(
-        Effect.catchCause((cause) =>
-          terminateTree(child, "SIGKILL").pipe(
-            Effect.ignore,
-            Effect.as(String(Cause.squash(cause))),
-          ),
-        ),
-      );
-      const outcome = yield* Deferred.await(this.exited);
-      // Shell exit does not end a requested grace period for its descendants.
-      if (Deferred.isDoneUnsafe(this.killRequested)) yield* Deferred.await(terminated);
-      yield* Scope.close(scope, Exit.void);
-      this.phase = {
-        tag: "finished",
-        outcome,
-        ...(captureError ? { captureError } : {}),
-      };
-      yield* Deferred.succeed(this.finished, undefined);
+      if (stopping) {
+        yield* stop(this.child);
+        // KILL ends the shell unless the kernel holds it; the session then keeps running.
+        yield* Deferred.await(this.exited).pipe(Effect.timeoutOption(TERMINATION_GRACE_MS));
+      }
+      yield* Deferred.succeed(this.settled, undefined);
     });
   }
 }
@@ -443,20 +374,15 @@ export const makeProcesses = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const scope = yield* Scope.make();
   const tasks = new Map<string, Task>();
+  /** Commands Pi may still signal. A finished session can leave `tasks` before its stop ends. */
+  const supervised = new Set<Task>();
   const removed = new Set<string>();
   let closed = false;
 
   // Pi can exit without session_shutdown, e.g. when its terminal disappears. Exit handlers must be
   // synchronous, so only the shell is reached on Windows, which has no process groups.
   const killOnExit = () => {
-    for (const task of tasks.values()) {
-      if (task.isFinished || !task.child.pid) continue;
-      try {
-        process.kill(process.platform === "win32" ? task.child.pid : -task.child.pid, "SIGKILL");
-      } catch {
-        // Already gone.
-      }
-    }
+    for (const task of supervised) task.killNow();
   };
   // Acquired first, so closing the scope removes the handler last: Pi may exit while shutdown is
   // still waiting out a termination grace period.
@@ -526,7 +452,6 @@ export const makeProcesses = Effect.gen(function* () {
   return {
     start: (command: Command) =>
       Effect.gen(function* () {
-        if (closed) return yield* Effect.fail(new Error("Bash session is shutting down"));
         const shell = yield* Effect.try(() => getShellConfig(command.shellPath));
         if (shell.commandTransport === "stdin") {
           return yield* Effect.fail(
@@ -537,12 +462,13 @@ export const makeProcesses = Effect.gen(function* () {
         }
         yield* prune;
         const id = randomUUID();
-        const taskScope = yield* Scope.fork(scope);
         const path = join(directory, `${id}.log`);
-        const task = yield* Effect.gen(function* () {
-          const output = yield* Output.make(fs, path, taskScope);
-          return yield* Effect.acquireRelease(
+        const task = yield* Effect.acquireUseRelease(
+          Effect.try(() => openSync(path, "ax", LOG_MODE)),
+          (log) =>
+            // One synchronous step, so shutdown either finds the command or turns it away.
             Effect.try(() => {
+              if (closed) throw new Error("Bash session is shutting down");
               const shellCommand = command.shellCommandPrefix
                 ? `${command.shellCommandPrefix}\n${command.command}`
                 : command.command;
@@ -551,32 +477,19 @@ export const makeProcesses = Effect.gen(function* () {
                 env: { ...command.env, TERM: "dumb", NO_COLOR: "1", FORCE_COLOR: "0" },
                 detached: process.platform !== "win32",
                 windowsHide: true,
-                stdio: ["pipe", "pipe", "pipe"],
+                stdio: ["pipe", log, log],
               });
-              return new Task(id, command, child, output);
+              const task = new Task(id, command, child as Child, fs, path);
+              tasks.set(id, task);
+              supervised.add(task);
+              return task;
             }),
-            (task) =>
-              terminateTree(task.child, "SIGKILL").pipe(
-                Effect.ensuring(
-                  Effect.sync(() => {
-                    task.child.stdin.destroy();
-                    task.child.stdout.destroy();
-                    task.child.stderr.destroy();
-                  }),
-                ),
-                Effect.orDie,
-              ),
-          ).pipe(Scope.provide(taskScope));
-        }).pipe(
-          Effect.onError((cause) =>
-            Scope.close(taskScope, Exit.failCause(cause)).pipe(
-              Effect.andThen(fs.remove(path).pipe(Effect.ignore)),
-            ),
-          ),
-        );
-        tasks.set(id, task);
-        // The monitor owns the task scope once the command has started.
-        yield* Effect.forkIn(task.monitor(fs, taskScope), scope);
+          // The command holds its own copies of the descriptor.
+          (log) => Effect.sync(() => closeSync(log)),
+        ).pipe(Effect.onError(() => fs.remove(path).pipe(Effect.ignore)));
+        yield* task
+          .supervise()
+          .pipe(Effect.ensuring(Effect.sync(() => supervised.delete(task))), Effect.forkIn(scope));
         return task;
       }).pipe(Effect.uninterruptible),
 
@@ -660,11 +573,25 @@ export const makeProcesses = Effect.gen(function* () {
         return removeLogs([task]);
       }),
 
-    list: Effect.sync(() => [...tasks.values()].map((task) => task.summary())),
+    list: Effect.suspend(() =>
+      Effect.forEach([...tasks.values()], (task) =>
+        task.summary().pipe(
+          Effect.map(Option.some),
+          // Pruning can remove a session's log while the list is being read.
+          Effect.catchIf(
+            () => !tasks.has(task.id),
+            () => Effect.succeed(Option.none<TaskSummary>()),
+          ),
+        ),
+      ).pipe(Effect.map((summaries) => summaries.flatMap(Option.toArray))),
+    ),
 
     /** Records what a result returned to the caller showed; the session may be gone by then. */
-    acknowledge: (shown: Pick<TaskSummary, "session_id" | "state" | "input_error">) =>
+    acknowledge: (shown: Shown & Pick<TaskSummary, "session_id">) =>
       Effect.sync(() => tasks.get(shown.session_id)?.acknowledge(shown)),
+
+    /** Where output continues after what returned results showed. */
+    shownCursor: (id: string) => get(id).pipe(Effect.map((task) => task.shownCursor)),
 
     /** Sessions that still need the caller's attention. */
     pending: Effect.sync(() => {
@@ -679,7 +606,7 @@ export const makeProcesses = Effect.gen(function* () {
 
     shutdown: Effect.gen(function* () {
       closed = true;
-      yield* Effect.forEach(tasks.values(), (task) => task.kill(), {
+      yield* Effect.forEach([...supervised], (task) => task.kill(), {
         concurrency: "unbounded",
         discard: true,
       });
