@@ -17,21 +17,25 @@ import {
   type TaskSummary,
 } from "./processes.ts";
 
-// One default for bash, poll and write: waits end as soon as the command finishes, and callers
-// that do not need the result pass 0.
+/**
+ * yield_time_ms asks when to hand control back if the command is still running; a call returns
+ * as soon as the command finishes. One default serves bash, poll, and write.
+ */
 const DEFAULT_WAIT_MS = 5_000;
+// Shorter waits would return before quick commands finish and cost a second call to see them end.
+const MIN_WAIT_MS = 1_000;
+/**
+ * Longest wait of one call. A request sent after a longer pause would miss the provider's prompt
+ * cache, whose entries commonly expire after five minutes.
+ */
+const MAX_WAIT_MS = 275_000;
 // Node and Bun timers cap delays at the largest signed 32-bit integer.
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const PAGE_LIMIT = `${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB`;
 
-function waitTime(value: number | undefined): number {
-  const duration = value ?? DEFAULT_WAIT_MS;
-  if (!Number.isFinite(duration) || duration < 0 || duration > MAX_TIMER_DELAY_MS) {
-    throw new Error(
-      `Wait must be a finite number between 0 and ${MAX_TIMER_DELAY_MS} milliseconds`,
-    );
-  }
-  return duration;
+/** A wait outside the limits is moved to the nearest one, so asking for it costs no extra call. */
+function waitTime(value: number | undefined, minWaitMs: number): number {
+  return Math.min(Math.max(value ?? DEFAULT_WAIT_MS, minWaitMs), MAX_WAIT_MS);
 }
 
 async function run<A, E>(effect: Effect.Effect<A, E>, signal?: AbortSignal): Promise<A> {
@@ -45,18 +49,41 @@ async function run<A, E>(effect: Effect.Effect<A, E>, signal?: AbortSignal): Pro
 type Observation = Omit<ProcessResult, "session_id" | "full_output_path"> &
   Partial<Pick<ProcessResult, "session_id" | "full_output_path">>;
 
-function status(value: Pick<TaskSummary, "state" | "exit_code" | "signal" | "stdin">): string {
-  const code = `code ${value.exit_code}${value.signal ? ` (${value.signal})` : ""}`;
+type Status = Pick<
+  TaskSummary,
+  "state" | "exit_code" | "signal" | "stdin" | "stopped_by" | "runtime_seconds" | "idle_seconds"
+>;
+
+const STOPPED_BY = { kill: "process kill", timeout: "timeout_ms" };
+
+function status(value: Status): string {
   switch (value.state) {
-    case "running":
-      return value.stdin === "closed" ? "running, stdin closed" : "running";
-    case "draining":
-      return `shell exited with ${code}, background processes or output still pending`;
-    case "exited":
-      return `exited with ${code}`;
+    case "running": {
+      const notes = [`running for ${value.runtime_seconds} s`];
+      if (value.stopped_by) notes.push(`${STOPPED_BY[value.stopped_by]} is stopping it`);
+      if (value.idle_seconds) notes.push(`no output for ${value.idle_seconds} s`);
+      if (value.stdin === "closed") notes.push("stdin closed");
+      return notes.join(", ");
+    }
+    case "exited": {
+      const stopped = value.stopped_by ? `stopped by ${STOPPED_BY[value.stopped_by]}, ` : "";
+      const signal = value.signal ? ` (${value.signal})` : "";
+      return `${stopped}exited with code ${value.exit_code}${signal} after ${value.runtime_seconds} s`;
+    }
     case "failed":
       return "failed to start";
   }
+}
+
+/**
+ * A stop the model asked for is the outcome it wanted, whatever exit code it produced and
+ * whatever input it left unread. A time limit that ran out is a failure even when the shell then
+ * exits cleanly.
+ */
+function failed(value: Observation): boolean {
+  if (value.error || value.input_refused) return true;
+  if (value.stopped_by === "kill") return false;
+  return Boolean(value.input_error || value.stopped_by || value.exit_code);
 }
 
 function inputNotes(value: Pick<ProcessResult, "input_error" | "input_refused">): string[] {
@@ -77,7 +104,11 @@ function render(value: Observation, cursor: number, startedAt: number) {
   if (value.error) notes.push(value.error);
   notes.push(...inputNotes(value));
   if (value.session_id === undefined) {
-    if (value.exit_code) notes.push(`Command exited with code ${value.exit_code}`);
+    if (value.stopped_by === "timeout") {
+      notes.push(`Command stopped by timeout_ms after ${value.runtime_seconds} s`);
+    } else if (value.exit_code) {
+      notes.push(`Command exited with code ${value.exit_code}`);
+    }
   } else {
     const range = `bytes ${value.output_start_bytes}-${value.cursor_bytes} of ${value.total_bytes}`;
     let next = "";
@@ -85,8 +116,8 @@ function render(value: Observation, cursor: number, startedAt: number) {
       next = ` Bytes ${cursor}-${value.output_start_bytes} omitted; page them with process read or open ${value.full_output_path}.`;
     } else if (value.cursor_bytes < value.total_bytes) {
       next = ` Continue with process read cursor_bytes=${value.cursor_bytes}.`;
-    } else if (value.state === "running" || value.state === "draining") {
-      next = ` Poll with cursor_bytes=${value.cursor_bytes} for new output only.`;
+    } else if (value.state === "running") {
+      next = " Poll for new output.";
     }
     notes.push(`[Session ${value.session_id} ${status(value)}; ${range}.${next}]`);
   }
@@ -100,9 +131,7 @@ function render(value: Observation, cursor: number, startedAt: number) {
       ...value,
       wall_time_seconds: (performance.now() - startedAt) / 1000,
     },
-    ...(value.error || value.input_error || value.input_refused || value.exit_code
-      ? { isError: true }
-      : {}),
+    ...(failed(value) ? { isError: true } : {}),
   };
 }
 
@@ -116,15 +145,10 @@ async function reply(manager: Processes, value: ProcessResult, cursor: number, s
 }
 
 const state = Type.Union(
-  [
-    Type.Literal("running"),
-    Type.Literal("draining"),
-    Type.Literal("exited"),
-    Type.Literal("failed"),
-  ],
+  [Type.Literal("running"), Type.Literal("exited"), Type.Literal("failed")],
   {
     description:
-      "Observed when the call returned. draining: the shell has exited, but processes it started in the background are still running or output can still arrive. exited and failed are final, and output up to total_bytes is complete.",
+      "Observed when the call returned. exited and failed are final: the shell has ended, and everything it wrote is in the output.",
   },
 );
 
@@ -136,15 +160,27 @@ const summaryFields = {
   pid: Type.Optional(Type.Number()),
   exit_code: Type.Optional(Type.Number({ description: "Shell exit code, once it has exited." })),
   signal: Type.Optional(Type.String()),
-  error: Type.Optional(Type.String({ description: "Launch or output capture failure." })),
+  error: Type.Optional(Type.String({ description: "Why the shell failed to start." })),
   input_error: Type.Optional(
     Type.String({
       description:
         "Stdin failed after accepting input, and the command may have read part of it. Results report it until one returns it, also after the write call has returned.",
     }),
   ),
+  stopped_by: Type.Optional(
+    Type.Union([Type.Literal("kill"), Type.Literal("timeout")], {
+      description: "Set once process kill or timeout_ms has begun stopping the command.",
+    }),
+  ),
   stdin: Type.Union([Type.Literal("open"), Type.Literal("closed")]),
-  total_bytes: Type.Number({ description: "UTF-8 bytes of combined output logged so far." }),
+  runtime_seconds: Type.Number({ description: "How long the shell has run, or ran." }),
+  idle_seconds: Type.Optional(
+    Type.Number({ description: "While running: how long ago the command last wrote output." }),
+  ),
+  total_bytes: Type.Number({
+    description:
+      "Bytes of combined output logged so far. Processes a finished command left running can still add to it.",
+  }),
   full_output_path: Type.String({
     description: "Log of the combined output, removed at session shutdown.",
   }),
@@ -181,7 +217,7 @@ const cursorParameter = Type.Optional(
   Type.Integer({
     minimum: 0,
     description:
-      "UTF-8 byte offset to return output from. Defaults to 0. Pass a returned cursor_bytes for new output only.",
+      "Byte offset to return output from. poll, write, and kill default to the end of the output earlier results showed; read defaults to 0.",
   }),
 );
 
@@ -197,9 +233,7 @@ const processParameters = Type.Object({
   cursor_bytes: cursorParameter,
   yield_time_ms: Type.Optional(
     Type.Number({
-      minimum: 0,
-      maximum: MAX_TIMER_DELAY_MS,
-      description: `poll and write: wait up to this long for the command to finish. Defaults to ${DEFAULT_WAIT_MS} ms; 0 returns immediately.`,
+      description: `poll and write: return after this long if the command is still running; it keeps running. Defaults to ${DEFAULT_WAIT_MS} ms; values are kept between ${MIN_WAIT_MS} and ${MAX_WAIT_MS} ms.`,
     }),
   ),
   chars: Type.Optional(Type.String({ description: "write: text for stdin, including newlines." })),
@@ -236,7 +270,8 @@ function environment(ctx: ExtensionToolContext): NodeJS.ProcessEnv {
   };
 }
 
-export default function (pi: ExtensionAPI): void {
+/** Registers the tools. Tests lower `minWaitMs`, the shortest wait of a call. */
+export function asyncBash(pi: ExtensionAPI, minWaitMs = MIN_WAIT_MS): void {
   let runtime: Promise<Processes> | undefined;
   const processes = () => (runtime ??= run(makeProcesses));
   const piBash = createBashToolDefinition(process.cwd());
@@ -272,13 +307,14 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "bash",
     label: "bash",
-    description: `Execute a bash command in the current working directory. Returns stdout and stderr, limited to the last ${PAGE_LIMIT}. A command still running after yield_time_ms continues in a session; the result then names the session for the process tool, as it does when output was omitted.`,
+    description: `Execute a bash command in the current working directory. Returns stdout and stderr, limited to the last ${PAGE_LIMIT}. A command still running after yield_time_ms continues in a session; the result then names the session for the process tool, as it does when output was omitted. timeout_ms stops the command once it has run that long.`,
     ...(piBash.promptSnippet ? { promptSnippet: piBash.promptSnippet } : {}),
     promptGuidelines: [
       ...(piBash.promptGuidelines ?? []),
       "Before finishing, account for bash sessions: collect needed results, wait or stop as appropriate, and report anything intentionally left running.",
-      "Commands have no execution timeout; use process kill to stop them. A command that leaves background processes keeps its session draining until they exit. Processes that leave its process group, e.g. through setsid, are neither tracked nor stopped, and outlive the session.",
-      "Output reads are repeatable and never consume output. Pass the returned cursor_bytes to see only newer output.",
+      `A call returns as soon as the command finishes. yield_time_ms asks to get control back after that long if it is still running; the command then keeps running in its session, as it does when the call is cancelled. Wait no longer than you would go without checking on the command, at most ${MAX_WAIT_MS / 1000} s. Set timeout_ms to have the command stopped once it has run that long, or stop it with process kill.`,
+      "A session ends when its shell exits. Processes the command left in the background keep running and are yours to stop. Redirect their output: what they write to the command's own output goes on filling its log, which you may no longer be able to read.",
+      "process poll, write, and kill return the output after what earlier results showed. Reads never consume output: pass cursor_bytes to read from another offset.",
       `Only the ${MAX_REPORTED_SESSIONS} finished sessions whose final state was returned most recently keep their logs; save output needed later instead of relying on older sessions.`,
       "Use a terminal multiplexer for programs that require terminal features.",
     ],
@@ -286,9 +322,15 @@ export default function (pi: ExtensionAPI): void {
       command: piBash.parameters.properties.command,
       yield_time_ms: Type.Optional(
         Type.Number({
-          minimum: 0,
+          description: `Return after this long if the command is still running; it keeps running. Defaults to ${DEFAULT_WAIT_MS} ms; values are kept between ${MIN_WAIT_MS} and ${MAX_WAIT_MS} ms.`,
+        }),
+      ),
+      timeout_ms: Type.Optional(
+        Type.Number({
+          exclusiveMinimum: 0,
           maximum: MAX_TIMER_DELAY_MS,
-          description: `Wait up to this long for the command to finish. Defaults to ${DEFAULT_WAIT_MS} ms; 0 returns immediately.`,
+          description:
+            "Stop the command once it has run this long, as process kill does, also after this call has returned. No limit by default.",
         }),
       ),
     }),
@@ -298,38 +340,37 @@ export default function (pi: ExtensionAPI): void {
     ...(piBash.renderResult ? { renderResult: piBash.renderResult } : {}),
     async execute(_id, params, signal, onUpdate, ctx) {
       const startedAt = performance.now();
-      const wait = waitTime(params.yield_time_ms);
+      const wait = waitTime(params.yield_time_ms, minWaitMs);
+      const timeoutMs = params.timeout_ms;
       if (!params.command.trim()) throw new Error("command must not be empty");
       if (signal?.aborted) throw new Error("Bash call aborted");
       const manager = await processes();
       const { shellPath, shellCommandPrefix } = pi.getSettings();
+      // Cancelling the call ends only its wait. The reminder names the session, whose ID the
+      // model never received.
       const value = await run(
-        Effect.acquireUseRelease(
-          manager.start({
+        manager
+          .start({
             command: params.command,
             cwd: ctx.cwd,
             env: environment(ctx),
             ...(shellPath ? { shellPath } : {}),
             ...(shellCommandPrefix ? { shellCommandPrefix } : {}),
-          }),
-          (task) =>
-            manager.poll(
-              task.id,
-              wait,
-              0,
-              onUpdate ? (update) => onUpdate(render(update, 0, startedAt)) : undefined,
+            ...(timeoutMs === undefined ? {} : { timeoutMs }),
+          })
+          .pipe(
+            Effect.flatMap((task) =>
+              manager.poll(
+                task.id,
+                wait,
+                0,
+                onUpdate ? (update) => onUpdate(render(update, 0, startedAt)) : undefined,
+              ),
             ),
-          (task, exit) =>
-            Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)
-              ? manager.kill(task.id, 0).pipe(Effect.ignore)
-              : Effect.void,
-        ),
+          ),
         signal,
       );
-      if (
-        (value.state === "exited" || value.state === "failed") &&
-        value.output_start_bytes === 0
-      ) {
+      if (value.state !== "running" && value.output_start_bytes === 0) {
         await run(manager.discard(value.session_id));
         const { session_id: _id, full_output_path: _path, ...complete } = value;
         return render(complete, 0, startedAt);
@@ -341,7 +382,7 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "process",
     label: "process",
-    description: `Manage bash sessions. poll: wait for the command to finish, then return the latest output after cursor_bytes. write: send stdin, then wait like poll. read: return output forward from cursor_bytes, one page of ${PAGE_LIMIT}, to recover omitted output. kill: stop the process tree and return its final output. list: show all sessions. Sessions remain until Pi's session ends, except that only the ${MAX_REPORTED_SESSIONS} finished sessions whose final state was returned most recently are kept.`,
+    description: `Manage bash sessions. poll: wait for the command to finish, then return the latest output after what earlier results showed. write: send stdin, then wait like poll. read: return output forward from cursor_bytes, one page of ${PAGE_LIMIT}, to recover omitted output. kill: stop the command, by force if it has not ended a few seconds after being asked to, and return its final output. list: show all sessions. Sessions remain until Pi's session ends, except that only the ${MAX_REPORTED_SESSIONS} finished sessions whose final state was returned most recently are kept.`,
     promptSnippet: "Wait for, read, write to, or stop bash sessions",
     parameters: processParameters,
     outputSchema: Type.Union([
@@ -377,18 +418,19 @@ export default function (pi: ExtensionAPI): void {
       }
       const id = params.session_id;
       if (!id) throw new Error(`session_id is required for action ${params.action}`);
-      const cursor = params.cursor_bytes ?? 0;
+      const cursor =
+        params.cursor_bytes ?? (params.action === "read" ? 0 : await run(manager.shownCursor(id)));
       const update = onUpdate
         ? (value: ProcessResult) => onUpdate(render(value, cursor, startedAt))
         : undefined;
       const effect = {
-        poll: () => manager.poll(id, waitTime(params.yield_time_ms), cursor, update),
+        poll: () => manager.poll(id, waitTime(params.yield_time_ms, minWaitMs), cursor, update),
         write: () =>
           manager.write(
             id,
             params.chars ?? "",
             params.eof ?? false,
-            waitTime(params.yield_time_ms),
+            waitTime(params.yield_time_ms, minWaitMs),
             cursor,
             update,
           ),
@@ -399,3 +441,5 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 }
+
+export default (pi: ExtensionAPI): void => asyncBash(pi);
